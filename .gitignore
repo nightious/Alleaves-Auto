@@ -1,0 +1,20 @@
+# Claude Code local settings (machine-specific permissions / paths)
+.claude/settings.local.json
+
+# Build intermediate (base64 blob emitted by build-bat.ps1)
+alleaves_b64.txt
+
+# Runtime working state created on target terminals
+downloads/
+logs/
+*.log
+
+# Installer payloads / binaries pulled at runtime
+*.exe
+*.msi
+*.zip
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
