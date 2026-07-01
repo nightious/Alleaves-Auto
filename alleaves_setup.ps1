@@ -39,6 +39,11 @@
 
 .PARAMETER ForceReinstall
     Re-download even if a valid file exists; pre-clean installed products.
+
+.PARAMETER ScannerConfigOnly
+    Run ONLY the final USB-OPOS scanner step (no downloads, installs, or finishing).
+    For iterating the OPOS switch on the rig, or configuring a scanner that was not
+    attached during the main install. Mutually exclusive with -Uninstall.
 #>
 
 [CmdletBinding()]
@@ -50,11 +55,13 @@ param(
     [switch]$SkipUninstallTeamViewer,
     [string[]]$SkipPrograms = @(),
     [switch]$ForceReinstall,
+    [switch]$ScannerConfigOnly,   # run ONLY the final USB-OPOS scanner step (no installs)
     # --- Per-terminal finishing (post-install additions) -------------------
     [string]$ComputerName,        # preset POS name/number (skips the rename prompt)
     [switch]$SkipRename,          # don't prompt/apply a computer rename
     [switch]$SkipChromeTaskbar,   # don't pin Chrome / remove Edge from the taskbar
-    [switch]$SkipDefaultBrowser   # don't make Chrome the default browser
+    [switch]$SkipDefaultBrowser,  # don't make Chrome the default browser
+    [switch]$SkipScannerConfig    # don't flip the connected Zebra scanner(s) to USB-OPOS
 )
 
 $ErrorActionPreference = 'Continue'
@@ -81,12 +88,12 @@ $IsAdmin = Test-IsAdmin
 # Make the parsed mode unambiguous BEFORE any dispatch, and refuse to run an
 # INSTALL when the launcher actually asked for an UNINSTALL (dropped switch).
 # ---------------------------------------------------------------------------
-$Mode = if ($Uninstall) { 'Uninstall' } else { 'Install' }
+$Mode = if ($Uninstall) { 'Uninstall' } elseif ($ScannerConfigOnly) { 'ScannerConfig' } else { 'Install' }
 Write-Host "Alleaves setup - parsed MODE: $Mode" -ForegroundColor Cyan
-Write-Host ("  Args: Uninstall={0} DryRun={1} SkipMasterList={2} SkipUninstallTeamViewer={3} ForceReinstall={4} SkipPrograms='{5}'" -f `
-    $Uninstall, $DryRun, $SkipMasterList, $SkipUninstallTeamViewer, $ForceReinstall, ($SkipPrograms -join ','))
-Write-Host ("        ComputerName='{0}' SkipRename={1} SkipChromeTaskbar={2} SkipDefaultBrowser={3}" -f `
-    $ComputerName, $SkipRename, $SkipChromeTaskbar, $SkipDefaultBrowser)
+Write-Host ("  Args: Uninstall={0} DryRun={1} SkipMasterList={2} SkipUninstallTeamViewer={3} ForceReinstall={4} ScannerConfigOnly={5} SkipPrograms='{6}'" -f `
+    $Uninstall, $DryRun, $SkipMasterList, $SkipUninstallTeamViewer, $ForceReinstall, $ScannerConfigOnly, ($SkipPrograms -join ','))
+Write-Host ("        ComputerName='{0}' SkipRename={1} SkipChromeTaskbar={2} SkipDefaultBrowser={3} SkipScannerConfig={4}" -f `
+    $ComputerName, $SkipRename, $SkipChromeTaskbar, $SkipDefaultBrowser, $SkipScannerConfig)
 
 $requested = $env:ALLEAVES_REQUESTED_MODE
 if ($requested) {
@@ -99,6 +106,14 @@ if ($requested) {
         Fail "Launcher requested INSTALL but script parsed UNINSTALL. Aborting ambiguous run."
         exit 2
     }
+}
+
+# -ScannerConfigOnly is a sub-mode of install (the .bat reports requested mode
+# 'install'); it must never combine with -Uninstall (one reverses, the other
+# configures - ambiguous, exit 2 like the guards above).
+if ($ScannerConfigOnly -and $Uninstall) {
+    Fail "-ScannerConfigOnly and -Uninstall are mutually exclusive."
+    exit 2
 }
 
 # ---------------------------------------------------------------------------
@@ -140,6 +155,7 @@ $script:RebootPending   = $false   # set if VC++ redist returns 3010, or a renam
 $script:FinishBrowser   = $false   # taskbar/browser features set these; if either is
 $script:FinishTaskbar   = $false   # true, a per-user logon task is registered to finish.
 $script:ScannerDegraded = $false   # F20: set if CoreScanner is missing post-install (exit 4)
+$script:ScannerConfigFailed = $false   # set if a connected scanner is present but the OPOS switch fails (exit 6)
 $script:UserAgent       = 'Mozilla/5.0 AlleavesAuto/1.0'   # F3: one UA for BITS + WebClient + HEAD/GET probe
 
 # ---------------------------------------------------------------------------
@@ -1545,6 +1561,14 @@ function Save-Manifest {
             $haveTB = @{}
             foreach ($e in @($Manifest.taskbandBackups)) { if ($e.sid) { $haveTB[$e.sid] = $true } }
             foreach ($p in @($prior.taskbandBackups)) { if ($p.sid -and -not $haveTB.ContainsKey($p.sid)) { $Manifest.taskbandBackups += $p } }
+            # Carry forward prior scanner-OPOS records (keyed by serial) so a re-run
+            # that skips the step (-SkipScannerConfig) or finds no scanner attached
+            # doesn't drop a prior 'ok' result. This run wins on a serial conflict.
+            $haveSC = @{}
+            foreach ($e in @($Manifest.scannerConfigured)) { if ($e.serial) { $haveSC[$e.serial] = $true } }
+            foreach ($p in @($prior.scannerConfigured)) {
+                if ($p.serial -and -not $haveSC.ContainsKey($p.serial)) { $Manifest.scannerConfigured += $p }
+            }
             if ((-not $Manifest.computerRenamed -or @($Manifest.computerRenamed.Keys).Count -eq 0) -and $prior.computerRenamed -and $prior.computerRenamed.to) {
                 $Manifest.computerRenamed = @{}
                 foreach ($pn in $prior.computerRenamed.PSObject.Properties) { $Manifest.computerRenamed[$pn.Name] = $pn.Value }
@@ -2038,6 +2062,401 @@ function Register-FinishLogonTask {
 }
 
 # ===========================================================================
+# FINAL STEP: flip the connected Zebra scanner(s) to USB-OPOS via CoreScanner.
+#
+# A tech normally opens 123Scan -> "Load to scanner" to put each Zebra scanner
+# into USB-OPOS so the Alleaves POS can read it. This automates that as the LAST
+# functional step. It is model-agnostic: turning on OPOS is a single CoreScanner
+# command - ExecCommand(6200 = DEVICE_SWITCH_HOST_MODE, "XUA-45001-8", silent,
+# permanent) - identical across all Zebra USB scanner families (DS/LI/MP/...).
+# Because we read the model/PID from GetScanners at runtime, this auto-adapts to
+# whatever is plugged in (it does NOT hardcode the DS2208).
+#
+# Host-variant codes (shared across all Zebra USB scanners):
+#   XUA-45001-1  USB IBM Hand-held      XUA-45001-8   USB OPOS  (target)
+#   XUA-45001-2  USB IBM Table-top      XUA-45001-9   USB SNAPI
+#   XUA-45001-3  USB HID Keyboard       XUA-45001-11  USB CDC Serial
+#
+# THE ONE GOTCHA: you cannot switch DIRECTLY from the factory HID-Keyboard
+# default to OPOS - from HID-KB the only legal targets are IBM Hand-held or
+# SNAPI. So from HID-KB (or any unconfirmed mode) we hop HID-KB -> IBM Hand-held
+# (XUA-45001-1) -> OPOS (XUA-45001-8), waiting for USB re-enumeration between
+# hops (the scanner reconnects and its scannerID CHANGES - so we re-match the
+# physical unit by its stable SERIAL number, not by scannerID). permanent=TRUE
+# survives power cycles; skipping the switch when already OPOS dodges an old-
+# driver "switch-to-OPOS-while-OPOS" hang (our SDK v3.07 is current).
+#
+# Uninstall records only (removable=$false): scanner host mode is hardware-
+# external state, like the computer rename and TeamViewer removal - not reverted.
+# A tech can scan the "USB HID Keyboard" / "Set Defaults" barcode (or re-run
+# 123Scan) to revert. Scanner_OPOS_barcode.pdf is the no-PC fallback.
+# ===========================================================================
+
+# Host-variant codes + opcode are STABLE across all Zebra USB scanners.
+$ScannerOpcodeSwitchHostMode = 6200
+$ScannerHostCodeOpos         = 'XUA-45001-8'   # USB OPOS (target)
+$ScannerHostCodeIbmHandheld  = 'XUA-45001-1'   # USB IBM Hand-held (mandatory HID-KB hop)
+
+# Host-mode detection. PRIMARY signal is the GetScanners <scanner type="..."> attribute
+# (confirmed on rig: OPOS enumerates as type="USBOPOS"); the PID tables below are the
+# secondary signal. Both feed Get-ScannerHostMode; if neither resolves, the mode reads
+# 'unknown' and takes the UNIVERSAL two-hop (HID-KB -> IBM Hand-held -> OPOS), valid
+# from ANY starting mode - so a gap here is SAFE, it just costs one extra harmless hop.
+# type-attribute -> mode. Regex, case-insensitive. OPOS confirmed; the SNAPI/IBM/HID-KB
+# strings are the documented CoreScanner type names (confirm the exact HID-KB/IBM strings
+# when a unit is in those modes - unmatched falls through to PID, then 'unknown').
+$ScannerTypeOpos     = 'OPOS'                 # e.g. USBOPOS  (CONFIRMED on rig 2026-07-01)
+$ScannerTypeIbmSnapi = 'SNAPI|IBMHID|IBMTT|IBM'  # USBIBMHID / USBIBMTT / SNAPI
+$ScannerTypeHidKb    = 'HIDKB|HIDKEYBOARD'    # USBHIDKB
+# *** RIG-DEPENDENT PID tables (secondary). GetScanners emits <PID> as a DECIMAL string
+# (e.g. OPOS on the DS2208 = 4864 = 0x1300), so record the literal decimal it prints. ***
+$ScannerPidsOpos     = @('4864')  # USB OPOS: DS2208 = 4864 (0x1300), CONFIRMED on rig 2026-07-01
+$ScannerPidsHidKb    = @()   # TODO[rig]: USB HID-Keyboard PID(s)  (reset a unit to HID-KB to capture)
+$ScannerPidsIbmSnapi = @()   # TODO[rig]: USB IBM/SNAPI PID(s)     (enables the direct-to-OPOS shortcut)
+# TODO[rig]: USB re-enumeration settle time between hops. 12s is a conservative
+# starting point; tune to the slowest observed reconnect on the rig.
+$ScannerReenumWaitSec = 12
+# TODO[rig]: model regex for the few entry-level/pre-RSM units that support only
+# IBM Hand-held/SNAPI (no OPOS). A match records 'unsupported' (Warn, not fail).
+# Empty by default - the deployed DS2208 and all listed families ARE OPOS-capable.
+$ScannerModelsNoOpos = ''
+
+# RSM readiness. The host-mode switch (ExecCommand 6200) rides the Zebra Remote
+# Scanner Management channel, which is UNAVAILABLE (ExecCommand status 112,
+# "Device Unavailable") until the CoreScanner + RSM services are running and have
+# settled. In a fresh install these run in the SAME session that just installed the
+# SDK, before the recommended reboot, so we must ensure the services are up and
+# retry 112 (Zebra's documented remediation is "start those services / reboot").
+$ScannerStatusDeviceUnavailable = 112
+# Confirmed on rig (DS2208, CoreScanner 3.4.0.0, 2026-07-01): the three Zebra services
+# and their exact short-names. We resolve by exact name first, then fall back to
+# DisplayName globs for other SDK versions where a short-name might differ.
+$ScannerServiceNames = @('CoreScanner', 'rsmdriverproviderservice', 'ScnSrvc')
+$ScannerServiceDisplayPatterns = @('*CoreScanner*', '*RSM*Driver*Provider*', '*Symbol*Scanner*Management*', '*Scanner*Management*')
+$ScannerServiceSettleSec = 8   # TODO[rig]: wait after starting services before the first switch
+$ScannerSwitchMaxRetries = 3   # TODO[rig]: attempts per hop while status 112 is returned
+$ScannerRetryWaitSec     = 5   # TODO[rig]: wait between 112 retries
+
+function Get-ScannerHostMode {
+    # Derive a scanner's USB host mode. PRIMARY signal is the GetScanners
+    # <scanner type="..."> attribute (confirmed: OPOS = "USBOPOS"); the RIG-DEPENDENT
+    # PID tables are the fallback. Returns 'OPOS' | 'IBM/SNAPI' | 'HID-KB' | 'unknown'.
+    # 'unknown' is the safe default (-> universal two-hop), so a gap never misroutes.
+    param($Scanner)
+    $t = ("$($Scanner.Type)").Trim()
+    if ($t) {
+        if ($t -match $ScannerTypeOpos)     { return 'OPOS' }
+        if ($t -match $ScannerTypeIbmSnapi) { return 'IBM/SNAPI' }
+        if ($t -match $ScannerTypeHidKb)    { return 'HID-KB' }
+    }
+    $p = ("$($Scanner.Pid)").Trim().ToLower()
+    if ($p) {
+        if ($ScannerPidsOpos     | Where-Object { $_.ToLower() -eq $p }) { return 'OPOS' }
+        if ($ScannerPidsIbmSnapi | Where-Object { $_.ToLower() -eq $p }) { return 'IBM/SNAPI' }
+        if ($ScannerPidsHidKb    | Where-Object { $_.ToLower() -eq $p }) { return 'HID-KB' }
+    }
+    return 'unknown'
+}
+
+function Get-CoreScannerInventory {
+    # Call GetScanners and parse OutXML into one object per connected scanner.
+    # scannerID changes across re-enumeration; SERIAL is stable, so callers
+    # re-match the same physical unit by Serial after each host-mode switch.
+    param($Obj)
+    $count  = [int16]0
+    $ids    = New-Object int16[] 255
+    $outXml = ''
+    $st     = 0
+    try { $Obj.GetScanners([ref]$count, $ids, [ref]$outXml, [ref]$st) }
+    catch { Warn "GetScanners failed: $($_.Exception.Message)"; return @() }
+    $list = @()
+    if ($outXml) {
+        try {
+            [xml]$x = $outXml
+            foreach ($n in @($x.scanners.scanner)) {
+                if (-not $n) { continue }
+                $list += [pscustomobject]@{
+                    Id     = [int]("$($n.scannerID)".Trim())
+                    Model  = "$($n.modelnumber)".Trim()
+                    Serial = "$($n.serialnumber)".Trim()
+                    Pid    = "$($n.PID)".Trim()
+                    Vid    = "$($n.VID)".Trim()
+                    Type   = "$($n.type)".Trim()   # host-mode signal, e.g. USBOPOS (PRIMARY over PID)
+                }
+            }
+        } catch { Warn "could not parse GetScanners XML: $($_.Exception.Message)" }
+    }
+    return ,$list
+}
+
+function Invoke-ScannerHostSwitch {
+    # ExecCommand(6200) to switch one scanner's USB host mode. 1st bool = silent
+    # reboot (no beeper menu), 2nd = permanent (survives power cycle). Returns the
+    # CoreScanner status integer (0 = success).
+    param($Obj, [int]$ScannerId, [string]$HostCode)
+    $inXml  = "<inArgs><scannerID>$ScannerId</scannerID><cmdArgs><arg-string>$HostCode</arg-string><arg-bool>TRUE</arg-bool><arg-bool>TRUE</arg-bool></cmdArgs></inArgs>"
+    $outXml = ''
+    $st     = 0
+    try { $Obj.ExecCommand($ScannerOpcodeSwitchHostMode, [ref]$inXml, [ref]$outXml, [ref]$st) }
+    catch { Warn "ExecCommand(6200,$HostCode) threw: $($_.Exception.Message)"; return -1 }
+    return [int]$st
+}
+
+function Confirm-ScannerServicesReady {
+    # Ensure the Zebra CoreScanner + RSM / Symbol Scanner Management services are
+    # Running so the RSM channel ExecCommand(6200) uses is available (fixes the
+    # status-112 "Device Unavailable" seen when the switch runs in the same session
+    # that just installed the SDK). Resolves by exact short-name first (confirmed on
+    # rig), then DisplayName globs for other SDK versions. STARTS any that are stopped
+    # (never Restart-Service - that would drop the COM Open() we hold), then settles.
+    # Returns $true if CoreScanner ended up Running.
+    if ($DryRun) { Dry 'would verify/start Zebra CoreScanner + RSM services before the OPOS switch'; return $true }
+
+    $svcs = @()
+    foreach ($n in $ScannerServiceNames) {
+        $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+        if ($s) { $svcs += $s }
+    }
+    foreach ($pat in $ScannerServiceDisplayPatterns) {
+        Get-Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like $pat } |
+            ForEach-Object { $svcs += $_ }
+    }
+    $svcs = $svcs | Sort-Object -Property Name -Unique
+    if (-not $svcs) { Warn '  no Zebra scanner services found (CoreScanner absent?)'; return $false }
+
+    $started = $false
+    foreach ($s in $svcs) {
+        try {
+            if ($s.Status -ne 'Running') {
+                Write-Host "  starting service '$($s.Name)' ($($s.DisplayName)) [was $($s.Status)]"
+                Start-Service -Name $s.Name -ErrorAction Stop
+                $started = $true
+            }
+        } catch { Warn "  could not start service '$($s.Name)': $($_.Exception.Message)" }
+    }
+    if ($started) { Start-Sleep -Seconds $ScannerServiceSettleSec }   # let RSM attach
+
+    $core = Get-Service -Name 'CoreScanner' -ErrorAction SilentlyContinue
+    return [bool]($core -and $core.Status -eq 'Running')
+}
+
+function Invoke-ScannerHostSwitchResilient {
+    # Wrap Invoke-ScannerHostSwitch with a bounded retry that treats status 112
+    # (Device Unavailable = RSM channel not ready) as retryable: re-ensure the
+    # services, wait, retry. Any other status returns immediately. Returns the final
+    # CoreScanner status integer.
+    param($Obj, [int]$ScannerId, [string]$HostCode, [string]$HopLabel)
+    $st = -1
+    for ($try = 1; $try -le $ScannerSwitchMaxRetries; $try++) {
+        $st = Invoke-ScannerHostSwitch -Obj $Obj -ScannerId $ScannerId -HostCode $HostCode
+        if ($st -ne $ScannerStatusDeviceUnavailable) { break }
+        Warn "    $HopLabel returned status 112 (RSM unavailable) - attempt $try/$ScannerSwitchMaxRetries"
+        if ($try -lt $ScannerSwitchMaxRetries) {
+            Confirm-ScannerServicesReady | Out-Null
+            Start-Sleep -Seconds $ScannerRetryWaitSec
+        }
+    }
+    return $st
+}
+
+function Get-ReenumeratedScanner {
+    # Re-match one physical scanner after a host-mode switch WITHOUT relying on the
+    # pre-hop serial (blank for a factory HID-KB unit, which exposes no asset data).
+    # Design assumes 1 scanner per terminal: if exactly one is present, take it. If
+    # several, prefer a stable serial match, else the one whose Id changed AND whose
+    # mode left the pre-hop mode, else best-effort first with a Warn. $null if none.
+    param($Obj, [string]$PreHopSerial, [int]$PreHopId, [string]$PreHopMode)
+    $all = @(Get-CoreScannerInventory $Obj)
+    if ($all.Count -eq 0) { return $null }
+    if ($all.Count -eq 1) { return $all[0] }               # 1-scanner terminal: unambiguous
+
+    if ($PreHopSerial) {
+        $bySerial = $all | Where-Object { $_.Serial -eq $PreHopSerial } | Select-Object -First 1
+        if ($bySerial) { return $bySerial }
+    }
+    $moved = $all | Where-Object {
+        $_.Id -ne $PreHopId -and (Get-ScannerHostMode $_) -ne $PreHopMode
+    } | Select-Object -First 1
+    if ($moved) { return $moved }
+
+    Warn '    multiple scanners present and none uniquely re-matched - using first (best-effort)'
+    return ($all | Select-Object -First 1)
+}
+
+function Show-ScannerBarcodeFallback {
+    # Loud, actionable guidance when the automated USB-OPOS switch fails after
+    # retries. The unit still works via the one-scan barcode fallback; exit stays 6.
+    # Scanner_OPOS_barcode.pdf is a repo/tech-share deliverable (NOT shipped in the
+    # .bat), so we auto-open it only if a local copy happens to be present.
+    Warn '*********************************************************************'
+    Warn '*  AUTOMATED USB-OPOS SWITCH FAILED - 1-SCAN BARCODE FIX AVAILABLE   *'
+    Warn '*  1. Open Scanner_OPOS_barcode.pdf (AlleavesAuto repo / tech share) *'
+    Warn '*     - the "OPOS (IBM Hand-Held with Full Disable)" host barcode.   *'
+    Warn '*  2. Scan it ONCE with the Zebra scanner - it sets OPOS at once.    *'
+    Warn '*  3. Reboot, then re-run with -ScannerConfigOnly to confirm/record. *'
+    Warn '*********************************************************************'
+    $pdf = Get-ScannerBarcodePdfPath
+    if ($pdf) { try { Start-Process $pdf } catch {} }
+}
+
+function Get-ScannerBarcodePdfPath {
+    # Return a local Scanner_OPOS_barcode.pdf path if one exists (script dir / WorkDir
+    # / downloads), else $null. Normally absent on a target terminal (not shipped).
+    $candidates = @(
+        (Join-Path $PSScriptRoot 'Scanner_OPOS_barcode.pdf'),
+        (Join-Path $WorkDir 'Scanner_OPOS_barcode.pdf'),
+        (Join-Path $DownloadDir 'Scanner_OPOS_barcode.pdf')
+    )
+    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+    return $null
+}
+
+function Set-ScannerOpos {
+    Step 'Set Zebra scanner(s) to USB-OPOS'
+
+    if ($SkipScannerConfig) { Ok 'scanner OPOS skipped (-SkipScannerConfig)'; return }
+    if ($script:ScannerDegraded) { Warn 'CoreScanner missing - skipping scanner OPOS'; return }
+
+    # DryRun simulates BEFORE the DLL existence + COM checks (same pattern as
+    # Invoke-Installer): on a bare box the real run installs CoreScanner first, so
+    # a not-yet-present Interop DLL is not a dry-run failure, and NO COM is touched.
+    if ($DryRun) {
+        Dry 'would set connected Zebra scanner(s) to USB-OPOS via CoreScanner (opcode 6200, XUA-45001-8)'
+        $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='dryrun'; removable=$false }
+        return
+    }
+
+    $interopDll = 'C:\Program Files\Zebra Technologies\Barcode Scanners\Common\Interop.CoreScanner.dll'
+    if (-not (Test-Path $interopDll)) {
+        Warn "Interop.CoreScanner.dll not found ($interopDll) - skipping scanner OPOS"
+        return
+    }
+
+    $obj = $null
+    try {
+        [System.Reflection.Assembly]::LoadFile($interopDll) | Out-Null
+        $obj = New-Object Interop.CoreScanner.CCoreScannerClass
+
+        # Open for ALL scanner types (scannerTypes[0] = 1).
+        $status    = 0
+        $appHandle = 0
+        $types     = New-Object int16[] 1; $types[0] = 1
+        $obj.Open($appHandle, $types, [int16]1, [ref]$status)
+        if ($status -ne 0) { Warn "CoreScanner Open() returned status $status - skipping scanner OPOS"; return }
+
+        # Ensure the RSM services are up BEFORE the first switch (fresh installs run
+        # this before the recommended reboot, when RSM is often not yet ready -> 112).
+        Confirm-ScannerServicesReady | Out-Null
+
+        $scanners = @(Get-CoreScannerInventory $obj)
+        if ($scanners.Count -eq 0) {
+            # Benign: a terminal set up before its scanner is plugged in still
+            # succeeds (exit 0); just re-run the .bat later with the scanner attached.
+            Warn 'no Zebra scanner connected - skipping OPOS (re-run with the scanner attached)'
+            $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='no-scanner'; removable=$false }
+            return
+        }
+
+        foreach ($s in $scanners) {
+            $label = "$($s.Model) [$($s.Serial)]"
+            $mode  = Get-ScannerHostMode $s
+            $result = 'fail'
+            # Final identity is captured post-hop (a HID-KB start reports blank
+            # serial/model up front; they populate once the unit is in a managed mode).
+            $script:ScannerFinalSerial = $s.Serial
+            $script:ScannerFinalModel  = $s.Model
+
+            if ($ScannerModelsNoOpos -and $s.Model -match $ScannerModelsNoOpos) {
+                Warn "  $label model does not support OPOS - leaving as-is"
+                $result = 'unsupported'
+            }
+            elseif ($mode -eq 'OPOS') {
+                Ok "  $label already USB-OPOS - no change"
+                $result = 'already-opos'
+            }
+            else {
+                # Route to OPOS. From HID-KB or an UNKNOWN/unconfirmed mode we MUST
+                # hop via IBM Hand-held first; IBM/SNAPI may switch directly.
+                $direct = ($mode -eq 'IBM/SNAPI')
+                if ($direct) { Write-Host "  $label : $mode -> USB-OPOS (direct)" }
+                else         { Write-Host "  $label : $mode -> IBM Hand-held -> USB-OPOS (two-hop)" }
+                $result = Set-OneScannerToOpos -Obj $obj -Scanner $s -DirectFromIbm:$direct
+            }
+
+            switch ($result) {
+                'ok'           { Ok   "  $label set to USB-OPOS" }
+                'already-opos' { }   # already logged
+                'unsupported'  { }   # already logged
+                default        { Fail "  $label could NOT be set to USB-OPOS (result=$result)"; $script:ScannerConfigFailed = $true }
+            }
+            $Manifest.scannerConfigured += @{
+                serial=$s.Serial; serialFinal=$script:ScannerFinalSerial; model=$s.Model
+                modelFinal=$script:ScannerFinalModel; hostBefore=$mode; target='USB-OPOS'
+                result=$result; removable=$false
+            }
+        }
+    } catch {
+        Warn "scanner OPOS step failed: $($_.Exception.Message)"
+        $script:ScannerConfigFailed = $true
+    } finally {
+        if ($obj) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($obj) | Out-Null } catch {} }
+    }
+}
+
+function Set-OneScannerToOpos {
+    # Drive ONE physical scanner to USB-OPOS. Re-match after each hop WITHOUT the
+    # pre-hop serial (blank when starting from factory HID-KB, which exposes no asset
+    # data): under the 1-scanner assumption Get-ReenumeratedScanner takes the sole
+    # re-enumerated unit and we refresh serial/id/mode from the now-managed device.
+    # Uses the resilient switch (retries status 112). Returns 'ok'|'unsupported'|'fail'.
+    # *** RIG-DEPENDENT timing/verification: $ScannerReenumWaitSec and the post-
+    #     switch PID verify depend on confirmed PIDs - finalize on the rig. ***
+    param($Obj, $Scanner, [switch]$DirectFromIbm)
+    $serial = $Scanner.Serial      # may be '' for a HID-KB start
+    $id     = $Scanner.Id
+    $mode0  = Get-ScannerHostMode $Scanner
+
+    if (-not $DirectFromIbm) {
+        # Hop 1: -> USB IBM Hand-held (the only legal target out of HID-KB).
+        $st1 = Invoke-ScannerHostSwitchResilient -Obj $Obj -ScannerId $id `
+                 -HostCode $ScannerHostCodeIbmHandheld -HopLabel 'hop1 (IBM Hand-held)'
+        if ($st1 -ne 0) { Warn "    hop1 (IBM Hand-held) returned status $st1" }
+        Start-Sleep -Seconds $ScannerReenumWaitSec
+        $re = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $serial -PreHopId $id -PreHopMode $mode0
+        if (-not $re) { Warn '    scanner did not re-enumerate after the IBM Hand-held hop'; return 'fail' }
+        # 112 never cleared after retries: the RSM channel is genuinely unavailable.
+        if ($st1 -eq $ScannerStatusDeviceUnavailable) {
+            Warn "    hop1 still 112 after $ScannerSwitchMaxRetries attempts - RSM unavailable"
+            return 'fail'
+        }
+        $id     = $re.Id
+        $serial = $re.Serial       # NOW populated (managed mode) - usable for hop 2
+        $mode0  = Get-ScannerHostMode $re
+        if ($re.Serial) { $script:ScannerFinalSerial = $re.Serial }
+        if ($re.Model)  { $script:ScannerFinalModel  = $re.Model }
+    }
+
+    # Hop 2 (or direct): -> USB OPOS.
+    $st2 = Invoke-ScannerHostSwitchResilient -Obj $Obj -ScannerId $id `
+             -HostCode $ScannerHostCodeOpos -HopLabel 'hop2 (OPOS)'
+    Start-Sleep -Seconds $ScannerReenumWaitSec
+    $after = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $serial -PreHopId $id -PreHopMode $mode0
+    if ($after) {
+        if ($after.Serial) { $script:ScannerFinalSerial = $after.Serial }
+        if ($after.Model)  { $script:ScannerFinalModel  = $after.Model }
+        $newMode = Get-ScannerHostMode $after
+        if ($newMode -eq 'OPOS') { return 'ok' }                       # confirmed via type/PID
+        if ($newMode -eq 'unknown' -and $st2 -eq 0) { return 'ok' }    # can't confirm this model's mode: trust clean status
+        Warn "    post-switch mode is '$newMode' (status $st2) - OPOS not confirmed"
+        return 'fail'
+    }
+    # No re-enumeration seen after the OPOS switch: trust a clean status, else fail.
+    if ($st2 -eq 0) { return 'ok' }
+    return 'fail'
+}
+
+# ===========================================================================
 # UNINSTALL (manifest-driven reverse, lifted from uninstall_alleaves.ps1)
 # ===========================================================================
 function Invoke-UninstallPhase {
@@ -2223,13 +2642,72 @@ function Invoke-UninstallPhase {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Fresh install-manifest skeleton. Shared by the full-install and the
+# -ScannerConfigOnly dispatch paths so the key set never drifts between them
+# (Save-Manifest merges a prior on-disk manifest forward, so a scanner-only run
+# preserves the full install's records and only updates scannerConfigured).
+# ---------------------------------------------------------------------------
+function New-InstallManifest {
+    [ordered]@{
+        schemaVersion     = 1
+        timestamp         = (Get-Date).ToString('o')
+        machine           = $env:COMPUTERNAME
+        user              = $env:USERNAME
+        dryRun            = [bool]$DryRun
+        workDir           = $WorkDir
+        downloadDir       = $DownloadDir
+        dependencies      = @()
+        teamViewerRemoved = @()
+        installed         = @()
+        filesPlaced       = @()
+        # Post-install finishing (rename / taskbar / default browser):
+        computerRenamed        = @{}   # { from=...; to=... } - recorded only, NOT reverted
+        regValuesSet           = @()   # { hive; path; name; type; value; prev } - uninstall restores prev (or removes if prev=$null)
+        scheduledTasksCreated  = @()   # task names we created  - uninstall deletes them
+        scheduledTasksDisabled = @()   # task names we disabled - uninstall re-enables them
+        taskbandBackups        = @()   # { sid; profile; favorites(b64); favoritesResolve(b64) } - uninstall restores
+        # Final step: connected Zebra scanner(s) flipped to USB-OPOS. Kept OUT of
+        # 'installed' so a benign 'no-scanner' run doesn't trip the failure tally.
+        # removable=$false: hardware-external state, recorded only (not reverted).
+        scannerConfigured      = @()   # { serial; model; hostBefore; target='USB-OPOS'; result; removable=$false }
+    }
+}
+
 # ===========================================================================
 # DISPATCH
 # ===========================================================================
 $exitCode = 0
 $RunLog = $null
 try {
-    if ($Uninstall) {
+    if ($ScannerConfigOnly) {
+        # Scanner-config-only: run ONLY the final USB-OPOS step - no downloads, no
+        # installs, no finishing. For iterating the OPOS switch on the rig, or to
+        # (re)configure a scanner that was unplugged during the main install. Still
+        # admin (COM + permanent switch); -DryRun works non-elevated. Save-Manifest
+        # MERGES onto any prior install_manifest.json, so this only updates
+        # scannerConfigured and preserves the rest.
+        $RunLog = Join-Path $LogDir ("scannercfg_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+        Start-Transcript -Path $RunLog -Append | Out-Null
+        Write-Host "Alleaves SCANNER-CONFIG ONLY (USB-OPOS)" -ForegroundColor Cyan
+        Write-Host "WorkDir:  $WorkDir"
+        Write-Host "Manifest: $ManifestPath"
+        if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
+
+        $Manifest = New-InstallManifest
+        Set-ScannerOpos
+        Save-Manifest
+
+        # Same non-fatal "re-run with the scanner attached" code as the full install.
+        if ($script:ScannerConfigFailed -and $exitCode -eq 0) {
+            $exitCode = 6
+            Warn 'Scanner present but USB-OPOS switch failed - re-run (scanner attached).'
+            Show-ScannerBarcodeFallback
+        }
+        Step 'Done'
+        Write-Host "Manifest: $ManifestPath"
+        Write-Host "Log:      $RunLog"
+    } elseif ($Uninstall) {
         $RunLog = Join-Path $LogDir ("uninstall_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
         Start-Transcript -Path $RunLog -Append | Out-Null
         Write-Host "Alleaves UNINSTALL" -ForegroundColor Cyan
@@ -2249,25 +2727,7 @@ try {
         Write-Host "Logs:         $LogDir"
         if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
 
-        $Manifest = [ordered]@{
-            schemaVersion     = 1
-            timestamp         = (Get-Date).ToString('o')
-            machine           = $env:COMPUTERNAME
-            user              = $env:USERNAME
-            dryRun            = [bool]$DryRun
-            workDir           = $WorkDir
-            downloadDir       = $DownloadDir
-            dependencies      = @()
-            teamViewerRemoved = @()
-            installed         = @()
-            filesPlaced       = @()
-            # Post-install finishing (rename / taskbar / default browser):
-            computerRenamed        = @{}   # { from=...; to=... } - recorded only, NOT reverted
-            regValuesSet           = @()   # { hive; path; name; type; value; prev } - uninstall restores prev (or removes if prev=$null)
-            scheduledTasksCreated  = @()   # task names we created  - uninstall deletes them
-            scheduledTasksDisabled = @()   # task names we disabled - uninstall re-enables them
-            taskbandBackups        = @()   # { sid; profile; favorites(b64); favoritesResolve(b64) } - uninstall restores
-        }
+        $Manifest = New-InstallManifest
 
         # 0. Computer rename FIRST (prompt up front so the tech can walk away while
         # the long download/install runs). Effective on the post-install reboot.
@@ -2314,7 +2774,12 @@ try {
             Copy-MasterList -Source $source
         }
 
-        # 5. Persist manifest (merged)
+        # 5. FINAL functional step: flip the connected Zebra scanner(s) to USB-OPOS
+        # (runs AFTER all installs, finishing, and the master-list copy - the last
+        # thing that happens before the manifest captures it).
+        Set-ScannerOpos
+
+        # 6. Persist manifest (merged)
         Save-Manifest
 
         # Tidy zero-byte stdout/stderr logs.
@@ -2322,7 +2787,7 @@ try {
             Where-Object { $_.Length -eq 0 } |
             Remove-Item -Force -ErrorAction SilentlyContinue
 
-        # 6. Exit code: non-zero if anything failed (Advisor #4 + F19 dependencies).
+        # 7. Exit code: non-zero if anything failed (Advisor #4 + F19 dependencies).
         # F19: a failed VC++ x64 redist (the exact fresh-box gap this bootstrap
         # closes; CoreScanner hard-depends on it) lands in $Manifest.dependencies,
         # which the old scan ignored - so a broken dependency exited 0. Count it too.
@@ -2339,6 +2804,14 @@ try {
         if ($script:ScannerDegraded -and $exitCode -eq 0) {
             $exitCode = 4
             Warn 'Scanner degraded (CoreScanner missing) - re-run the installer.'
+        }
+        # A scanner WAS connected but the OPOS switch failed (mirrors the ScannerDegraded
+        # ->4 design): distinct non-fatal code 6 ("re-run with the scanner attached") so
+        # RMM can tell it apart from a real install failure (1). Never masks an exit 1.
+        if ($script:ScannerConfigFailed -and $exitCode -eq 0) {
+            $exitCode = 6
+            Warn 'Scanner present but USB-OPOS switch failed - re-run the installer (scanner attached).'
+            Show-ScannerBarcodeFallback
         }
         Step 'Done'
         Write-Host "Manifest: $ManifestPath"
