@@ -5,6 +5,7 @@
 alleaves_b64.txt
 
 # Runtime working state created on target terminals
+AlleavesAuto/
 downloads/
 logs/
 *.log

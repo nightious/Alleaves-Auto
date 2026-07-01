@@ -24,7 +24,7 @@ DS8108, LI2208, MP7000, …). From the factory **USB HID-Keyboard** default it w
 through the required **HID-Keyboard → IBM Hand-held → USB-OPOS** sequence; the change is permanent
 (survives power cycles). **If no scanner is plugged in during the run, that's fine** — the install
 still succeeds; just re-run `Install-Alleaves.bat` later with the scanner attached, or use the
-barcode fallback below.
+barcode fallback below (`scanner/Scanner_OPOS_barcode.pdf`).
 
 Working root is `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`, and the install
 manifest) so state survives a later `-Uninstall`.
@@ -36,8 +36,10 @@ manifest) so state survives a later `-Uninstall`.
 | `alleaves_setup.ps1` | The actual installer — native-PowerShell Google Drive download, silent install, manifest-driven uninstall. |
 | `build-bat.ps1` | Base64-packs `alleaves_setup.ps1` into the single deliverable `Install-Alleaves.bat` (self-verifies SHA256 byte-identity). |
 | `Install-Alleaves.bat` | **The deliverable.** Generated — do not hand-edit. Elevates once, decodes the embedded script, runs it. |
-| `Scanner_OPOS_barcode.pdf` | One-page printable **USB-OPOS programming barcode** — the DS2208 PRG "OPOS (IBM Hand-Held with Full Disable)" host-type barcode. Scan it once to set OPOS with zero PC software when no scanner was attached during the run; a single scan from the factory HID-Keyboard default, and the same barcode works across Zebra USB families. |
-| `DS2208_OPOS.scncfg` | Reference only — a full per-model 123Scan config. **Not** used by the installer (OPOS is set via a CoreScanner command, not a config file). Kept for a possible future full-parameter path. |
+| `scanner/Scanner_OPOS_barcode.pdf` | One-page printable **USB-OPOS programming barcode** — the DS2208 PRG "OPOS (IBM Hand-Held with Full Disable)" host-type barcode. Scan it once to set OPOS with zero PC software when no scanner was attached during the run; a single scan from the factory HID-Keyboard default, and the same barcode works across Zebra USB families. |
+| `scanner/DS2208_OPOS.scncfg` | Reference only — a full per-model 123Scan config. **Not** used by the installer (OPOS is set via a CoreScanner command, not a config file). Kept for a possible future full-parameter path. |
+| `scanner/Collect-ScannerFingerprint.ps1` | Standalone rig tool — dumps a connected Zebra scanner's host mode, USB PID, serial, and model to help finalize the rig-dependent `Set-ScannerOpos` constants. Not part of the install flow. |
+| `docs/SCANNER_OPOS_PLAN.md`, `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Design + hardware-validation follow-on for the scanner USB-OPOS step. |
 
 ## Usage
 
@@ -62,7 +64,7 @@ Codes `4` and `6` are non-fatal "re-run" signals and never mask a hard failure (
 
 The installer sets OPOS automatically (software path). For a terminal that has no scanner attached
 during the run, or a no-PC situation, scan the single **USB-OPOS** programming barcode in
-`Scanner_OPOS_barcode.pdf` — same end result, no software required. It sets OPOS in one scan straight
+`scanner/Scanner_OPOS_barcode.pdf` — same end result, no software required. It sets OPOS in one scan straight
 from the factory HID-Keyboard default (the HID-KB → IBM Hand-held → OPOS two-hop is only needed by the
 software/CoreScanner path, not by scanning the barcode).
 
