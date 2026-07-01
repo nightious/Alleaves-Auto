@@ -2305,6 +2305,7 @@ function Get-ScannerBarcodePdfPath {
     # / downloads), else $null. Normally absent on a target terminal (not shipped).
     $candidates = @(
         (Join-Path $PSScriptRoot 'Scanner_OPOS_barcode.pdf'),
+        (Join-Path $PSScriptRoot 'scanner\Scanner_OPOS_barcode.pdf'),
         (Join-Path $WorkDir 'Scanner_OPOS_barcode.pdf'),
         (Join-Path $DownloadDir 'Scanner_OPOS_barcode.pdf')
     )

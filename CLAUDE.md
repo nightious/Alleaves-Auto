@@ -99,8 +99,8 @@ Major function groups in `alleaves_setup.ps1`:
   miss — the current code addresses both. Confirmed on DESKTOP-GG0BMOA (2026-07-01, DS2208): the three
   Zebra service short-names (`CoreScanner`, `rsmdriverproviderservice`, `ScnSrvc`, now pinned in
   `$ScannerServiceNames`) and OPOS `type=USBOPOS` / PID `4864` (0x1300). Still to capture on hardware:
-  HID-KB/IBM type+PID, hop timing, and one real in-session 112→recovery run. `Scanner_OPOS_barcode.pdf` (committed
-  at repo root) is the no-PC barcode fallback: the single **"OPOS (IBM Hand-Held with Full Disable)"**
+  HID-KB/IBM type+PID, hop timing, and one real in-session 112→recovery run. `scanner/Scanner_OPOS_barcode.pdf` (committed
+  under `scanner/`) is the no-PC barcode fallback: the single **"OPOS (IBM Hand-Held with Full Disable)"**
   USB host-type barcode from the DS2208 PRG (MN-002874-14EN, p.7-5). It sets OPOS in **one scan** from
   the factory HID-Keyboard default — the two-hop above is an SDK `DEVICE_SWITCH_HOST_MODE` constraint
   (HID-KB lacks the Remote-Management channel), **not** a barcode one. Reproduced as clean vector
