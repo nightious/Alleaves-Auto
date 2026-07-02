@@ -44,6 +44,28 @@
     Run ONLY the final USB-OPOS scanner step (no downloads, installs, or finishing).
     For iterating the OPOS switch on the rig, or configuring a scanner that was not
     attached during the main install. Mutually exclusive with -Uninstall.
+
+.PARAMETER NiceLabelLicense
+    Activation ID (license key) fed to NiceLabel's silent install for unattended online
+    activation. Supplying it alone lets the license server auto-populate the owner
+    name/company/country/email, so by default ONLY LICENSECODE is sent.
+    -SkipNiceLabelActivation falls back to plain /s.
+
+.PARAMETER NiceLabelActName
+    Optional ACTIVATIONNAME override (default blank = let the server auto-populate).
+
+.PARAMETER NiceLabelActCompany
+    Optional ACTIVATIONCOMPANY override (default blank = let the server auto-populate).
+
+.PARAMETER NiceLabelActCountry
+    Optional ACTIVATIONCOUNTRY override (default blank = let the server auto-populate).
+
+.PARAMETER NiceLabelActEmail
+    Optional ACTIVATIONEMAIL override (default blank = let the server auto-populate).
+
+.PARAMETER SkipNiceLabelActivation
+    Install NiceLabel with plain /s (no license/activation params) - the license must
+    then be entered manually on that site.
 #>
 
 [CmdletBinding()]
@@ -61,7 +83,14 @@ param(
     [switch]$SkipRename,          # don't prompt/apply a computer rename
     [switch]$SkipChromeTaskbar,   # don't pin Chrome / remove Edge from the taskbar
     [switch]$SkipDefaultBrowser,  # don't make Chrome the default browser
-    [switch]$SkipScannerConfig    # don't flip the connected Zebra scanner(s) to USB-OPOS
+    [switch]$SkipScannerConfig,   # don't flip the connected Zebra scanner(s) to USB-OPOS
+    # --- NiceLabel unattended license activation ---------------------------
+    [string]$NiceLabelLicense = 'FXQWA-6CPFD-ST4FB-TWTCZ-HMUMB',  # activation ID (server auto-fills the rest)
+    [string]$NiceLabelActName = '',      # ACTIVATIONNAME  - optional override (blank = auto-populate)
+    [string]$NiceLabelActCompany = '',   # ACTIVATIONCOMPANY - optional override (blank = auto-populate)
+    [string]$NiceLabelActCountry = '',   # ACTIVATIONCOUNTRY - optional override (blank = auto-populate)
+    [string]$NiceLabelActEmail = '',     # ACTIVATIONEMAIL - optional override (blank = auto-populate)
+    [switch]$SkipNiceLabelActivation     # install with plain /s (manual license entry)
 )
 
 $ErrorActionPreference = 'Continue'
@@ -1367,6 +1396,27 @@ bOpt2=0
 
 $IssMap = @{ '123scan' = $Iss123Scan; 'scannersdk' = $IssScannerSdk }
 
+# NiceLabel 2019 takes the activation ID on the SAME command line as /s, enabling
+# unattended online activation (no tech present): supplying LICENSECODE alone lets
+# the license server auto-populate the owner name/company/country/email, so by
+# default we send ONLY the activation ID. The ACTIVATION* params stay as optional
+# overrides for a site where the server does not auto-fill.
+# CRITICAL: this is passed VERBATIM to ProcessStartInfo.Arguments (see
+# Invoke-Installer), so any override value containing whitespace MUST be quoted or
+# it splits into separate args.
+function Format-InstallerArg([string]$Value) {
+    if ($Value -match '\s') { '"' + $Value + '"' } else { $Value }
+}
+$NiceLabelArgs = '/s'
+if (-not $SkipNiceLabelActivation) {
+    $nlParts = @("LICENSECODE=$NiceLabelLicense")
+    if ($NiceLabelActName)    { $nlParts += "ACTIVATIONNAME=$(Format-InstallerArg $NiceLabelActName)" }
+    if ($NiceLabelActCompany) { $nlParts += "ACTIVATIONCOMPANY=$(Format-InstallerArg $NiceLabelActCompany)" }
+    if ($NiceLabelActCountry) { $nlParts += "ACTIVATIONCOUNTRY=$(Format-InstallerArg $NiceLabelActCountry)" }
+    if ($NiceLabelActEmail)   { $nlParts += "ACTIVATIONEMAIL=$(Format-InstallerArg $NiceLabelActEmail)" }
+    $NiceLabelArgs = '/s ' + ($nlParts -join ' ')
+}
+
 # Per-installer table. DisplayNameMatch is a regex the uninstaller uses to find
 # this product's UninstallString in HKLM:\...\Uninstall.
 $Installers = @(
@@ -1383,7 +1433,7 @@ $Installers = @(
     @{ Name='Zebra 123 Scan';    File='Zebra 123 Scan.exe';        Match='123Scan';           UninstallMatch='123Scan|Zebra CoreScanner';           Iss='123scan';    WrappedMsi=$true; CachedMsi='Zebra 123Scan (64bit).msi' }
     @{ Name='Zebra Scanner SDK'; File='Zebra Scanner SDK.exe';     Match='Zebra Scanner SDK'; UninstallMatch='Zebra Scanner SDK|Zebra CoreScanner'; Iss='scannersdk'; WrappedMsi=$true; CachedMsi='Zebra Scanner SDK (64bit).msi' }
     @{ Name='POS for .NET';      File='POSforDOTNet.msi';          Match='POS for \.NET';     Msi=$true }
-    @{ Name='NiceLabel';         File='Nice Label.exe';            Match='NiceLabel';         ArgString='/s' }
+    @{ Name='NiceLabel';         File='Nice Label.exe';            Match='NiceLabel';         ArgString=$NiceLabelArgs }
 )
 
 function Invoke-InstallLoop {
