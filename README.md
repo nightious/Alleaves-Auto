@@ -4,6 +4,13 @@ Single-file, double-clickable bootstrap for deploying an **Alleaves POS** termin
 onto a stock Windows 10/11 machine. No Python, no `gdown`, no shipped install folder —
 everything downloads and installs from one `.bat`.
 
+## Prerequisites
+
+- **Stock Windows 10 or 11** — no prior preparation needed.
+- **Local administrator rights** — the `.bat` self-elevates once via UAC on double-click.
+- **An active internet connection** reaching Google Drive and the vendor CDNs — every product is
+  downloaded at runtime, so there is no offline/bundled installer.
+
 ## What it installs
 
 In order:
@@ -15,7 +22,13 @@ In order:
 5. Microsoft POS for .NET
 6. NiceLabel
 
-Plus the NiceLabel master-list (`.nlbl`) copy and a Splashtop SOS download.
+Before the Zebra installers it also bootstraps the **Microsoft Visual C++ 2015–2022 x64
+Redistributable** (a prerequisite for the Zebra CoreScanner driver), but only when it is missing.
+As a shared Microsoft runtime it is intentionally left in place on `-Uninstall`.
+
+Plus the NiceLabel master-list (`.nlbl`) copy and a Splashtop SOS download. Any existing
+**TeamViewer** install is removed by default (Splashtop SOS is the remote-access tool for these
+terminals) — pass `-SkipUninstallTeamViewer` to keep it.
 
 As the **final step**, any connected Zebra scanner is automatically switched to **USB-OPOS**
 so the Alleaves POS can read it — no more opening 123Scan to "Load to scanner" by hand. This
@@ -26,8 +39,33 @@ through the required **HID-Keyboard → IBM Hand-held → USB-OPOS** sequence; t
 still succeeds; just re-run `Install-Alleaves.bat` later with the scanner attached, or use the
 barcode fallback below (`scanner/Scanner_OPOS_barcode.pdf`).
 
-Working root is `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`, and the install
-manifest) so state survives a later `-Uninstall`.
+## Per-terminal finishing
+
+Every install also applies a few per-terminal changes so the terminal is floor-ready:
+
+- **Computer rename** — on an interactive (double-clicked) run the installer pauses **early** to
+  prompt for the terminal's computer name (POS name/number); press **Enter** to skip. Preset it
+  non-interactively with `-ComputerName "POS-1"`, or disable the step with `-SkipRename`. The new
+  name takes effect on the next reboot. On an unattended/RMM run there is no prompt, so the terminal
+  is named **only** if you pass `-ComputerName`.
+- **Chrome taskbar pin / Edge removal** — pins Google Chrome to the taskbar and removes Microsoft
+  Edge from it. Skip with `-SkipChromeTaskbar`.
+- **Default browser** — sets Chrome as the default browser. Skip with `-SkipDefaultBrowser`.
+
+The taskbar pin and default-browser change are applied automatically at the next logon (via the
+`AlleavesAuto-FinishUser` task), so they take effect after the reboot below.
+
+## After install — reboot
+
+The installer never auto-reboots (it uses `/norestart` throughout). **Reboot the terminal once** to
+finalize the Zebra CoreScanner driver and apply the computer rename, then **sign back in** so the
+`AlleavesAuto-FinishUser` logon task applies the Chrome taskbar pin and default-browser change. When
+a pending reboot is detected (e.g. the VC++ redistributable requested one), the run prints an
+emphatic `*** REBOOT REQUIRED ***` at the end.
+
+Working root is `%ProgramData%\AlleavesAuto` — a `downloads\` folder and a `logs\` folder (the
+latter holds the per-run transcript **and** the install manifest) — so state survives a later
+`-Uninstall`.
 
 ## Files
 
@@ -38,19 +76,28 @@ manifest) so state survives a later `-Uninstall`.
 | `Install-Alleaves.bat` | **The deliverable.** Generated — do not hand-edit. Elevates once, decodes the embedded script, runs it. |
 | `scanner/Scanner_OPOS_barcode.pdf` | One-page printable **USB-OPOS programming barcode** — the DS2208 PRG "OPOS (IBM Hand-Held with Full Disable)" host-type barcode. Scan it once to set OPOS with zero PC software when no scanner was attached during the run; a single scan from the factory HID-Keyboard default, and the same barcode works across Zebra USB families. |
 | `scanner/DS2208_OPOS.scncfg` | Reference only — a full per-model 123Scan config. **Not** used by the installer (OPOS is set via a CoreScanner command, not a config file). Kept for a possible future full-parameter path. |
-| `scanner/Collect-ScannerFingerprint.ps1` | Standalone rig tool — dumps a connected Zebra scanner's host mode, USB PID, serial, and model to help finalize the rig-dependent `Set-ScannerOpos` constants. Not part of the install flow. |
+| `scanner/Collect-ScannerFingerprint.ps1` | Standalone rig tool. **By default it walks the scanner** HID-KB → IBM Hand-held → USB-OPOS (the same two-hop the installer does) while capturing its host mode, USB PID, serial, and model to help finalize the rig-dependent `Set-ScannerOpos` constants; pass `-SnapshotOnly` to read the current state without changing anything. Not part of the install flow. |
 | `docs/SCANNER_OPOS_PLAN.md`, `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Design + hardware-validation follow-on for the scanner USB-OPOS step. |
 
 ## Usage
 
-Double-click `Install-Alleaves.bat` to install (it requests elevation once).
+Double-click `Install-Alleaves.bat` to install. It elevates once (UAC), then — on an interactive
+run — prompts for the computer name before proceeding; otherwise it runs unattended.
 
 | Argument | Effect |
 | --- | --- |
-| _(none)_ | Install |
-| `-Uninstall` | Reverse a prior install using the persisted manifest. Does **not** reset the scanner — to revert it, scan the "USB HID Keyboard" / "Set Defaults" barcode or re-run 123Scan. |
-| `-DryRun` | Simulate everything; make no system changes (no admin required) |
-| `-SkipScannerConfig` | Don't flip the connected Zebra scanner(s) to USB-OPOS (leave the scanner's host mode untouched) |
+| _(none)_ | Install (products + per-terminal finishing). |
+| `-ComputerName "POS-1"` | Preset the terminal's computer (POS) name and skip the interactive rename prompt. On an unattended/RMM run this is the **only** way to name the terminal. |
+| `-DryRun` | Simulate everything; make no system changes (no admin required). |
+| `-Uninstall` | Reverse a prior install using the persisted manifest. Does **not** revert the computer rename or the scanner's USB-OPOS mode, and leaves shared runtimes (the VC++ redistributable) in place. To revert the scanner, scan the "USB HID Keyboard" / "Set Defaults" barcode or re-run 123Scan. Mutually exclusive with `-ScannerConfigOnly`. |
+| `-ForceReinstall` | Re-download even if a valid cached file exists, and pre-clean/reinstall products already present (a normal re-run skips anything already installed). |
+| `-SkipMasterList` | Don't copy the NiceLabel master list (`.nlbl`) into the admin/cashier Documents folders. |
+| `-SkipUninstallTeamViewer` | Keep any existing TeamViewer install (removed by default). |
+| `-SkipRename` | Don't prompt for / apply the computer rename. |
+| `-SkipChromeTaskbar` | Don't pin Chrome / remove Edge from the taskbar. |
+| `-SkipDefaultBrowser` | Don't make Chrome the default browser. |
+| `-SkipScannerConfig` | Don't flip the connected Zebra scanner(s) to USB-OPOS (leave the scanner's host mode untouched). |
+| `-SkipPrograms <regex...>` | Skip specific products in **both** the download and install phases — any product whose name matches one of the given regex fragments is dropped (e.g. `-SkipPrograms Zebra` skips both Zebra products). Quote a fragment that contains cmd metacharacters, e.g. `-SkipPrograms "Chrome\|NiceLabel"`. |
 | `-ScannerConfigOnly` | Run **only** the USB-OPOS scanner step — skip all downloads, installs, and finishing. Use it to configure a scanner that wasn't attached during the main install (just plug it in and run this), or to re-apply OPOS. Mutually exclusive with `-Uninstall`. |
 
 ### Exit codes
@@ -64,9 +111,19 @@ Codes `4` and `6` are non-fatal "re-run" signals and never mask a hard failure (
 
 The installer sets OPOS automatically (software path). For a terminal that has no scanner attached
 during the run, or a no-PC situation, scan the single **USB-OPOS** programming barcode in
-`scanner/Scanner_OPOS_barcode.pdf` — same end result, no software required. It sets OPOS in one scan straight
-from the factory HID-Keyboard default (the HID-KB → IBM Hand-held → OPOS two-hop is only needed by the
-software/CoreScanner path, not by scanning the barcode).
+`scanner/Scanner_OPOS_barcode.pdf` — same end result, no software required. It sets OPOS in one scan
+straight from the factory HID-Keyboard default (the HID-KB → IBM Hand-held → OPOS two-hop is only
+needed by the software/CoreScanner path, not by scanning the barcode).
+
+## Troubleshooting / logs
+
+If a run fails, look under `%ProgramData%\AlleavesAuto\logs\` (both paths are also echoed at the end
+of every run):
+
+- `install_YYYYMMDD_HHMMSS.log` (or `uninstall_…` / `scannercfg_…` for those modes) — the full
+  per-run transcript.
+- `install_manifest.json` — the JSON record of everything installed, placed, and changed;
+  `-Uninstall` replays it in reverse.
 
 ## Rebuilding the deliverable
 
