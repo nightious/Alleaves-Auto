@@ -24,8 +24,7 @@ param(
     [string]$OutBat
 )
 
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
+$ScriptDir = $PSScriptRoot
 if (-not $Source) { $Source = Join-Path $ScriptDir 'alleaves_setup.ps1' }
 if (-not $OutBat) { $OutBat = Join-Path $ScriptDir 'Install-Alleaves.bat' }
 

@@ -51,18 +51,6 @@
     name/company/country/email, so by default ONLY LICENSECODE is sent.
     -SkipNiceLabelActivation falls back to plain /s.
 
-.PARAMETER NiceLabelActName
-    Optional ACTIVATIONNAME override (default blank = let the server auto-populate).
-
-.PARAMETER NiceLabelActCompany
-    Optional ACTIVATIONCOMPANY override (default blank = let the server auto-populate).
-
-.PARAMETER NiceLabelActCountry
-    Optional ACTIVATIONCOUNTRY override (default blank = let the server auto-populate).
-
-.PARAMETER NiceLabelActEmail
-    Optional ACTIVATIONEMAIL override (default blank = let the server auto-populate).
-
 .PARAMETER SkipNiceLabelActivation
     Install NiceLabel with plain /s (no license/activation params) - the license must
     then be entered manually on that site.
@@ -86,10 +74,6 @@ param(
     [switch]$SkipScannerConfig,   # don't flip the connected Zebra scanner(s) to USB-OPOS
     # --- NiceLabel unattended license activation ---------------------------
     [string]$NiceLabelLicense = 'FXQWA-6CPFD-ST4FB-TWTCZ-HMUMB',  # activation ID (server auto-fills the rest)
-    [string]$NiceLabelActName = '',      # ACTIVATIONNAME  - optional override (blank = auto-populate)
-    [string]$NiceLabelActCompany = '',   # ACTIVATIONCOMPANY - optional override (blank = auto-populate)
-    [string]$NiceLabelActCountry = '',   # ACTIVATIONCOUNTRY - optional override (blank = auto-populate)
-    [string]$NiceLabelActEmail = '',     # ACTIVATIONEMAIL - optional override (blank = auto-populate)
     [switch]$SkipNiceLabelActivation     # install with plain /s (manual license entry)
 )
 
@@ -228,7 +212,8 @@ function ConvertTo-MsiPackedGuid {
 }
 
 function Invoke-SilentUninstall {
-    param([string]$DisplayName, [string]$UninstallString, [string]$QuietUninstallString, [string]$ProductCode, [int]$UninstallTimeoutMs = 360000)
+    param([string]$DisplayName, [string]$UninstallString, [string]$QuietUninstallString, [string]$ProductCode)
+    $UninstallTimeoutMs = 360000   # kill-timeout backstop for a /S-ignoring uninstaller; fixed (no caller varies it)
     $cmd = if ($QuietUninstallString) { $QuietUninstallString } else { $UninstallString }
     # NiceLabel is an InstallShield SUITE whose uninstall fights the unattended
     # flow, so it gets a dedicated handler here (never the generic bootstrapper
@@ -581,10 +566,14 @@ function Invoke-FileDownload {
     }
 }
 
-function Get-DriveFile {
+function Get-FileWithRetry {
+    # Shared download+validate loop for Drive and Splashtop. $Urls[0] is used on every
+    # attempt EXCEPT the last, where $Urls[-1] is used (Drive's alt host). A single-entry
+    # $Urls means the same URL every attempt (Splashtop). Validation is identical to the
+    # old Get-DriveFile: Content-Length size guard (when known) + magic-byte sniff + sidecar.
     param(
         [Parameter(Mandatory)][string]$Label,
-        [Parameter(Mandatory)][string]$FileId,
+        [Parameter(Mandatory)][string[]]$Urls,
         [Parameter(Mandatory)][string]$TargetPath,
         [int]$MaxRetries = 4
     )
@@ -599,13 +588,9 @@ function Get-DriveFile {
     }
     if ($DryRun) { Dry "would download $Label -> $TargetPath"; return $true }
 
-    # confirm=t alone bypasses the Drive virus-scan interstitial (live-tested).
-    $primary  = "https://drive.usercontent.google.com/download?id=$FileId&export=download&confirm=t"
-    $fallback = "https://drive.google.com/uc?export=download&id=$FileId&confirm=t"
-
     for ($i = 0; $i -lt $MaxRetries; $i++) {
-        # Advisor #2B: try the alternate confirm=t host on the final attempt.
-        $url = if ($i -ge ($MaxRetries - 1)) { $fallback } else { $primary }
+        # Advisor #2B: try the alternate host (last entry) on the final attempt.
+        $url = if ($i -ge ($MaxRetries - 1) -and $Urls.Count -gt 1) { $Urls[-1] } else { $Urls[0] }
         Write-Host "  attempt $($i + 1)/$MaxRetries : $url"
 
         $expected = Get-RemoteLength $url
@@ -630,41 +615,28 @@ function Get-DriveFile {
             }
         }
 
-        $delay = [int][math]::Min(30, [math]::Pow(2, $i))
-        if ($i -lt ($MaxRetries - 1)) { Write-Host "  backing off $delay s..."; Start-Sleep -Seconds $delay }
+        if ($i -lt ($MaxRetries - 1)) {
+            $delay = [int][math]::Min(30, [math]::Pow(2, $i))
+            Write-Host "  backing off $delay s..."; Start-Sleep -Seconds $delay
+        }
     }
     Fail "could not download $Label after $MaxRetries attempts"
     Remove-Item $TargetPath -Force -ErrorAction SilentlyContinue
     return $false
 }
 
+function Get-DriveFile {
+    param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string]$FileId,
+          [Parameter(Mandatory)][string]$TargetPath, [int]$MaxRetries = 4)
+    # confirm=t bypasses the Drive virus-scan interstitial; alt host tried on the final attempt.
+    $primary  = "https://drive.usercontent.google.com/download?id=$FileId&export=download&confirm=t"
+    $fallback = "https://drive.google.com/uc?export=download&id=$FileId&confirm=t"
+    return Get-FileWithRetry -Label $Label -Urls @($primary, $fallback) -TargetPath $TargetPath -MaxRetries $MaxRetries
+}
+
 function Get-SplashtopSos {
-    Step "Download: Splashtop SOS"
     $target = Join-Path $DownloadDir 'SplashtopSOS.exe'
-    if ((Test-Path $target) -and -not $ForceReinstall -and (Test-CachedFileValid $target)) {
-        Ok "already present, valid: SplashtopSOS.exe"
-        return $true
-    }
-    if ($DryRun) { Dry "would download SplashtopSOS.exe from Splashtop CDN"; return $true }
-    $url = 'https://download.splashtop.com/sos/SplashtopSOS.exe'
-    for ($i = 0; $i -lt 3; $i++) {
-        $expected = Get-RemoteLength $url
-        $got = Invoke-FileDownload -Url $url -Dest $target
-        if ($got) {
-            $size = (Get-Item $target -ErrorAction SilentlyContinue).Length
-            if (($expected -le 0 -or $size -eq $expected) -and (Test-RealBinary $target)) {
-                Unblock-FileSafe $target
-                Save-FileSizeSidecar $target   # F2: record size for the cache guard
-                Ok "downloaded SplashtopSOS.exe ($size bytes)"
-                return $true
-            }
-            Warn "Splashtop validation failed (size $size / expected $expected) - retrying"
-        }
-        Start-Sleep -Seconds ([int][math]::Min(30, [math]::Pow(2, $i)))
-    }
-    Fail "could not download SplashtopSOS.exe"
-    Remove-Item $target -Force -ErrorAction SilentlyContinue
-    return $false
+    return Get-FileWithRetry -Label 'Splashtop SOS' -Urls @('https://download.splashtop.com/sos/SplashtopSOS.exe') -TargetPath $target -MaxRetries 3
 }
 
 # Download table (core only; filenames MUST match the installer File= column).
@@ -756,7 +728,6 @@ function Invoke-Installer {
         [Parameter(Mandatory)][string]   $Name,
         [Parameter(Mandatory)][string]   $Path,
         [string[]]                       $ArgList,
-        [string]                         $ArgString,
         [string]                         $DisplayNameMatch,
         [int[]]                          $SuccessCodes = @(0, 3010, 1641),
         [switch]                         $ConfirmRegistry   # F6: also require ARP presence (raw-exe installers)
@@ -766,11 +737,10 @@ function Invoke-Installer {
     # DryRun simulates BEFORE the existence check: on a bare machine the real
     # run downloads first, so a not-yet-present installer is not a failure here.
     if ($DryRun) {
-        $cmdDisplay = if ($ArgString) { "$Path $ArgString" } else { "$Path $($ArgList -join ' ')" }
-        Dry "would run: $cmdDisplay"
+        Dry "would run: $Path $($ArgList -join ' ')"
         $Manifest.installed += @{
             name=$Name; source=$Path
-            args=$(if ($ArgString) { $ArgString } else { $ArgList })
+            args=$ArgList
             displayNameMatch=$DisplayNameMatch; result='dryrun'
         }
         return
@@ -783,7 +753,7 @@ function Invoke-Installer {
         return
     }
 
-    $cmdDisplay = if ($ArgString) { "$resolved $ArgString" } else { "$resolved $($ArgList -join ' ')" }
+    $cmdDisplay = "$resolved $($ArgList -join ' ')"
     $stdoutLog  = Join-Path $LogDir ("{0}.stdout.log" -f ($Name -replace '\W','_'))
     $stderrLog  = Join-Path $LogDir ("{0}.stderr.log" -f ($Name -replace '\W','_'))
 
@@ -792,35 +762,11 @@ function Invoke-Installer {
 
     $exit = $null
     try {
-        if ($ArgString) {
-            # ArgString -> ProcessStartInfo.Arguments preserves embedded quotes
-            # verbatim - required for any wrapper whose silent switches pass an
-            # inner quoted payload (e.g. setup.exe /s /v"/qn ..."). NiceLabel
-            # (InstallAware) takes /s alone, so it no longer needs this.
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName               = $resolved
-            $psi.Arguments              = $ArgString
-            $psi.UseShellExecute        = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError  = $true
-            $psi.CreateNoWindow         = $true
-            $proc = [System.Diagnostics.Process]::Start($psi)
-            # Drain BOTH pipes concurrently. Reading stdout to end then stderr
-            # sequentially can deadlock if the child fills the ~4KB stderr buffer
-            # before stdout is drained (it blocks on write, we block on read).
-            $outTask = $proc.StandardOutput.ReadToEndAsync()
-            $errTask = $proc.StandardError.ReadToEndAsync()
-            $proc.WaitForExit()
-            $outTask.Result | Set-Content -Path $stdoutLog -Encoding UTF8
-            $errTask.Result | Set-Content -Path $stderrLog -Encoding UTF8
-            $exit = $proc.ExitCode
-        } else {
-            $p = Start-Process -FilePath $resolved -ArgumentList $ArgList `
-                -Wait -PassThru -WindowStyle Hidden `
-                -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog `
-                -ErrorAction Stop
-            $exit = $p.ExitCode
-        }
+        $p = Start-Process -FilePath $resolved -ArgumentList $ArgList `
+            -Wait -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog `
+            -ErrorAction Stop
+        $exit = $p.ExitCode
     } catch {
         Fail "launch failed: $($_.Exception.Message)"
         $Manifest.installed += @{ name=$Name; result="launch-failed: $($_.Exception.Message)" }
@@ -829,7 +775,7 @@ function Invoke-Installer {
 
     $entry = @{
         name=$Name; source=$Path
-        args=$(if ($ArgString) { $ArgString } else { $ArgList })
+        args=$ArgList
         displayNameMatch=$DisplayNameMatch; exitCode=$exit
         stdoutLog=$stdoutLog; stderrLog=$stderrLog
     }
@@ -1018,7 +964,6 @@ function Invoke-WrappedMsi {
         return
     }
 
-    $stdoutLog = Join-Path $LogDir ("{0}.stdout.log" -f ($Name -replace '\W','_'))
     $msiLog    = Join-Path $LogDir ("{0}.msi.log"    -f ($Name -replace '\W','_'))
 
     Write-Host "  launching wrapper to extract embedded MSI..."
@@ -1396,26 +1341,11 @@ bOpt2=0
 
 $IssMap = @{ '123scan' = $Iss123Scan; 'scannersdk' = $IssScannerSdk }
 
-# NiceLabel 2019 takes the activation ID on the SAME command line as /s, enabling
-# unattended online activation (no tech present): supplying LICENSECODE alone lets
-# the license server auto-populate the owner name/company/country/email, so by
-# default we send ONLY the activation ID. The ACTIVATION* params stay as optional
-# overrides for a site where the server does not auto-fill.
-# CRITICAL: this is passed VERBATIM to ProcessStartInfo.Arguments (see
-# Invoke-Installer), so any override value containing whitespace MUST be quoted or
-# it splits into separate args.
-function Format-InstallerArg([string]$Value) {
-    if ($Value -match '\s') { '"' + $Value + '"' } else { $Value }
-}
-$NiceLabelArgs = '/s'
-if (-not $SkipNiceLabelActivation) {
-    $nlParts = @("LICENSECODE=$NiceLabelLicense")
-    if ($NiceLabelActName)    { $nlParts += "ACTIVATIONNAME=$(Format-InstallerArg $NiceLabelActName)" }
-    if ($NiceLabelActCompany) { $nlParts += "ACTIVATIONCOMPANY=$(Format-InstallerArg $NiceLabelActCompany)" }
-    if ($NiceLabelActCountry) { $nlParts += "ACTIVATIONCOUNTRY=$(Format-InstallerArg $NiceLabelActCountry)" }
-    if ($NiceLabelActEmail)   { $nlParts += "ACTIVATIONEMAIL=$(Format-InstallerArg $NiceLabelActEmail)" }
-    $NiceLabelArgs = '/s ' + ($nlParts -join ' ')
-}
+# NiceLabel 2019 takes the activation ID on /s's command line for unattended online
+# activation; LICENSECODE alone lets the server auto-fill name/company/country/email.
+# An ARRAY (not a string) so it runs through Invoke-Installer's -ArgList path - keep it
+# an array or NiceLabel loses /s and installs non-silent/unlicensed.
+$NiceLabelArgs = if ($SkipNiceLabelActivation) { @('/s') } else { @('/s', "LICENSECODE=$NiceLabelLicense") }
 
 # Per-installer table. DisplayNameMatch is a regex the uninstaller uses to find
 # this product's UninstallString in HKLM:\...\Uninstall.
@@ -1430,10 +1360,10 @@ $Installers = @(
     # UninstallMatch (broad) is recorded for -Uninstall so CoreScanner is also
     # removed. (The single extracted MSI installs the SDK WITHOUT CoreScanner, so
     # the .iss path is required for a working scanner.)
-    @{ Name='Zebra 123 Scan';    File='Zebra 123 Scan.exe';        Match='123Scan';           UninstallMatch='123Scan|Zebra CoreScanner';           Iss='123scan';    WrappedMsi=$true; CachedMsi='Zebra 123Scan (64bit).msi' }
-    @{ Name='Zebra Scanner SDK'; File='Zebra Scanner SDK.exe';     Match='Zebra Scanner SDK'; UninstallMatch='Zebra Scanner SDK|Zebra CoreScanner'; Iss='scannersdk'; WrappedMsi=$true; CachedMsi='Zebra Scanner SDK (64bit).msi' }
+    @{ Name='Zebra 123 Scan';    File='Zebra 123 Scan.exe';        Match='123Scan';           UninstallMatch='123Scan|Zebra CoreScanner';           Iss='123scan';    CachedMsi='Zebra 123Scan (64bit).msi' }
+    @{ Name='Zebra Scanner SDK'; File='Zebra Scanner SDK.exe';     Match='Zebra Scanner SDK'; UninstallMatch='Zebra Scanner SDK|Zebra CoreScanner'; Iss='scannersdk'; CachedMsi='Zebra Scanner SDK (64bit).msi' }
     @{ Name='POS for .NET';      File='POSforDOTNet.msi';          Match='POS for \.NET';     Msi=$true }
-    @{ Name='NiceLabel';         File='Nice Label.exe';            Match='NiceLabel';         ArgString=$NiceLabelArgs }
+    @{ Name='NiceLabel';         File='Nice Label.exe';            Match='NiceLabel';         Args=$NiceLabelArgs }
 )
 
 function Invoke-InstallLoop {
@@ -1454,7 +1384,7 @@ function Invoke-InstallLoop {
         # lingers, so the reinstall runs as a REPAIR that does NOT recreate the ARP
         # entries -> NiceLabel ends up installed but invisible to a later -Uninstall.
         # So skip pre-clean for non-MSI/.iss items; they handle reinstall themselves.
-        if ($ForceReinstall -and ($i.Msi -or $i.Iss -or $i.WrappedMsi)) {
+        if ($ForceReinstall -and ($i.Msi -or $i.Iss)) {
             # Pre-clean with the BROAD UninstallMatch when defined (the two Zebra
             # wrappers) so the shared "Zebra CoreScanner Driver (64bit)" is removed
             # too, not just this item's own product. Removing it per-item is
@@ -1535,20 +1465,6 @@ function Invoke-InstallLoop {
                     Invoke-WrappedMsi -Name $i.Name -WrapperPath $full -DisplayNameMatch $i.Match
                 }
             }
-        } elseif ($i.WrappedMsi) {
-            # Prefer a pre-extracted cached MSI (no wrapper UI flash). Wrapped
-            # installs run STRICTLY sequentially (Advisor #4): the {GUID}-watch +
-            # name-based Stop-Process can kill the wrong wrapper if two overlap.
-            $cached = if ($i.CachedMsi) { Join-Path $DownloadDir $i.CachedMsi } else { $null }
-            if ($cached -and (Test-Path $cached)) {
-                Step $i.Name
-                Write-Host "  using cached extracted MSI: $cached"
-                Invoke-Msi -Name $i.Name -Msi $cached -DisplayNameMatch $i.Match
-            } else {
-                Invoke-WrappedMsi -Name $i.Name -WrapperPath $full -DisplayNameMatch $i.Match
-            }
-        } elseif ($i.ArgString) {
-            Invoke-Installer -Name $i.Name -Path $full -DisplayNameMatch $i.Match -ArgString $i.ArgString
         } else {
             Invoke-Installer -Name $i.Name -Path $full -DisplayNameMatch $i.Match -ArgList $i.Args -ConfirmRegistry:([bool]$i.ConfirmRegistry)
         }
@@ -1560,6 +1476,23 @@ function Invoke-InstallLoop {
 # merge so a program skipped this run (already-installed / -SkipPrograms /
 # download-failed) doesn't drop out and become un-uninstallable.
 # ---------------------------------------------------------------------------
+# Merge prior-manifest items forward that THIS run didn't touch, deduped by a key
+# selector (for scalar arrays the key IS the item). This run wins on a key conflict.
+function Merge-PriorList {
+    param($Current, $Prior, [scriptblock]$Key, [string]$Announce)
+    $have = @{}
+    foreach ($e in @($Current)) { $k = & $Key $e; if ($k) { $have[$k] = $true } }
+    $merged = @($Current)
+    foreach ($p in @($Prior)) {
+        $k = & $Key $p
+        if ($k -and -not $have.ContainsKey($k)) {
+            if ($Announce) { Write-Host "  manifest: carrying forward prior $Announce '$k'" }
+            $merged += $p; $have[$k] = $true
+        }
+    }
+    return ,$merged
+}
+
 function Save-Manifest {
     # Never persist over the real manifest during a dry-run: dryrun entries
     # share program names with real ones and would shadow the 'ok' results in
@@ -1568,57 +1501,15 @@ function Save-Manifest {
     if (Test-Path $ManifestPath) {
         try {
             $prior = Get-Content $ManifestPath -Raw | ConvertFrom-Json
-            $haveNames = @{}
-            foreach ($e in @($Manifest.installed)) { if ($e.name) { $haveNames[$e.name] = $true } }
-            foreach ($p in @($prior.installed)) {
-                if ($p.name -and -not $haveNames.ContainsKey($p.name)) {
-                    Write-Host "  manifest: carrying forward prior entry '$($p.name)' (not touched this run)"
-                    $Manifest.installed += $p
-                }
-            }
-            foreach ($f in @($prior.filesPlaced)) {
-                if ($f -and ($Manifest.filesPlaced -notcontains $f)) { $Manifest.filesPlaced += $f }
-            }
-            foreach ($t in @($prior.teamViewerRemoved)) {
-                if ($t -and ($Manifest.teamViewerRemoved -notcontains $t)) { $Manifest.teamViewerRemoved += $t }
-            }
-            # Carry forward prior dependencies too (e.g. VC++ runtime). Harmless
-            # today since Install-VcRedist re-records every run, but keeps the
-            # merge consistent so a future conditionally-skipped dependency can't
-            # silently drop out of the manifest and become un-uninstallable.
-            $haveDeps = @{}
-            foreach ($d in @($Manifest.dependencies)) { if ($d.name) { $haveDeps[$d.name] = $true } }
-            foreach ($pd in @($prior.dependencies)) {
-                if ($pd.name -and -not $haveDeps.ContainsKey($pd.name)) {
-                    Write-Host "  manifest: carrying forward prior dependency '$($pd.name)'"
-                    $Manifest.dependencies += $pd
-                }
-            }
-            # Carry forward the post-install finishing tracking so a re-run that
-            # skips a feature (e.g. -SkipDefaultBrowser) doesn't strand the prior
-            # change as un-uninstallable. Keyed dedupe (this run wins on conflict).
-            $haveRV = @{}
-            foreach ($e in @($Manifest.regValuesSet)) { if ($e.path) { $haveRV["$($e.path)|$($e.name)"] = $true } }
-            foreach ($p in @($prior.regValuesSet)) {
-                if ($p.path -and -not $haveRV.ContainsKey("$($p.path)|$($p.name)")) { $Manifest.regValuesSet += $p }
-            }
-            $haveCT = @{}
-            foreach ($e in @($Manifest.scheduledTasksCreated)) { if ($e.name) { $haveCT[$e.name] = $true } }
-            foreach ($p in @($prior.scheduledTasksCreated)) { if ($p.name -and -not $haveCT.ContainsKey($p.name)) { $Manifest.scheduledTasksCreated += $p } }
-            $haveDT = @{}
-            foreach ($e in @($Manifest.scheduledTasksDisabled)) { if ($e.name) { $haveDT[$e.name] = $true } }
-            foreach ($p in @($prior.scheduledTasksDisabled)) { if ($p.name -and -not $haveDT.ContainsKey($p.name)) { $Manifest.scheduledTasksDisabled += $p } }
-            $haveTB = @{}
-            foreach ($e in @($Manifest.taskbandBackups)) { if ($e.sid) { $haveTB[$e.sid] = $true } }
-            foreach ($p in @($prior.taskbandBackups)) { if ($p.sid -and -not $haveTB.ContainsKey($p.sid)) { $Manifest.taskbandBackups += $p } }
-            # Carry forward prior scanner-OPOS records (keyed by serial) so a re-run
-            # that skips the step (-SkipScannerConfig) or finds no scanner attached
-            # doesn't drop a prior 'ok' result. This run wins on a serial conflict.
-            $haveSC = @{}
-            foreach ($e in @($Manifest.scannerConfigured)) { if ($e.serial) { $haveSC[$e.serial] = $true } }
-            foreach ($p in @($prior.scannerConfigured)) {
-                if ($p.serial -and -not $haveSC.ContainsKey($p.serial)) { $Manifest.scannerConfigured += $p }
-            }
+            $Manifest.installed              = Merge-PriorList $Manifest.installed              $prior.installed              { param($e) $e.name }   -Announce 'entry'
+            $Manifest.filesPlaced            = Merge-PriorList $Manifest.filesPlaced            $prior.filesPlaced            { param($e) $e }
+            $Manifest.teamViewerRemoved      = Merge-PriorList $Manifest.teamViewerRemoved      $prior.teamViewerRemoved      { param($e) $e }
+            $Manifest.dependencies           = Merge-PriorList $Manifest.dependencies           $prior.dependencies           { param($e) $e.name }   -Announce 'dependency'
+            $Manifest.regValuesSet           = Merge-PriorList $Manifest.regValuesSet           $prior.regValuesSet           { param($e) if ($e.path) { "$($e.path)|$($e.name)" } }
+            $Manifest.scheduledTasksCreated  = Merge-PriorList $Manifest.scheduledTasksCreated  $prior.scheduledTasksCreated  { param($e) $e.name }
+            $Manifest.scheduledTasksDisabled = Merge-PriorList $Manifest.scheduledTasksDisabled $prior.scheduledTasksDisabled { param($e) $e.name }
+            $Manifest.taskbandBackups        = Merge-PriorList $Manifest.taskbandBackups        $prior.taskbandBackups        { param($e) $e.sid }
+            $Manifest.scannerConfigured      = Merge-PriorList $Manifest.scannerConfigured      $prior.scannerConfigured      { param($e) $e.serial }
             if ((-not $Manifest.computerRenamed -or @($Manifest.computerRenamed.Keys).Count -eq 0) -and $prior.computerRenamed -and $prior.computerRenamed.to) {
                 $Manifest.computerRenamed = @{}
                 foreach ($pn in $prior.computerRenamed.PSObject.Properties) { $Manifest.computerRenamed[$pn.Name] = $pn.Value }
@@ -2140,6 +2031,19 @@ function Register-FinishLogonTask {
 # external state, like the computer rename and TeamViewer removal - not reverted.
 # A tech can scan the "USB HID Keyboard" / "Set Defaults" barcode (or re-run
 # 123Scan) to revert. Scanner_OPOS_barcode.pdf is the no-PC fallback.
+#
+# Design notes (migrated from the retired docs/SCANNER_OPOS_PLAN.md):
+#   * Full parameter sets (beeper volume, symbologies, ...) beyond the host-mode
+#     switch would need the per-model .scncfg + opcode 5020 path - a documented
+#     FUTURE option only; regenerate a fresh 123Scan export if that day comes.
+#     Setting OPOS itself never needs it (it is the 6200 command above).
+#   * Factory-reset on uninstall (opcode 2015) was considered and deliberately
+#     skipped: it needs a scanner attached at uninstall AND is SNAPI-only.
+#   * Authority for the host-variant codes + the two-hop: Zebra TechDocs
+#     "PowerShell Scripts for Windows - Examples"
+#     (techdocs.zebra.com/dcs/scanners/powershell-scripts-windows/examples/),
+#     "Scanner SDK for Windows - API" (.../sdk-windows/api/), and the Zebra
+#     support thread "change Host Variant HID Keyboard -> OPOS".
 # ===========================================================================
 
 # Host-variant codes + opcode are STABLE across all Zebra USB scanners.
@@ -2147,29 +2051,26 @@ $ScannerOpcodeSwitchHostMode = 6200
 $ScannerHostCodeOpos         = 'XUA-45001-8'   # USB OPOS (target)
 $ScannerHostCodeIbmHandheld  = 'XUA-45001-1'   # USB IBM Hand-held (mandatory HID-KB hop)
 
-# Host-mode detection. PRIMARY signal is the GetScanners <scanner type="..."> attribute
-# (confirmed on rig: OPOS enumerates as type="USBOPOS"); the PID tables below are the
-# secondary signal. Both feed Get-ScannerHostMode; if neither resolves, the mode reads
-# 'unknown' and takes the UNIVERSAL two-hop (HID-KB -> IBM Hand-held -> OPOS), valid
-# from ANY starting mode - so a gap here is SAFE, it just costs one extra harmless hop.
+# Host-mode detection. The signal is the GetScanners <scanner type="..."> attribute
+# (confirmed on rig: OPOS enumerates as type="USBOPOS"); it feeds Get-ScannerHostMode.
+# If it doesn't resolve, the mode reads 'unknown' and takes the UNIVERSAL two-hop
+# (HID-KB -> IBM Hand-held -> OPOS), valid from ANY starting mode - so a gap here is
+# SAFE, it just costs one extra harmless hop.
 # type-attribute -> mode. Regex, case-insensitive. OPOS confirmed; the SNAPI/IBM/HID-KB
 # strings are the documented CoreScanner type names (confirm the exact HID-KB/IBM strings
-# when a unit is in those modes - unmatched falls through to PID, then 'unknown').
+# when a unit is in those modes - unmatched falls through to 'unknown').
 $ScannerTypeOpos     = 'OPOS'                 # e.g. USBOPOS  (CONFIRMED on rig 2026-07-01)
 $ScannerTypeIbmSnapi = 'SNAPI|IBMHID|IBMTT|IBM'  # USBIBMHID / USBIBMTT / SNAPI
 $ScannerTypeHidKb    = 'HIDKB|HIDKEYBOARD'    # USBHIDKB
-# *** RIG-DEPENDENT PID tables (secondary). GetScanners emits <PID> as a DECIMAL string
-# (e.g. OPOS on the DS2208 = 4864 = 0x1300), so record the literal decimal it prints. ***
-$ScannerPidsOpos     = @('4864')  # USB OPOS: DS2208 = 4864 (0x1300), CONFIRMED on rig 2026-07-01
-$ScannerPidsHidKb    = @()   # TODO[rig]: USB HID-Keyboard PID(s)  (reset a unit to HID-KB to capture)
-$ScannerPidsIbmSnapi = @()   # TODO[rig]: USB IBM/SNAPI PID(s)     (enables the direct-to-OPOS shortcut)
-# TODO[rig]: USB re-enumeration settle time between hops. 12s is a conservative
-# starting point; tune to the slowest observed reconnect on the rig.
-$ScannerReenumWaitSec = 12
-# TODO[rig]: model regex for the few entry-level/pre-RSM units that support only
-# IBM Hand-held/SNAPI (no OPOS). A match records 'unsupported' (Warn, not fail).
-# Empty by default - the deployed DS2208 and all listed families ARE OPOS-capable.
-$ScannerModelsNoOpos = ''
+$ScannerKnownModels  = @('DS2208')  # confirmed OPOS timing/type; any other model dumps a fingerprint
+
+# Adaptive re-enumeration poll: after each host-mode hop, poll GetScanners until the
+# unit's Id or host-mode leaves its pre-hop values, instead of a fixed sleep.
+$ScannerReenumPollMs     = 1000  # GetScanners poll interval
+# ponytail: 40s ceiling = the fingerprint script's proven $MaxWaitSec; only bites on a
+# failed hop (success exits at the real reconnect). RIG-DEPENDENT / TODO[rig]: tune down
+# if the slowest observed reconnect is well under this.
+$ScannerReenumMaxWaitSec = 40
 
 # RSM readiness. The host-mode switch (ExecCommand 6200) rides the Zebra Remote
 # Scanner Management channel, which is UNAVAILABLE (ExecCommand status 112,
@@ -2179,18 +2080,15 @@ $ScannerModelsNoOpos = ''
 # retry 112 (Zebra's documented remediation is "start those services / reboot").
 $ScannerStatusDeviceUnavailable = 112
 # Confirmed on rig (DS2208, CoreScanner 3.4.0.0, 2026-07-01): the three Zebra services
-# and their exact short-names. We resolve by exact name first, then fall back to
-# DisplayName globs for other SDK versions where a short-name might differ.
+# and their exact short-names. We resolve by exact name.
 $ScannerServiceNames = @('CoreScanner', 'rsmdriverproviderservice', 'ScnSrvc')
-$ScannerServiceDisplayPatterns = @('*CoreScanner*', '*RSM*Driver*Provider*', '*Symbol*Scanner*Management*', '*Scanner*Management*')
 $ScannerServiceSettleSec = 8   # TODO[rig]: wait after starting services before the first switch
 $ScannerSwitchMaxRetries = 3   # TODO[rig]: attempts per hop while status 112 is returned
 $ScannerRetryWaitSec     = 5   # TODO[rig]: wait between 112 retries
 
 function Get-ScannerHostMode {
-    # Derive a scanner's USB host mode. PRIMARY signal is the GetScanners
-    # <scanner type="..."> attribute (confirmed: OPOS = "USBOPOS"); the RIG-DEPENDENT
-    # PID tables are the fallback. Returns 'OPOS' | 'IBM/SNAPI' | 'HID-KB' | 'unknown'.
+    # Derive a scanner's USB host mode from the GetScanners <scanner type="..."> attribute
+    # (confirmed: OPOS = "USBOPOS"). Returns 'OPOS' | 'IBM/SNAPI' | 'HID-KB' | 'unknown'.
     # 'unknown' is the safe default (-> universal two-hop), so a gap never misroutes.
     param($Scanner)
     $t = ("$($Scanner.Type)").Trim()
@@ -2198,12 +2096,6 @@ function Get-ScannerHostMode {
         if ($t -match $ScannerTypeOpos)     { return 'OPOS' }
         if ($t -match $ScannerTypeIbmSnapi) { return 'IBM/SNAPI' }
         if ($t -match $ScannerTypeHidKb)    { return 'HID-KB' }
-    }
-    $p = ("$($Scanner.Pid)").Trim().ToLower()
-    if ($p) {
-        if ($ScannerPidsOpos     | Where-Object { $_.ToLower() -eq $p }) { return 'OPOS' }
-        if ($ScannerPidsIbmSnapi | Where-Object { $_.ToLower() -eq $p }) { return 'IBM/SNAPI' }
-        if ($ScannerPidsHidKb    | Where-Object { $_.ToLower() -eq $p }) { return 'HID-KB' }
     }
     return 'unknown'
 }
@@ -2226,12 +2118,13 @@ function Get-CoreScannerInventory {
             foreach ($n in @($x.scanners.scanner)) {
                 if (-not $n) { continue }
                 $list += [pscustomobject]@{
-                    Id     = [int]("$($n.scannerID)".Trim())
-                    Model  = "$($n.modelnumber)".Trim()
-                    Serial = "$($n.serialnumber)".Trim()
-                    Pid    = "$($n.PID)".Trim()
-                    Vid    = "$($n.VID)".Trim()
-                    Type   = "$($n.type)".Trim()   # host-mode signal, e.g. USBOPOS (PRIMARY over PID)
+                    Id       = [int]("$($n.scannerID)".Trim())
+                    Model    = "$($n.modelnumber)".Trim()
+                    Serial   = "$($n.serialnumber)".Trim()
+                    Pid      = "$($n.PID)".Trim()
+                    Type     = "$($n.type)".Trim()   # host-mode signal, e.g. USBOPOS
+                    Vid      = "$($n.VID)".Trim()
+                    Firmware = "$($n.firmware)".Trim()
                 }
             }
         } catch { Warn "could not parse GetScanners XML: $($_.Exception.Message)" }
@@ -2256,8 +2149,8 @@ function Confirm-ScannerServicesReady {
     # Ensure the Zebra CoreScanner + RSM / Symbol Scanner Management services are
     # Running so the RSM channel ExecCommand(6200) uses is available (fixes the
     # status-112 "Device Unavailable" seen when the switch runs in the same session
-    # that just installed the SDK). Resolves by exact short-name first (confirmed on
-    # rig), then DisplayName globs for other SDK versions. STARTS any that are stopped
+    # that just installed the SDK). Resolves by exact short-name (confirmed on
+    # rig). STARTS any that are stopped
     # (never Restart-Service - that would drop the COM Open() we hold), then settles.
     # Returns $true if CoreScanner ended up Running.
     if ($DryRun) { Dry 'would verify/start Zebra CoreScanner + RSM services before the OPOS switch'; return $true }
@@ -2266,11 +2159,6 @@ function Confirm-ScannerServicesReady {
     foreach ($n in $ScannerServiceNames) {
         $s = Get-Service -Name $n -ErrorAction SilentlyContinue
         if ($s) { $svcs += $s }
-    }
-    foreach ($pat in $ScannerServiceDisplayPatterns) {
-        Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like $pat } |
-            ForEach-Object { $svcs += $_ }
     }
     $svcs = $svcs | Sort-Object -Property Name -Unique
     if (-not $svcs) { Warn '  no Zebra scanner services found (CoreScanner absent?)'; return $false }
@@ -2334,11 +2222,27 @@ function Get-ReenumeratedScanner {
     return ($all | Select-Object -First 1)
 }
 
+function Wait-ScannerReenum {
+    # Poll until the scanner re-enumerates after a host-mode hop (its Id or host-mode left
+    # the pre-hop values), replacing a fixed Start-Sleep. Reuses Get-ReenumeratedScanner for
+    # the actual re-match. On the ceiling, Scanner is the last best-effort re-match (may be
+    # $null / unchanged) - the caller's verify decides. Returns @{ Scanner; Seconds }.
+    param($Obj, [string]$PreHopSerial, [int]$PreHopId, [string]$PreHopMode)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $cand = $null
+    while ($sw.Elapsed.TotalSeconds -lt $ScannerReenumMaxWaitSec) {
+        Start-Sleep -Milliseconds $ScannerReenumPollMs
+        $cand = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $PreHopSerial -PreHopId $PreHopId -PreHopMode $PreHopMode
+        if ($cand -and ($cand.Id -ne $PreHopId -or (Get-ScannerHostMode $cand) -ne $PreHopMode)) { break }
+    }
+    $sw.Stop()
+    return @{ Scanner = $cand; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
+}
+
 function Show-ScannerBarcodeFallback {
     # Loud, actionable guidance when the automated USB-OPOS switch fails after
     # retries. The unit still works via the one-scan barcode fallback; exit stays 6.
-    # Scanner_OPOS_barcode.pdf is a repo/tech-share deliverable (NOT shipped in the
-    # .bat), so we auto-open it only if a local copy happens to be present.
+    # Scanner_OPOS_barcode.pdf is a repo/tech-share deliverable (NOT shipped in the .bat).
     Warn '*********************************************************************'
     Warn '*  AUTOMATED USB-OPOS SWITCH FAILED - 1-SCAN BARCODE FIX AVAILABLE   *'
     Warn '*  1. Open Scanner_OPOS_barcode.pdf (AlleavesAuto repo / tech share) *'
@@ -2346,21 +2250,32 @@ function Show-ScannerBarcodeFallback {
     Warn '*  2. Scan it ONCE with the Zebra scanner - it sets OPOS at once.    *'
     Warn '*  3. Reboot, then re-run with -ScannerConfigOnly to confirm/record. *'
     Warn '*********************************************************************'
-    $pdf = Get-ScannerBarcodePdfPath
-    if ($pdf) { try { Start-Process $pdf } catch {} }
 }
 
-function Get-ScannerBarcodePdfPath {
-    # Return a local Scanner_OPOS_barcode.pdf path if one exists (script dir / WorkDir
-    # / downloads), else $null. Normally absent on a target terminal (not shipped).
-    $candidates = @(
-        (Join-Path $PSScriptRoot 'Scanner_OPOS_barcode.pdf'),
-        (Join-Path $PSScriptRoot 'scanner\Scanner_OPOS_barcode.pdf'),
-        (Join-Path $WorkDir 'Scanner_OPOS_barcode.pdf'),
-        (Join-Path $DownloadDir 'Scanner_OPOS_barcode.pdf')
-    )
-    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
-    return $null
+function Write-NewScannerFingerprint {
+    # A scanner Model not in $ScannerKnownModels appeared. Dump every hop's full fingerprint
+    # (inventory fields + hop status + measured reconnect secs) to ONE $LogDir file so the tech
+    # can send it back to finalize the rig-dependent OPOS timing for that model. Records-only.
+    param([string]$Model, [array]$Hops)
+    $safe = ($Model -replace '[^\w.-]', '_')
+    $path = Join-Path $LogDir ("scanner_new_model_{0}_{1:yyyyMMdd_HHmmss}.txt" -f $safe, (Get-Date))
+    $out = @("NEW SCANNER MODEL fingerprint", "model    : $Model", "computer : $env:COMPUTERNAME",
+             "captured : $((Get-Date).ToString('o')) (during USB-OPOS switch)", "")
+    foreach ($h in $Hops) {
+        $s = $h.s
+        if ($s) { $out += ("[{0}] type='{1}' pid={2} vid={3} serial='{4}' model='{5}' id={6} fw='{7}'  | status={8} reconnect={9}s" -f `
+                    $h.label,$s.Type,$s.Pid,$s.Vid,$s.Serial,$s.Model,$s.Id,$s.Firmware,$h.status,$h.seconds) }
+        else    { $out += ("[{0}] (no scanner re-enumerated)  | status={1} reconnect={2}s" -f $h.label,$h.status,$h.seconds) }
+    }
+    $out | Set-Content -Path $path -Encoding UTF8
+    Warn '*********************************************************************'
+    Warn '*  NEW SCANNER MODEL - PLEASE SAVE / SEND THESE LOGS                *'
+    Warn '*  No confirmed OPOS timing for this model yet. A per-hop           *'
+    Warn '*  fingerprint was written so the switch can be finalized for it.   *'
+    Warn '*********************************************************************'
+    Warn "    model: $Model"
+    Warn "    log:   $path"
+    return $path
 }
 
 function Set-ScannerOpos {
@@ -2417,12 +2332,11 @@ function Set-ScannerOpos {
             # serial/model up front; they populate once the unit is in a managed mode).
             $script:ScannerFinalSerial = $s.Serial
             $script:ScannerFinalModel  = $s.Model
+            # Per-hop fingerprint, seeded with the pre-switch state; Set-OneScannerToOpos
+            # appends each hop. Dumped only if the resolved model is unknown (Task 2).
+            $script:ScannerHopLog = @( @{ label='initial'; s=$s; status=$null; seconds=$null } )
 
-            if ($ScannerModelsNoOpos -and $s.Model -match $ScannerModelsNoOpos) {
-                Warn "  $label model does not support OPOS - leaving as-is"
-                $result = 'unsupported'
-            }
-            elseif ($mode -eq 'OPOS') {
+            if ($mode -eq 'OPOS') {
                 Ok "  $label already USB-OPOS - no change"
                 $result = 'already-opos'
             }
@@ -2438,14 +2352,22 @@ function Set-ScannerOpos {
             switch ($result) {
                 'ok'           { Ok   "  $label set to USB-OPOS" }
                 'already-opos' { }   # already logged
-                'unsupported'  { }   # already logged
                 default        { Fail "  $label could NOT be set to USB-OPOS (result=$result)"; $script:ScannerConfigFailed = $true }
             }
-            $Manifest.scannerConfigured += @{
+            $entry = @{
                 serial=$s.Serial; serialFinal=$script:ScannerFinalSerial; model=$s.Model
                 modelFinal=$script:ScannerFinalModel; hostBefore=$mode; target='USB-OPOS'
                 result=$result; removable=$false
             }
+            # New (non-DS2208) model: dump its per-hop fingerprint + warn so the rig
+            # constants can be finalized for it. Model is read post-hop (blank up front
+            # for a HID-KB start). Records-only; never touches the exit code.
+            $newModel = $script:ScannerFinalModel
+            if ($newModel -and ($ScannerKnownModels -notcontains $newModel)) {
+                $entry.newModel       = $true
+                $entry.fingerprintLog = Write-NewScannerFingerprint -Model $newModel -Hops $script:ScannerHopLog
+            }
+            $Manifest.scannerConfigured += $entry
         }
     } catch {
         Warn "scanner OPOS step failed: $($_.Exception.Message)"
@@ -2460,9 +2382,9 @@ function Set-OneScannerToOpos {
     # pre-hop serial (blank when starting from factory HID-KB, which exposes no asset
     # data): under the 1-scanner assumption Get-ReenumeratedScanner takes the sole
     # re-enumerated unit and we refresh serial/id/mode from the now-managed device.
-    # Uses the resilient switch (retries status 112). Returns 'ok'|'unsupported'|'fail'.
-    # *** RIG-DEPENDENT timing/verification: $ScannerReenumWaitSec and the post-
-    #     switch PID verify depend on confirmed PIDs - finalize on the rig. ***
+    # Uses the resilient switch (retries status 112). Returns 'ok'|'fail'.
+    # Each hop waits via Wait-ScannerReenum (adaptive poll to the real reconnect, not a
+    # fixed sleep); OPOS is confirmed by the type attribute (Get-ScannerHostMode).
     param($Obj, $Scanner, [switch]$DirectFromIbm)
     $serial = $Scanner.Serial      # may be '' for a HID-KB start
     $id     = $Scanner.Id
@@ -2473,8 +2395,10 @@ function Set-OneScannerToOpos {
         $st1 = Invoke-ScannerHostSwitchResilient -Obj $Obj -ScannerId $id `
                  -HostCode $ScannerHostCodeIbmHandheld -HopLabel 'hop1 (IBM Hand-held)'
         if ($st1 -ne 0) { Warn "    hop1 (IBM Hand-held) returned status $st1" }
-        Start-Sleep -Seconds $ScannerReenumWaitSec
-        $re = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $serial -PreHopId $id -PreHopMode $mode0
+        $w1 = Wait-ScannerReenum -Obj $Obj -PreHopSerial $serial -PreHopId $id -PreHopMode $mode0
+        $re = $w1.Scanner
+        $script:ScannerHopLog += @{ label='after hop1 (IBM)'; s=$re; status=$st1; seconds=$w1.Seconds }
+        Write-Host "    re-enumerated in $($w1.Seconds)s"
         if (-not $re) { Warn '    scanner did not re-enumerate after the IBM Hand-held hop'; return 'fail' }
         # 112 never cleared after retries: the RSM channel is genuinely unavailable.
         if ($st1 -eq $ScannerStatusDeviceUnavailable) {
@@ -2491,13 +2415,15 @@ function Set-OneScannerToOpos {
     # Hop 2 (or direct): -> USB OPOS.
     $st2 = Invoke-ScannerHostSwitchResilient -Obj $Obj -ScannerId $id `
              -HostCode $ScannerHostCodeOpos -HopLabel 'hop2 (OPOS)'
-    Start-Sleep -Seconds $ScannerReenumWaitSec
-    $after = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $serial -PreHopId $id -PreHopMode $mode0
+    $w2 = Wait-ScannerReenum -Obj $Obj -PreHopSerial $serial -PreHopId $id -PreHopMode $mode0
+    $after = $w2.Scanner
+    $script:ScannerHopLog += @{ label='after hop2 (OPOS)'; s=$after; status=$st2; seconds=$w2.Seconds }
+    Write-Host "    re-enumerated in $($w2.Seconds)s"
     if ($after) {
         if ($after.Serial) { $script:ScannerFinalSerial = $after.Serial }
         if ($after.Model)  { $script:ScannerFinalModel  = $after.Model }
         $newMode = Get-ScannerHostMode $after
-        if ($newMode -eq 'OPOS') { return 'ok' }                       # confirmed via type/PID
+        if ($newMode -eq 'OPOS') { return 'ok' }                       # confirmed via type
         if ($newMode -eq 'unknown' -and $st2 -eq 0) { return 'ok' }    # can't confirm this model's mode: trust clean status
         Warn "    post-switch mode is '$newMode' (status $st2) - OPOS not confirmed"
         return 'fail'
@@ -2701,7 +2627,6 @@ function Invoke-UninstallPhase {
 # ---------------------------------------------------------------------------
 function New-InstallManifest {
     [ordered]@{
-        schemaVersion     = 1
         timestamp         = (Get-Date).ToString('o')
         machine           = $env:COMPUTERNAME
         user              = $env:USERNAME
