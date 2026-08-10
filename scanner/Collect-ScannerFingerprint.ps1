@@ -6,11 +6,13 @@
     finalize the AlleavesAuto USB-OPOS auto-config:
 
       1. the per-mode "fingerprint" (GetScanners <type> + <PID> + <serial>) for
-         HID-Keyboard, IBM Hand-held, and OPOS  -> fills the RIG-DEPENDENT tables in
-         Set-ScannerOpos ($ScannerTypeHidKb/$ScannerTypeIbmSnapi, $ScannerPidsHidKb/IbmSnapi)
+         HID-Keyboard, IBM Hand-held, and OPOS  -> confirms the type strings the installer
+         matches on ($ScannerTypeHidKb / $ScannerTypeIbmSnapi) and gives a full fingerprint
+         for any non-DS2208 model
       2. the REAL in-session ExecCommand status per hop (does status 112 "Device
          Unavailable" occur, and does ensuring the Zebra services + retrying clear it?)
-      3. the measured USB re-enumeration time per hop -> tunes $ScannerReenumWaitSec
+      3. the measured USB re-enumeration time per hop -> validates the installer's adaptive
+         re-enum poll and confirms its ceiling $ScannerReenumMaxWaitSec is comfortable
 
     By DEFAULT it performs the full walk **HID-KB -> IBM Hand-held -> OPOS** (the same
     two-hop the installer does), so a fresh terminal ends up correctly in OPOS - the

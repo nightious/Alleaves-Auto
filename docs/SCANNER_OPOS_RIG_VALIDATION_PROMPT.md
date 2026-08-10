@@ -1,19 +1,21 @@
 # Next step: finalize + validate the scanner USB-OPOS step on the physical rig
 
 > Hand this prompt to a Claude Code session **running on the authorized test rig with a
-> physical Zebra scanner (ideally a DS2208) attached**. It is the follow-on to the work
-> recorded in `SCANNER_OPOS_PLAN.md` (the design) — that step is implemented and was verified
-> only to DryRun + build-SHA256; the real OPOS switch, exact USB PIDs, and hop timing were
-> deliberately deferred to hardware. This prompt finalizes them.
+> physical Zebra scanner (ideally a DS2208) attached**. It is the follow-on to the design
+> recorded in the `Set-ScannerOpos` header comment in `alleaves_setup.ps1` — that step is implemented
+> and was verified only to DryRun + build-SHA256; the real OPOS switch, the exact HID-KB/IBM
+> `type` strings, and hop reconnect timing were deliberately deferred to hardware. This prompt finalizes them.
 
 ## Context (what already exists)
 
-`alleaves_setup.ps1` already contains the full final step. Read it first, plus `CLAUDE.md`
-(repo conventions) and `SCANNER_OPOS_PLAN.md` (the design + the host-variant code table).
+`alleaves_setup.ps1` already contains the full final step. Read it first — especially the
+`Set-ScannerOpos` header comment (the design + the host-variant code table) — plus `CLAUDE.md`
+(repo conventions).
 
-- **`Set-ScannerOpos`** (+ helpers `Get-CoreScannerInventory`, `Get-ScannerHostModeFromPid`,
+- **`Set-ScannerOpos`** (+ helpers `Get-CoreScannerInventory`, `Get-ScannerHostMode`,
   `Invoke-ScannerHostSwitch`, `Invoke-ScannerHostSwitchResilient`, `Confirm-ScannerServicesReady`,
-  `Get-ReenumeratedScanner`, `Set-OneScannerToOpos`, `Show-ScannerBarcodeFallback`) drives the
+  `Get-ReenumeratedScanner`, `Wait-ScannerReenum`, `Set-OneScannerToOpos`, `Show-ScannerBarcodeFallback`,
+  `Write-NewScannerFingerprint`) drives the
   already-installed Zebra CoreScanner COM driver: `Open` → ensure RSM services →
   `GetScanners` → per-scanner route to OPOS via `ExecCommand(6200, "XUA-45001-8", silent, permanent)`.
   From the factory **USB HID-Keyboard** default it does the mandatory two-hop **HID-KB → IBM
@@ -29,21 +31,25 @@
 - **The opcode + host-variant codes are STABLE** and must not change:
   `$ScannerOpcodeSwitchHostMode = 6200`, `$ScannerHostCodeOpos = 'XUA-45001-8'`,
   `$ScannerHostCodeIbmHandheld = 'XUA-45001-1'`.
-- **The placeholders you are here to finalize** are the block marked
-  `*** RIG-DEPENDENT — FINALIZE ON THE TEST RIG ... ***` / `TODO[rig]`:
-  - `$ScannerPidsOpos` — USB OPOS host PID(s) (currently `@()`)
-  - `$ScannerPidsHidKb` — USB HID-Keyboard PID(s) (currently `@()`)
-  - `$ScannerPidsIbmSnapi` — USB IBM/SNAPI PID(s) (currently `@()`)
-  - `$ScannerReenumWaitSec` — re-enumeration settle time between hops (currently `12`)
-  - `$ScannerModelsNoOpos` — model regex for OPOS-incapable units (currently `''`)
-  - `$ScannerServiceDisplayPatterns` — DisplayName globs used to find the Zebra services to start;
+- **What you are here to finalize** (the `RIG-DEPENDENT` / `TODO[rig]` items — mode detection is
+  now **type-only**; the per-mode PID tables were deleted 2026-07-09):
+  - `$ScannerTypeHidKb` / `$ScannerTypeIbmSnapi` — the `type=` regexes for the HID-KB and IBM
+    modes (OPOS = `USBOPOS` already confirmed). Confirm the exact strings a live unit reports in
+    those modes so the `already-opos` skip and the direct-from-IBM/SNAPI shortcut fire correctly.
+  - `$ScannerReenumMaxWaitSec` (`40`) — the adaptive re-enum **poll ceiling** (`Wait-ScannerReenum`
+    polls `$ScannerReenumPollMs` = 1000ms until the unit's Id/type changes). It only bites on a
+    failed hop; confirm it sits comfortably above the **slowest** reconnect you measure.
+  - `$ScannerServiceNames` — exact `-Name` list of Zebra services to start;
     **confirm the real `Get-Service` short-names** (`RSM Driver Provider` / `Symbol Scanner
     Management` names vary by SDK version) and pin them.
   - `$ScannerServiceSettleSec` (`8`), `$ScannerSwitchMaxRetries` (`3`), `$ScannerRetryWaitSec` (`5`)
     — tune from how long RSM takes to become ready after the services start.
-  With the PID lists empty, every scanner reads `'unknown'` → takes the safe **universal
-  two-hop**, which is valid from any starting mode. So nothing is broken today; you are
-  enabling the `already-opos` skip + the direct-from-IBM/SNAPI shortcut, and confirming timing.
+  An unmatched `type` reads `'unknown'` → takes the safe **universal two-hop**, valid from any
+  starting mode. So nothing is broken today; you are confirming the type strings (to enable the
+  skip + direct shortcut) and the reconnect timing. **Any model outside the known families
+  auto-dumps a per-hop fingerprint** to `$LogDir` (`Write-NewScannerFingerprint`) with a loud warn —
+  that file has the exact `type`/reconnect data to finalize a new model; add the confirmed model
+  **family** to the `$ScannerKnownModels` regex.
 - **Fast iteration:** use **`-ScannerConfigOnly`** to run ONLY this step (no
   downloads/installs/finishing). `Install-Alleaves.bat -ScannerConfigOnly`, or non-elevated
   `PowerShell -File .\alleaves_setup.ps1 -ScannerConfigOnly -DryRun`. `Save-Manifest` merges
@@ -64,7 +70,7 @@ Work in small loops using `-ScannerConfigOnly` so you don't re-run the whole ins
    Get-Service | ? { $_.DisplayName -match 'CoreScanner|Scanner Management|RSM|Symbol' } |
      Select Name,DisplayName,Status,StartType | Format-Table -Auto
    ```
-   Pin the confirmed names in `$ScannerServiceDisplayPatterns` (or switch to exact `-Name` lookups).
+   Pin the confirmed names in `$ScannerServiceNames`.
 
 1a. **Reproduce + confirm the 112 fix.** With the scanner in factory HID-KB, stop the RSM/Symbol
    service(s), run `Install-Alleaves.bat -ScannerConfigOnly`, and confirm hop1 returns **112**; then
@@ -73,20 +79,18 @@ Work in small loops using `-ScannerConfigOnly` so you don't re-run the whole ins
    clear 112 in-session, escalate to a `Restart-Service CoreScanner` before `Open()`, or defer the
    switch to a post-reboot one-shot task — document which was needed.
 
-2. **Capture the live PID for each host mode** (this is the crux). For the attached model, record
-   the `GetScanners` `<PID>`, `<modelnumber>`, `<serialnumber>` while the scanner is in each mode:
-   **HID-Keyboard** (factory default), **IBM Hand-held**, and **OPOS**. Get there either by
-   driving `ExecCommand(6200, ...)` with the codes above, or by setting each mode in **123Scan**
-   and reading the PID back. A throwaway diagnostic script that loads the Interop DLL and dumps the
-   parsed `GetScanners` XML is the cleanest way — put it in the scratchpad, not the repo.
-   *Record the exact hex PID strings as they appear in the XML (e.g. `0x????`).*
+2. **Confirm the `type` string for each host mode** (this is the crux — mode detection keys off
+   `type=`, not PID). Record the `GetScanners` `<type>`, `<modelnumber>`, `<serialnumber>` (and
+   `<PID>` for the record) while the scanner is in each mode: **HID-Keyboard** (factory default),
+   **IBM Hand-held**, and **OPOS**. The repo's **`scanner/Collect-ScannerFingerprint.ps1`** already
+   does exactly this — run it (default full walk, or `-SnapshotOnly`); it drives the same
+   `ExecCommand(6200, ...)` hops, dumps the parsed XML per mode, and measures the reconnect seconds.
 
-3. **Fill in the constants** in `alleaves_setup.ps1` from the captured values:
-   `$ScannerPidsOpos`, `$ScannerPidsHidKb`, `$ScannerPidsIbmSnapi`. Set `$ScannerReenumWaitSec`
-   to a value comfortably above the **slowest** reconnect you observe (measure it; don't guess).
-   Replace the `TODO[rig]` / `PLACEHOLDER` wording on each line you finalize with the confirmed
-   value + a short "confirmed on rig <model>" note. Leave `$ScannerModelsNoOpos` empty unless you
-   actually have an OPOS-incapable model to encode.
+3. **Finalize the constants** in `alleaves_setup.ps1` from the captured values: confirm the
+   `$ScannerTypeHidKb` / `$ScannerTypeIbmSnapi` regexes match the strings you observed, and set
+   `$ScannerReenumMaxWaitSec` comfortably above the **slowest** reconnect (measure it; don't guess —
+   the poll exits at the real time, so this only caps a failed hop). Replace the `TODO[rig]` /
+   `ponytail:` wording on each line you finalize with the confirmed value + a "confirmed on rig <model>" note.
 
 4. **Exercise the real two-hop from the factory default.** Reset the scanner to **USB HID
    Keyboard** first (scan "Set Defaults" / "USB HID Keyboard", or via 123Scan), then run
@@ -97,19 +101,20 @@ Work in small loops using `-ScannerConfigOnly` so you don't re-run the whole ins
 
 5. **Verify the other paths:**
    - **Idempotent re-run:** run again → `already-opos` skip, *no* re-enumeration, exit `0`
-     (this is what filling `$ScannerPidsOpos` buys — confirm the PID-based skip fires).
+     (the skip keys off `type=USBOPOS`, already confirmed on the DS2208).
    - **No-scanner:** unplug, run → Warn "no Zebra scanner connected", `result=no-scanner`, exit `0`.
    - **Direct path (optional):** put the scanner in IBM/SNAPI, run → confirm the direct-to-OPOS
-     branch (single hop) works once `$ScannerPidsIbmSnapi` is populated.
-   - **Multi / other model (if available):** confirm the same code path puts a 2nd model
-     (e.g. DS8108) into OPOS unchanged.
+     branch (single hop) fires once the IBM/SNAPI `type` string is confirmed in `$ScannerTypeIbmSnapi`.
+   - **Other family (if available):** confirm a 2nd family (e.g. DS8108) lands in OPOS unchanged, and
+     that it **auto-dumps a `scanner_new_model_*.txt` fingerprint + loud warn** (non-fatal, exit `0`);
+     send that file, then add the family prefix to the `$ScannerKnownModels` regex. A different *SKU*
+     of an already-known family (DS2208-SR7U2100SGW vs DS2208-SR00007ZZWW) must NOT dump a fingerprint.
 
-6. **Decide on the post-switch verification.** Now that `$ScannerPidsOpos` is populated,
-   `Set-OneScannerToOpos` confirms success by the post-switch PID. Sanity-check that the
-   "trust status 0 when the PID table is empty" fallback is no longer the path being taken; keep
-   it as defense-in-depth or tighten it — your call, but document the choice in a comment.
-   **If PID detection proves unreliable on the rig**, leave the PID lists empty and rely on the
-   universal two-hop (the code already does this); note that in the constants block and in CLAUDE.md.
+6. **Confirm the post-switch verification.** `Set-OneScannerToOpos` confirms success via
+   `Get-ScannerHostMode` (the `type=USBOPOS` attribute), falling back to "trust clean status 0"
+   only when the type reads `'unknown'`. Sanity-check that on your rig the switch is confirmed by
+   **type**, not the status-0 fallback. If the type attribute proves unreliable for a model, that
+   model just rides the universal two-hop + status-0 trust — note it in the constants block and CLAUDE.md.
 
 7. **Full round-trip + reboot** (project rule — no partial tests):
    full `Install-Alleaves.bat` → reboot → confirm OPOS holds and is the **last** step in the log;
@@ -128,7 +133,29 @@ Work in small loops using `-ScannerConfigOnly` so you don't re-run the whole ins
    - Update `CLAUDE.md` / `README.md` to reflect the finalized (no-longer-placeholder) constants
      and the committed barcode PDF.
    - Update the memory file `project_scanner_opos_step.md` to mark the rig items done and record
-     the confirmed PIDs / timing.
+     the confirmed `type` strings / reconnect timing.
+
+## Field confirmations so far
+
+| Date | Machine | Model (reported `<modelnumber>`) | Result |
+|---|---|---|---|
+| 2026-07-01 | rig | DS2208 (CoreScanner 3.4.0.0) | `type="USBOPOS"` → `OPOS`; services `CoreScanner` / `rsmdriverproviderservice` / `ScnSrvc` pinned |
+| 2026-07-31 | `DESKTOP-GT30M4V` (Win10 19045) | `DS2208-SR7U2100SGW`, fw `PAADES00-007-R00`, VID 1504 / PID 4864 | `type="USBOPOS"` → `OPOS`, `already-opos` skip, exit `0` |
+
+Raw capture for the 2026-07-31 row: `docs/scanner_fingerprint_DS2208-SR7U2100SGW_20260731.txt`
+(the installer's new-model dump, taken mid-switch with the unit already reporting `USBOPOS`).
+
+The 2026-07-31 run is a **second independent confirmation of the `type` attribute** (different
+machine + CoreScanner install), which is what the skip and direct-hop shortcuts rest on. It also
+exposed the exact-match `$ScannerKnownModels` bug — CoreScanner reports the **kit SKU**
+(`DS2208-SR7U2100SGW`; per Zebra, the kit for scanner `DS2208-SR00007ZZWW`), never the bare family
+name, so `-notcontains` false-flagged every real DS2208 as a new model. Now a family regex.
+
+**Still open:** that unit arrived already in OPOS (`hostBefore=OPOS`), so the two-hop never ran —
+no hop status, no reconnect timing. The `RIG-DEPENDENT` / `TODO[rig]` constants
+(`$ScannerReenumMaxWaitSec`, `$ScannerServiceSettleSec`, `$ScannerSwitchMaxRetries`,
+`$ScannerRetryWaitSec`) and the in-session status-112 recovery remain **unvalidated**. Capturing
+them needs a scanner deliberately reset to HID-KB (step 4 above).
 
 ## Conventions + guardrails
 

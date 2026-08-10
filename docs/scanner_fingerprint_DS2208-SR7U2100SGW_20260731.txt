@@ -1,0 +1,6 @@
+﻿NEW SCANNER MODEL fingerprint
+model    : DS2208-SR7U2100SGW
+computer : DESKTOP-GT30M4V
+captured : 2026-07-31T13:22:53.4968764-05:00 (during USB-OPOS switch)
+
+[initial] type='USBOPOS' pid=4864 vid=1504 serial='26092010552243' model='DS2208-SR7U2100SGW' id=1 fw='PAADES00-007-R00'  | status= reconnect=s
