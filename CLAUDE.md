@@ -10,8 +10,9 @@ Windows 10/11 terminals: silent, idempotent (re-runs skip installed products), r
 (manifest-driven uninstall). `alleaves_setup.ps1` is the **source of truth**; `Install-Alleaves.bat`
 is a **generated transport** — `build-bat.ps1` base64-packs the `.ps1` into the `.bat`, which
 self-elevates once and runs the embedded script. The `.bat` is the whole deliverable. `docs/`
-holds the scanner design + rig-validation notes; `scanner/` holds the no-PC barcode fallback and
-`Collect-ScannerFingerprint.ps1`. README's Files table is the fuller map.
+holds the scanner rig-validation notes (the design lives in the `Set-ScannerOpos` header comment);
+`scanner/` holds the no-PC barcode fallback and `Collect-ScannerFingerprint.ps1`. README's Files
+table is the fuller map.
 
 ## Build & run
 
@@ -82,7 +83,8 @@ Major function groups in `alleaves_setup.ps1`:
 - Zebra products use InstallShield `.iss` response-file silent installs; CoreScanner requires VC++
   first to avoid a forced mid-install reboot.
 - **Scanner USB-OPOS is a CoreScanner *command*, not a file** — never embed a `.scncfg` in the
-  installer (the committed `scanner/DS2208_OPOS.scncfg` is a reference export it never consumes).
+  installer (a per-model `.scncfg` + opcode 5020 is a documented *future* full-config path only —
+  beeper volume, symbologies — never needed to set OPOS itself; regenerate a fresh export if ever used).
   `Set-ScannerOpos` is the LAST functional step and **records-only** on uninstall
   (`removable=$false`, like the rename / TeamViewer removal); it also runs standalone via
   `-ScannerConfigOnly` (own dispatch branch; `Save-Manifest` merges onto the prior manifest, both
@@ -101,7 +103,11 @@ Major function groups in `alleaves_setup.ps1`:
     (`RIG-DEPENDENT` / `TODO[rig]` in `Set-ScannerOpos`; `Get-ScannerHostMode` / `$ScannerServiceNames`
     hold current values — read those, don't copy them here). Confirmed on DS2208; other models and a
     real in-session 112→recovery run still pending — capture with `scanner/Collect-ScannerFingerprint.ps1`,
-    log to `docs/`.
+    log to `docs/` (running table in `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md`).
+  - `$ScannerKnownModels` (which models skip the new-model fingerprint dump) is a **family regex**,
+    not a list: CoreScanner's `<modelnumber>` is the full kit/config SKU (`DS2208-SR7U2100SGW`),
+    never the bare family name, so it's matched with `-notmatch` on the prefix. Add families with
+    `|`; keep it non-empty (`''` matches everything and silences the dump).
   - `scanner/Scanner_OPOS_barcode.pdf` is the no-PC fallback (one scan from the HID-KB default — the
     two-hop is only the SDK path's constraint). A doc deliverable, **not** embedded, so it needs no
     `.bat` rebuild.

@@ -75,9 +75,8 @@ latter holds the per-run transcript **and** the install manifest) — so state s
 | `build-bat.ps1` | Base64-packs `alleaves_setup.ps1` into the single deliverable `Install-Alleaves.bat` (self-verifies SHA256 byte-identity). |
 | `Install-Alleaves.bat` | **The deliverable.** Generated — do not hand-edit. Elevates once, decodes the embedded script, runs it. |
 | `scanner/Scanner_OPOS_barcode.pdf` | One-page printable **USB-OPOS programming barcode** — the DS2208 PRG "OPOS (IBM Hand-Held with Full Disable)" host-type barcode. Scan it once to set OPOS with zero PC software when no scanner was attached during the run; a single scan from the factory HID-Keyboard default, and the same barcode works across Zebra USB families. |
-| `scanner/DS2208_OPOS.scncfg` | Reference only — a full per-model 123Scan config. **Not** used by the installer (OPOS is set via a CoreScanner command, not a config file). Kept for a possible future full-parameter path. |
 | `scanner/Collect-ScannerFingerprint.ps1` | Standalone rig tool. **By default it walks the scanner** HID-KB → IBM Hand-held → USB-OPOS (the same two-hop the installer does) while capturing its host mode, USB PID, serial, and model to help finalize the rig-dependent `Set-ScannerOpos` constants; pass `-SnapshotOnly` to read the current state without changing anything. Not part of the install flow. |
-| `docs/SCANNER_OPOS_PLAN.md`, `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Design + hardware-validation follow-on for the scanner USB-OPOS step. |
+| `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Hardware-validation follow-on for the scanner USB-OPOS step (the design lives in the `Set-ScannerOpos` header comment in `alleaves_setup.ps1`). |
 
 ## Usage
 

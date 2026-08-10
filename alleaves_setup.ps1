@@ -2062,7 +2062,11 @@ $ScannerHostCodeIbmHandheld  = 'XUA-45001-1'   # USB IBM Hand-held (mandatory HI
 $ScannerTypeOpos     = 'OPOS'                 # e.g. USBOPOS  (CONFIRMED on rig 2026-07-01)
 $ScannerTypeIbmSnapi = 'SNAPI|IBMHID|IBMTT|IBM'  # USBIBMHID / USBIBMTT / SNAPI
 $ScannerTypeHidKb    = 'HIDKB|HIDKEYBOARD'    # USBHIDKB
-$ScannerKnownModels  = @('DS2208')  # confirmed OPOS timing/type; any other model dumps a fingerprint
+# Regex (NOT a list): CoreScanner reports the full kit/config SKU in <modelnumber>
+# (DS2208-SR7U2100SGW, DS2208-SR00007ZZWW, ...), never the bare family name - so match the
+# family prefix. Add confirmed families with '|'. Must stay NON-EMPTY: '' matches everything
+# and would silence the new-model fingerprint dump entirely.
+$ScannerKnownModels  = 'DS2208'  # confirmed OPOS timing/type; any other family dumps a fingerprint
 
 # Adaptive re-enumeration poll: after each host-mode hop, poll GetScanners until the
 # unit's Id or host-mode leaves its pre-hop values, instead of a fixed sleep.
@@ -2359,11 +2363,13 @@ function Set-ScannerOpos {
                 modelFinal=$script:ScannerFinalModel; hostBefore=$mode; target='USB-OPOS'
                 result=$result; removable=$false
             }
-            # New (non-DS2208) model: dump its per-hop fingerprint + warn so the rig
-            # constants can be finalized for it. Model is read post-hop (blank up front
-            # for a HID-KB start). Records-only; never touches the exit code.
+            # Model outside the known FAMILIES: dump its per-hop fingerprint + warn so the
+            # rig constants can be finalized for it. Matched as a family regex, since the
+            # reported model is a kit SKU (DS2208-SR7U2100SGW), not the bare family name.
+            # Model is read post-hop (blank up front for a HID-KB start). Records-only;
+            # never touches the exit code.
             $newModel = $script:ScannerFinalModel
-            if ($newModel -and ($ScannerKnownModels -notcontains $newModel)) {
+            if ($newModel -and ($newModel -notmatch $ScannerKnownModels)) {
                 $entry.newModel       = $true
                 $entry.fingerprintLog = Write-NewScannerFingerprint -Model $newModel -Hops $script:ScannerHopLog
             }
