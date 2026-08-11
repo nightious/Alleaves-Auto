@@ -160,7 +160,13 @@ Major function groups in `alleaves_setup.ps1`:
     doc-style deliverable, **not** embedded, so it needs no `.bat` rebuild.
   - The **brand prompt is asked at step 0**, beside the rename prompt, and cached in
     `$script:PrinterBrandResolved` — every interactive question belongs before the long
-    unattended stretch, not at step 5b. Its `Read-Host` is try/catch'd for the same reason the
+    unattended stretch, not at step 5b. Option `4) None` (`-PrinterBrand None`) is the
+    no-receipt-printer answer: it appends `OLE POS Setup` to `$SkipPrograms` so the *existing*
+    `Test-SkipMatch` drops the driver from both the download and install rows, and
+    `Set-PrinterOpos` returns `result='skipped'` — which is why the prompt has to run before
+    the download phase. It returns *before* `Remove-StalePrinterOpos`: None is a skip, not a
+    retro-uninstall. Rejected with `-PrinterConfigOnly` for the same reason
+    `-SkipPrinterConfig` is. Its `Read-Host` is try/catch'd for the same reason the
     rename's is (F14): it throws on a headless run, and an escaping throw lands in the
     top-level catch and turns a clean install into exit 1. `UserInteractive` alone is not a
     sufficient guard — `powershell -NonInteractive` still reports `$true`.

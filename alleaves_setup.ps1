@@ -46,9 +46,11 @@
     attached during the main install. Mutually exclusive with -Uninstall.
 
 .PARAMETER PrinterBrand
-    Receipt printer brand: POS-X (the only one implemented), Star or Epson. Supplying it
-    skips the interactive brand prompt. Star/Epson select cleanly and warn "not yet
-    implemented". Single word - see build-bat.ps1's arg double-wrapping.
+    Receipt printer brand: POS-X (the only one implemented), Star, Epson, or None.
+    Supplying it skips the interactive brand prompt. Star/Epson select cleanly and warn
+    "not yet implemented" (the POS-X driver is still installed). None = this terminal has
+    no receipt printer: the OLE POS Setup driver is neither downloaded nor installed, and
+    the OPOS registration is skipped. Single word - see build-bat.ps1's arg double-wrapping.
 
 .PARAMETER SkipPrinterConfig
     Don't register the OPOS receipt printer / cash drawer device entries.
@@ -89,8 +91,8 @@ param(
     # --- POS-X receipt printer + cash drawer (OPOS) ------------------------
     # Single word, no spaces/apostrophes: build-bat.ps1 double-wraps args through cmd
     # %* and a PS single-quoted string on the non-elevated relaunch.
-    [ValidateSet('POS-X','Star','Epson')]
-    [string]$PrinterBrand,        # skip the brand prompt (only POS-X is implemented)
+    [ValidateSet('POS-X','Star','Epson','None')]
+    [string]$PrinterBrand,        # skip the brand prompt (only POS-X is implemented; None = no printer at all)
     [switch]$SkipPrinterConfig,   # don't register the OPOS printer / cash drawer entries
     [switch]$PrinterConfigOnly,   # run ONLY the OPOS printer step (no downloads/installs)
     # --- NiceLabel unattended license activation ---------------------------
@@ -163,6 +165,13 @@ if ($PrinterConfigOnly -and ($Uninstall -or $ScannerConfigOnly)) {
 # step" is a run that does nothing and exits 0, which reads as success to RMM.
 if ($PrinterConfigOnly -and $SkipPrinterConfig) {
     Fail "-PrinterConfigOnly and -SkipPrinterConfig are mutually exclusive (that run would do nothing)."
+    exit 2
+}
+# -PrinterBrand None is the same contradiction said a different way. (Answering None at the
+# PROMPT under -PrinterConfigOnly needs no guard: the "registered nothing" check in that
+# branch already turns it into exit 7.)
+if ($PrinterConfigOnly -and $PrinterBrand -eq 'None') {
+    Fail "-PrinterConfigOnly and -PrinterBrand None are mutually exclusive (that run would do nothing)."
     exit 2
 }
 
@@ -2954,10 +2963,12 @@ function Resolve-PrinterBrand {
             Write-Host '    1) POS-X   (default)'
             Write-Host '    2) Star TSP'
             Write-Host '    3) Epson'
-            $sel = Read-Host '  Select 1-3 (Enter for POS-X)'
+            Write-Host '    4) None - no receipt printer (skips the driver install too)'
+            $sel = Read-Host '  Select 1-4 (Enter for POS-X)'
             switch ("$sel".Trim()) {
                 '2' { $brand = 'Star' }
                 '3' { $brand = 'Epson' }
+                '4' { $brand = 'None' }
             }
         } catch {
             Warn "no console for the printer-brand prompt - defaulting to POS-X ($($_.Exception.Message))"
@@ -2996,6 +3007,18 @@ function Set-PrinterOpos {
     if ($SkipPrinterConfig) { Ok 'printer OPOS skipped (-SkipPrinterConfig)'; return }
 
     $brand = Resolve-PrinterBrand
+    # Deliberate "this terminal has no receipt printer" - distinct from 'not-implemented' so
+    # the manifest doesn't blame an unimplemented brand for a choice the tech made. Returns
+    # BEFORE Remove-StalePrinterOpos: None means skip, not retro-uninstall a prior run's
+    # entries (-Uninstall is what removes those).
+    if ($brand -eq 'None') {
+        Ok 'no receipt printer selected - skipping OPOS registration'
+        $Manifest.printerConfigured += @{
+            logicalName='(none:None)'; deviceClass=$null; deviceType=$null
+            progId=$null; brand=$brand; result='skipped'; removable=$true
+        }
+        return
+    }
     if ($brand -ne 'POS-X') {
         Warn "$brand printers are not yet implemented - skipping OPOS registration."
         $Manifest.printerConfigured += @{
@@ -3213,7 +3236,14 @@ try {
         # 0b. Ask the printer brand HERE, next to the rename, for the same reason:
         # every interactive question belongs before the long unattended stretch. The
         # answer is cached and consumed by Set-PrinterOpos at step 5b.
-        if (-not $SkipPrinterConfig) { Resolve-PrinterBrand | Out-Null }
+        # "None" also has to reach the DOWNLOAD phase below, which is why it is asked
+        # before it: no printer means the vendor driver isn't wanted either, and feeding
+        # $SkipPrograms reuses Test-SkipMatch for both the download and the install row
+        # instead of adding a second skip mechanism.
+        if (-not $SkipPrinterConfig -and (Resolve-PrinterBrand) -eq 'None') {
+            $SkipPrograms += 'OLE POS Setup'
+            Ok 'no receipt printer - OLE POS Setup will not be downloaded or installed'
+        }
 
         # 1. Download
         Invoke-DownloadPhase
