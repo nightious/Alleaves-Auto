@@ -1,8 +1,9 @@
 <#
     Collect-PrinterFingerprint.ps1
     ---------------------------------------------------------------------------
-    Run this on a terminal that has a POS-X receipt printer (and/or cash drawer)
-    ATTACHED. We have never had one on the bench: every constant in Set-PrinterOpos
+    Run this on a terminal that has a POS-X receipt printer ATTACHED (with the cash
+    drawer on its RJ-11, if there is one). We have never had one on the bench: every
+    constant in Set-PrinterOpos
     was captured from the vendor's own SetupPOS.exe on a printer-less rig, and the
     OPOS device entries were proved to Open() with nothing plugged in. What is still
     unknown is everything that only a real unit can show.
@@ -10,8 +11,11 @@
     This capture yields, in order:
 
       1. The OPOS device entries as they actually exist, verbatim, in BOTH registry
-         views - validates what Set-PrinterOpos wrote (and the per-terminal LDNs
-         <POSname>_Printer / <POSname>_Drawer).
+         views - validates what Set-PrinterOpos wrote (the per-terminal LDN
+         <POSname>_Printer), and reads back the printer's DrawerOpen value.
+         The cash drawer has NO device entry of its own as of 2026-08-12: it follows
+         the printer. A CashDrawer\* key showing up here is a leftover from an older
+         run, not something this build creates.
       2. The ProgID -> CLSID -> InprocServer32 chain, i.e. whether the service
          objects the entries point at are really registered and really on disk.
       3. Get-PnpDevice for the attached USB printer: VID / PID / status / device
@@ -24,11 +28,12 @@
          itself informative, not a requirement.
       5. Unless -SnapshotOnly, a live OPOS probe: Open -> ClaimDevice ->
          DeviceEnabled -> PrintNormal, reporting a result code per call. THIS PRINTS
-         A TEST RECEIPT and opens the cash drawer.
+         A TEST RECEIPT. Watch the drawer while it prints: whether it kicks is the
+         test of the printer's DrawerOpen ("Open CashDrawer") setting - there is no
+         separate drawer device to probe any more.
 
-    Already known (do NOT need again): the printer/drawer value sets, the ProgIDs
-    (RecPrinter.POSPrinter.SOU / Standard.CashDrawer.SOU), and that Open() returns 0
-    with no hardware.
+    Already known (do NOT need again): the printer value set, the ProgID
+    (RecPrinter.POSPrinter.SOU), and that Open() returns 0 with no hardware.
 
     Invocation (ELEVATED):
         powershell -ExecutionPolicy Bypass -File .\Collect-PrinterFingerprint.ps1
@@ -39,8 +44,7 @@
 [CmdletBinding()]
 param(
     [switch]$SnapshotOnly,      # read current state only; do not touch the hardware
-    [string]$PrinterName,       # override the printer LDN (default <COMPUTERNAME>_Printer)
-    [string]$DrawerName         # override the drawer  LDN (default <COMPUTERNAME>_Drawer)
+    [string]$PrinterName        # override the printer LDN (default <COMPUTERNAME>_Printer)
 )
 
 $ErrorActionPreference = 'Continue'
@@ -48,7 +52,6 @@ $OposRoots  = @('HKLM:\SOFTWARE\WOW6432Node\OLEforRetail', 'HKLM:\SOFTWARE\OLEfo
 $InstDir    = 'C:\Program Files (x86)\OPOS\StdOPOS2.84'
 $Ps32       = "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 if (-not $PrinterName) { $PrinterName = "$env:COMPUTERNAME`_Printer" }
-if (-not $DrawerName)  { $DrawerName  = "$env:COMPUTERNAME`_Drawer" }
 # GetFolderPath, not $env:USERPROFILE\Desktop: a OneDrive-redirected Desktop makes that
 # path nonexistent, Start-Transcript then fails and the closing Stop-Transcript throws.
 $Desktop    = [Environment]::GetFolderPath('Desktop')
@@ -97,11 +100,11 @@ function Resolve-ProgId($progId) {
 
 # --------------------------------------------------------------------------
 Start-Transcript -Path $ReportPath -Append | Out-Null
-Write-Host "POS-X printer / cash drawer OPOS FINGERPRINT - $(Get-Date)"
+Write-Host "POS-X receipt printer OPOS FINGERPRINT - $(Get-Date)"
 Write-Host "Machine : $env:COMPUTERNAME   User: $env:USERNAME"
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Write-Host "Elevated: $admin   Mode: $(if($SnapshotOnly){'SNAPSHOT-ONLY (no printing)'}else{'FULL (WILL PRINT A RECEIPT + OPEN THE DRAWER)'})"
-Write-Host "Looking for LDNs: printer='$PrinterName'  drawer='$DrawerName'"
+Write-Host "Elevated: $admin   Mode: $(if($SnapshotOnly){'SNAPSHOT-ONLY (no printing)'}else{'FULL (WILL PRINT A TEST RECEIPT)'})"
+Write-Host "Looking for LDN: printer='$PrinterName'"
 
 Section '1. OPOS device entries - both registry views, verbatim'
 foreach ($r in $OposRoots) {
@@ -124,10 +127,18 @@ foreach ($r in $OposRoots) {
 if (-not $found) { Write-Host '    NONE - the installer step did not run, or ran against a different name.' }
 Write-Host ''
 Write-Host ("  expected printer LDN present : {0}" -f ($found -contains $PrinterName))
-Write-Host ("  expected drawer  LDN present : {0}" -f ($found -contains $DrawerName))
+# The cash drawer has no device entry of its own - it follows the printer, and THIS is
+# the value that decides whether it does. Captured default is 0 ("not used"); the value
+# for SetupPOS's "Open CashDrawer = Follow Printer" is what a field capture must confirm.
+$drawerOpen = '(printer key not found)'
+foreach ($r in $OposRoots) {
+    $pk = "$r\ServiceOPOS\POSPrinter\$PrinterName"
+    if (Test-Path $pk) { $drawerOpen = (Get-Item $pk).GetValue('DrawerOpen', '(value absent)'); break }
+}
+Write-Host ("  printer DrawerOpen value     : {0}   <- 'Open CashDrawer' setting" -f $drawerOpen)
 
 Section '2. ProgID -> CLSID -> InprocServer32'
-foreach ($p in @('RecPrinter.POSPrinter.SOU','Standard.CashDrawer.SOU','OPOS.POSPrinter','OPOS.CashDrawer')) { Resolve-ProgId $p }
+foreach ($p in @('RecPrinter.POSPrinter.SOU','OPOS.POSPrinter')) { Resolve-ProgId $p }
 
 Section '3. USB printer PnP device  *** THE MOST VALUABLE PART - WE HAVE NO SAMPLE ***'
 $pnp = @()
@@ -184,7 +195,7 @@ if ($SnapshotOnly) {
     return
 }
 
-Section '6. LIVE OPOS PROBE - this prints a receipt and opens the drawer'
+Section '6. LIVE OPOS PROBE - this prints a test receipt'
 # The CCOs are 32-bit, so shell out to the WOW64 host rather than relaunching the
 # whole script under it. Each call reports its own result code.
 $probe = @"
@@ -210,18 +221,8 @@ try {
 } catch { Write-Host ('  POSPrinter probe threw: ' + `$_.Exception.Message) }
 
 Write-Host ''
-Write-Host '  --- CashDrawer: $DrawerName ---'
-try {
-  `$d = New-Object -ComObject OPOS.CashDrawer
-  RC "Open('$DrawerName')" `$d.Open('$DrawerName')
-  RC 'ClaimDevice(3000)' `$d.ClaimDevice(3000)
-  `$d.DeviceEnabled = `$true
-  Write-Host ('  DrawerOpened (before)    : ' + `$d.DrawerOpened)
-  RC 'OpenDrawer()' `$d.OpenDrawer()
-  Write-Host ('  ResultCode               : ' + `$d.ResultCode)
-  try { `$d.DeviceEnabled = `$false; `$d.ReleaseDevice(); `$d.Close() } catch {}
-} catch { Write-Host ('  CashDrawer probe threw: ' + `$_.Exception.Message) }
-
+Write-Host '  DID THE CASH DRAWER KICK while that receipt printed? (DrawerOpen = $drawerOpen)'
+Write-Host '  That is the whole drawer test - there is no separate drawer device.'
 Write-Host ''
 Write-Host '  OPOS codes: 0=OK 101=CLOSED 103=NOTCLAIMED 104=NOSERVICE 105=DISABLED'
 Write-Host '              106=ILLEGAL 107=NOHARDWARE 108=OFFLINE 109=NOEXIST 111=FAILURE 112=TIMEOUT'
@@ -234,7 +235,7 @@ Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
 Section '7. SUMMARY (paste this back)'
 Write-Host ("  machine        : {0}" -f $env:COMPUTERNAME)
 Write-Host ("  printer LDN    : {0}   present={1}" -f $PrinterName, ($found -contains $PrinterName))
-Write-Host ("  drawer  LDN    : {0}   present={1}" -f $DrawerName, ($found -contains $DrawerName))
+Write-Host ("  DrawerOpen     : {0}   (did the drawer kick? note it in the row)" -f $drawerOpen)
 Write-Host ("  driver in ARP  : {0}" -f [bool]$app)
 Write-Host ("  USB candidates : {0}" -f @($pnp).Count)
 Write-Host '  -> record the row in docs/PRINTER_OPOS_FIELD_RESULTS.md'

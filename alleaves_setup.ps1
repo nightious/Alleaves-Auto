@@ -53,10 +53,10 @@
     the OPOS registration is skipped. Single word - see build-bat.ps1's arg double-wrapping.
 
 .PARAMETER SkipPrinterConfig
-    Don't register the OPOS receipt printer / cash drawer device entries.
+    Don't register the OPOS receipt printer device entry.
 
 .PARAMETER PrinterConfigOnly
-    Run ONLY the OPOS printer + cash drawer registration (no downloads, installs, or
+    Run ONLY the OPOS receipt printer registration (no downloads, installs, or
     finishing). Use it to re-apply the entries, or to fix them after a rename. The POS-X
     driver must already be installed. Mutually exclusive with -Uninstall and
     -ScannerConfigOnly.
@@ -88,12 +88,12 @@ param(
     [switch]$SkipChromeTaskbar,   # don't pin Chrome / remove Edge from the taskbar
     [switch]$SkipDefaultBrowser,  # don't make Chrome the default browser
     [switch]$SkipScannerConfig,   # don't flip the connected Zebra scanner(s) to USB-OPOS
-    # --- POS-X receipt printer + cash drawer (OPOS) ------------------------
+    # --- POS-X receipt printer (OPOS) --------------------------------------
     # Single word, no spaces/apostrophes: build-bat.ps1 double-wraps args through cmd
     # %* and a PS single-quoted string on the non-elevated relaunch.
     [ValidateSet('POS-X','Star','Epson','None')]
     [string]$PrinterBrand,        # skip the brand prompt (only POS-X is implemented; None = no printer at all)
-    [switch]$SkipPrinterConfig,   # don't register the OPOS printer / cash drawer entries
+    [switch]$SkipPrinterConfig,   # don't register the OPOS receipt printer entry
     [switch]$PrinterConfigOnly,   # run ONLY the OPOS printer step (no downloads/installs)
     # --- NiceLabel unattended license activation ---------------------------
     [string]$NiceLabelLicense = 'FXQWA-6CPFD-ST4FB-TWTCZ-HMUMB',  # activation ID (server auto-fills the rest)
@@ -215,7 +215,7 @@ $script:FinishBrowser   = $false   # taskbar/browser features set these; if eith
 $script:FinishTaskbar   = $false   # true, a per-user logon task is registered to finish.
 $script:ScannerDegraded = $false   # F20: set if CoreScanner is missing post-install (exit 4)
 $script:ScannerConfigFailed = $false   # set if a connected scanner is present but the OPOS switch fails (exit 6)
-$script:PrinterConfigFailed = $false   # set if an OPOS printer/drawer device entry fails to write (exit 7)
+$script:PrinterConfigFailed = $false   # set if the OPOS printer device entry fails to write (exit 7)
 $script:PrinterBrandResolved = $null   # brand answered ONCE up front (see Resolve-PrinterBrand)
 $script:UserAgent       = 'Mozilla/5.0 AlleavesAuto/1.0'   # F3: one UA for BITS + WebClient + HEAD/GET probe
 
@@ -708,7 +708,7 @@ $DriveFiles = @(
     @{ Label='Zebra Scanner SDK';     FileId='1K5DR-STIxxtsnwklcbTCpo8cPFCwcIUa'; File='Zebra Scanner SDK.exe' }
     @{ Label='POS for .NET';          FileId='1pYr5skO85h8baFByy9z_ZN1ZPiDnfN_D'; File='POSforDOTNet.msi' }   # F7: Label aligned with install Name so one -SkipPrograms fragment hits both phases
     @{ Label='Nice Label';            FileId='1C6eDiJBp1S8aVw9i4iebDbs-JC2ERBZn'; File='Nice Label.exe' }
-    @{ Label='OLE POS Setup';         FileId='1y14kZ2g4Bwqhi9M0inszCCi_TREkNaH0'; File='OLE POS Setup.exe' }   # POS-X receipt printer + cash drawer OPOS driver
+    @{ Label='OLE POS Setup';         FileId='1y14kZ2g4Bwqhi9M0inszCCi_TREkNaH0'; File='OLE POS Setup.exe' }   # POS-X receipt printer OPOS driver
     @{ Label='Master List';           FileId='1dPktafxPsoumHSKDC5z7Nm-Jl3sgx2PQ'; File='Alleaves Nice Label Master List.nlbl' }
 )
 # SKIP (phase-2 drivers, not installed today): Star TSP 100.
@@ -1479,7 +1479,7 @@ $Installers = @(
     @{ Name='Zebra Scanner SDK'; File='Zebra Scanner SDK.exe';     Match='Zebra Scanner SDK'; UninstallMatch='Zebra Scanner SDK|Zebra CoreScanner'; Iss='scannersdk'; CachedMsi='Zebra Scanner SDK (64bit).msi' }
     @{ Name='POS for .NET';      File='POSforDOTNet.msi';          Match='POS for \.NET';     Msi=$true }
     @{ Name='NiceLabel';         File='Nice Label.exe';            Match='NiceLabel';         Args=$NiceLabelArgs }
-    # POS-X receipt printer + cash drawer OPOS driver. PackageForTheWeb stub wrapping an
+    # POS-X receipt printer OPOS driver. PackageForTheWeb stub wrapping an
     # InstallShield 5.52 (InstallScript) engine - a different animal from the Zebra IS7
     # pair above, hence the four Iss* overrides. Every override defaults to today's
     # behaviour in Invoke-IssSilent, so the validated Zebra path stays byte-identical.
@@ -2857,16 +2857,20 @@ function Invoke-UninstallPhase {
 }
 
 # ===========================================================================
-# POS-X receipt printer + cash drawer: OPOS device registration.
+# POS-X receipt printer: OPOS device registration.
 #
 # The vendor installer ("OLE POS Setup 2.84") stages the files and registers the
 # COM objects; SetupPOS.exe is only a GUI over the registry. So we make the device
-# entries ourselves - silent, tracked, and reversible. Everything below was CAPTURED
+# entry ourselves - silent, tracked, and reversible. Everything below was CAPTURED
 # from a real SetupPOS run and diffed (see docs/PRINTER_POSX_OPOS_HANDOFF.md Q3);
 # NONE of it is authored. The OPOS spec mandates only (default)=ProgID - the rest is
-# vendor-private, and deriving it from Thermal.inf/StdCash.inf would have been subtly
-# wrong (Description and PortShare appear in neither, and the drawer's IdleSleep /
-# Timeout are 0 where the printer's are 10 / 1000).
+# vendor-private, and deriving it from Thermal.inf would have been subtly wrong
+# (Description and PortShare appear in neither section of it).
+#
+# The cash drawer has NO device entry of its own (dropped 2026-08-12). It hangs off
+# the printer's RJ-11 and Standard.CashDrawer.SOU resolved to the printer's own
+# POSPrinterSOU.dll anyway, so a second logical device bought nothing - the drawer
+# now follows the printer via DrawerOpen=1 below ("Open CashDrawer" = "Follow Printer").
 #
 # WOW6432Node is explicit and correct: the CCOs and service objects are 32-bit, and
 # the .bat forces the 64-bit PowerShell host, whose registry provider takes the path
@@ -2891,25 +2895,13 @@ $PrinterOposDevices = @(
             BaudrateSel=''; BitLengthSel=''; HandShakeSel=''; IP=''; ParitySel=''; StopSel=''; XonXoffSel=''
         }
         DWords = [ordered]@{
-            Baudrate=0; BitLength=0; DrawerOpen=0; HandShake=0; IdleSleep=10; InputBuf=0
+            # DrawerOpen=1 is SetupPOS's "Open CashDrawer" = "Follow Printer" - the cash
+            # drawer's whole configuration now that it has no device entry of its own.
+            # CAPTURED 2026-08-12, not authored: driving the real SetupPOS combo from
+            # 'CashDrawer' (0) to 'Follow Printer' (1) and diffing HKLM\...\OLEforRetail
+            # changed exactly this one value. Thermal.inf's [UOPTION] default is 0.
+            Baudrate=0; BitLength=0; DrawerOpen=1; HandShake=0; IdleSleep=10; InputBuf=0
             InputSleep=10; OutputBuf=1024; Parity=0; PortShare=0; Stop=0; Timeout=1000
-            USBSerialNumber=0; XonXoff=0
-        }
-    }
-    @{
-        Class = 'CashDrawer'; Suffix = '_Drawer'; Type = 'StandardU'
-        ProgId = 'Standard.CashDrawer.SOU'
-        Strings = [ordered]@{
-            '(default)'='Standard.CashDrawer.SOU'; ADKConfig='CashDrawer1.0'
-            Description='OLE Cash Drawer OPOS Service Object'
-            DeviceDesc='Standard Cash Drawer'; DeviceName='StandardU'
-            Port='USB'; Version='1.0'
-            BaudrateSel=''; BitLengthSel=''; HandShakeSel=''; IP=''; ParitySel=''; StopSel=''; XonXoffSel=''
-        }
-        DWords = [ordered]@{
-            Baudrate=0; BitLength=0; ConnectorPinNo=2; DrawerClose=1; DrawerOpen=0; HandShake=0
-            IdleSleep=0; InputBuf=0; InputSleep=10; OpenLevel=1; OutputBuf=1024; Parity=0
-            PortShare=0; PulseOffTime=400; PulseOnTime=100; Stop=0; Timeout=0
             USBSerialNumber=0; XonXoff=0
         }
     }
@@ -2978,21 +2970,28 @@ function Resolve-PrinterBrand {
     return $brand
 }
 
-# Drop device entries WE created under a previous logical name. Without this the
-# advertised "re-run -PrinterConfigOnly to fix the names after a rename" leaves the old
-# <OLDNAME>_Printer / _Drawer behind and the terminal advertises two of each.
+# Drop device entries WE created that this run no longer registers. Two cases, one test:
+# a rename (the advertised "re-run -PrinterConfigOnly to fix the names" would otherwise
+# leave <OLDNAME>_Printer behind and the terminal advertises two), and a device RETIRED
+# from $PrinterOposDevices - which is how the 2026-08-12 cash-drawer removal reaches
+# terminals already deployed with a <POSname>_Drawer entry. The old prefix-match test
+# ("-like $Prefix_*") could not do the second: on the same terminal the retired drawer
+# matched this run's own prefix and was stranded as a phantom device forever.
 # Only names recorded in the PRIOR manifest are touched - never a device some other
 # vendor or a manual SetupPOS run created. The stale rows (printerConfigured, plus that
 # key's regValuesSet / regKeysCreated) are left to merge forward, so printerConfigured
 # ACCUMULATES old names and (none:*) skips run after run; on uninstall every one of them
 # resolves to a harmless "already gone". Pruning them costs more than it buys.
+# ponytail: the emptied CLASS key (ServiceOPOS\CashDrawer) is left in place - it
+# enumerates no devices, and -Uninstall still removes it via regKeysCreated.
 function Remove-StalePrinterOpos {
     param([Parameter(Mandatory)][string]$Prefix)
     if (-not (Test-Path $ManifestPath)) { return }
     $prior = try { Get-Content $ManifestPath -Raw | ConvertFrom-Json } catch { return }
+    $keep = @($PrinterOposDevices | ForEach-Object { "$Prefix$($_.Suffix)" })
     foreach ($p in @($prior.printerConfigured)) {
         if (-not $p.logicalName -or -not $p.deviceClass) { continue }          # skips the (none:*) rows
-        if ($p.logicalName -like "$Prefix`_*") { continue }                     # this run's own names
+        if ($keep -contains $p.logicalName) { continue }                        # this run's own names
         $stale = "$PrinterOposRoot\$($p.deviceClass)\$($p.logicalName)"
         if (-not (Test-Path $stale)) { continue }
         if ($DryRun) { Dry "would remove stale OPOS device: $($p.logicalName)"; continue }
@@ -3002,7 +3001,7 @@ function Remove-StalePrinterOpos {
 }
 
 function Set-PrinterOpos {
-    Step 'Register POS-X receipt printer + cash drawer (OPOS)'
+    Step 'Register POS-X receipt printer (OPOS)'
 
     if ($SkipPrinterConfig) { Ok 'printer OPOS skipped (-SkipPrinterConfig)'; return }
 
@@ -3028,9 +3027,9 @@ function Set-PrinterOpos {
         return
     }
 
-    # The entries point at the vendor's service objects; writing them with the driver
-    # absent registers two PHANTOM devices aimed at a DLL that isn't there - Alleaves
-    # then enumerates them and fails to open. Benign skip (exit 0), same shape as the
+    # The entry points at the vendor's service object; writing it with the driver
+    # absent registers a PHANTOM device aimed at a DLL that isn't there - Alleaves
+    # then enumerates it and fails to open. Benign skip (exit 0), same shape as the
     # scanner step's "no scanner attached".
     # Checked via ARP, NOT the ProgID: the vendor uninstaller leaves the whole
     # ProgID -> CLSID -> InprocServer32 chain behind (measured), so a ProgID test says
@@ -3097,7 +3096,7 @@ function Set-PrinterOpos {
         $Manifest.printerConfigured += $entry
     }
 
-    Write-Host "  Alleaves must be configured to open these exact logical names." -ForegroundColor Yellow
+    Write-Host "  Alleaves must be configured to open this exact logical name." -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------
@@ -3129,9 +3128,9 @@ function New-InstallManifest {
         # 'installed' so a benign 'no-scanner' run doesn't trip the failure tally.
         # removable=$false: hardware-external state, recorded only (not reverted).
         scannerConfigured      = @()   # { serial; model; hostBefore; target='USB-OPOS'; result; removable=$false }
-        # POS-X OPOS device entries (receipt printer + cash drawer). Unlike the scanner
-        # these ARE reversible - they are pure registry - so removable=$true and the keys
-        # come back out via regKeysCreated / regValuesSet.
+        # POS-X OPOS device entry (receipt printer). Unlike the scanner this IS reversible
+        # - it is pure registry - so removable=$true and the key comes back out via
+        # regKeysCreated / regValuesSet.
         printerConfigured      = @()   # { logicalName; deviceClass; deviceType; progId; brand; result; removable=$true }
     }
 }
@@ -3291,7 +3290,7 @@ try {
         # thing that happens before the manifest captures it).
         Set-ScannerOpos
 
-        # 5b. Register the POS-X receipt printer + cash drawer OPOS device entries.
+        # 5b. Register the POS-X receipt printer OPOS device entry.
         # Registry-only and hardware-independent, so unlike the scanner step it does
         # not care whether anything is plugged in.
         Set-PrinterOpos
@@ -3330,12 +3329,12 @@ try {
             Warn 'Scanner present but USB-OPOS switch failed - re-run the installer (scanner attached).'
             Show-ScannerBarcodeFallback
         }
-        # The OPOS printer/drawer entries are pure registry, so this failing means the
+        # The OPOS printer entry is pure registry, so this failing means the
         # WRITE failed - not that hardware is missing. Non-fatal re-run signal (7), same
         # discipline as 4 and 6: never masks a real install failure (1).
         if ($script:PrinterConfigFailed -and $exitCode -eq 0) {
             $exitCode = 7
-            Warn 'OPOS printer/cash-drawer registration failed - re-run (or use -PrinterConfigOnly).'
+            Warn 'OPOS receipt printer registration failed - re-run (or use -PrinterConfigOnly).'
         }
         Step 'Done'
         Write-Host "Manifest: $ManifestPath"

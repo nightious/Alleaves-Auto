@@ -812,7 +812,9 @@ and the `DeIsL#.isu` filename this install produces.
 > | DWord | `Timeout` | `1000` |
 > | DWord | `Baudrate`, `BitLength`, `DrawerOpen`, `HandShake`, `InputBuf`, `Parity`, `PortShare`, `Stop`, `USBSerialNumber`, `XonXoff` | `0` (all ten) |
 >
-> 28 values total (14 String + 14 DWord). The serial-port fields are present but zeroed/blanked for a USB device —
+> 28 values total (14 String + 14 DWord). **One deliberate later divergence:** we now ship
+> `DrawerOpen=1`, not the `0` captured here — see "Q3 addendum 2". Everything else is shipped
+> exactly as captured. The serial-port fields are present but zeroed/blanked for a USB device —
 > `Port=USB`, `OutputBuf`/`Timeout`/`IdleSleep`/`InputSleep` carry the `[UPORT]`/`[UOPTION]`
 > values from `Thermal.inf`, everything else is inert. Note `PortShare` and `Description` appear
 > in **neither** `.inf` section — a reminder that authoring from `Thermal.inf` would have
@@ -858,7 +860,8 @@ used or no name is supplied.
 `POSPrinter.Open('ZZTEST_Printer') -> 0` and `CashDrawer.Open('ZZTEST_CashDrawer') -> 0` over
 32-bit COM. Both aliases were removed afterwards. The LDN really is just the registry key name.
 
-**2. Cash drawer is in scope.** Captured the same way — SetupPOS → CashDrawer → `StandardU`,
+**2. Cash drawer is in scope.** ~~Shipped~~ — **REVERSED 2026-08-12, see "Q3 addendum 2" below.
+The capture below stays on the record; the device is no longer registered.** Captured the same way — SetupPOS → CashDrawer → `StandardU`,
 before/after diff. 33 values under `…\ServiceOPOS\CashDrawer\StandardU`:
 
 | Type | Name | Data |
@@ -888,9 +891,10 @@ another reason "capture, never author" earned its place.
 `Standard.CashDrawer.SOU` resolves to `POSPrinterSOU.dll` — the drawer rides the printer's USB
 service object, consistent with a drawer hanging off the printer's RJ-11.
 
-**So `Set-PrinterOpos` creates five keys**, removed deepest-first and subkey-guarded on
+~~**So `Set-PrinterOpos` creates five keys**, removed deepest-first and subkey-guarded on
 uninstall: `ServiceOPOS` · `ServiceOPOS\POSPrinter` · `ServiceOPOS\POSPrinter\<POSname>_Printer`
-· `ServiceOPOS\CashDrawer` · `ServiceOPOS\CashDrawer\<POSname>_Drawer`.
+· `ServiceOPOS\CashDrawer` · `ServiceOPOS\CashDrawer\<POSname>_Drawer`.~~
+**Three as of 2026-08-12** — the two `CashDrawer` keys are gone with the device.
 
 ```powershell
 reg export "HKLM\SOFTWARE\WOW6432Node\OLEforRetail" "$env:TEMP\opos_before.reg" /y
@@ -913,6 +917,57 @@ Diff the directory CSVs too — SetupPOS may write an `.ini` outside the registr
 uses `AbstractDevice`/`Usage`/`Port`/`BaudRate`; LK will differ).
 
 Read `Thermal.inf` / `StdCash.inf` from the install dir first — see §1.
+
+### Q3 addendum 2 — SCOPE CHANGE 2026-08-12: the cash-drawer device is REMOVED
+
+> Supersedes point **2** of the addendum above ("Cash drawer is in scope") and its
+> five-keys claim. Everything captured there stays on the record as evidence — it is simply
+> no longer shipped.
+
+Requested by the user. `$PrinterOposDevices` now holds **one** element: the `POSPrinter`.
+The `CashDrawer` / `StandardU` element and all 33 of its values are gone, and with them the
+`<POSname>_Drawer` LDN.
+
+The rationale the capture itself supplied: `Standard.CashDrawer.SOU` resolves to the printer's
+own `POSPrinterSOU.dll` (line 888) — the drawer already rides the printer's USB service object.
+A second logical device was a second thing to name, register, verify, uninstall and configure in
+Alleaves, for a drawer that physically hangs off the printer's RJ-11.
+
+**Replaced by one value on the printer:** SetupPOS's *Open CashDrawer* option → **`Follow
+Printer`**, which is the `DrawerOpen` DWORD inside
+`…\ServiceOPOS\POSPrinter\<POSname>_Printer`. It comes from `Thermal.inf` `[UOPTION]`
+(line 741) and was captured as `0` (line 813).
+
+> **CAPTURED 2026-08-12 — `DrawerOpen` = `1`.** Driver installed on the bench rig through the
+> installer's own path (`ResultCode=0`), our `<POSname>_Printer` registered, then the real
+> `SetupPOS.exe` was driven to *Printer Test And Setting* → **Open CashDrawer**. That combo
+> holds exactly two items, read straight off the control with `CB_GETLBTEXT`:
+>
+> | Index | Label | Meaning |
+> |---|---|---|
+> | 0 | `CashDrawer` | the `Thermal.inf` `[UOPTION]` default — what we shipped before |
+> | 1 | `Follow Printer` | the drawer rides the printer |
+>
+> Selecting index 1 and closing produced a **one-line** diff over the whole `OLEforRetail`
+> tree — `"DrawerOpen"=dword:00000000` → `"DrawerOpen"=dword:00000001`. No companion value, no
+> key elsewhere. So this remains a capture, not an authored guess, even though `1` was the
+> obvious guess: §Q3's rule is that the obvious guess still has to be measured.
+
+Consequences:
+
+- **Keys created drops from five to three** (or two — `ServiceOPOS` is often created by POS
+  for .NET first, see §4b): `ServiceOPOS` · `ServiceOPOS\POSPrinter` ·
+  `ServiceOPOS\POSPrinter\<POSname>_Printer`. Values: 61 → **28**.
+- **Terminals already deployed** carry a live `<POSname>_Drawer`. `Remove-StalePrinterOpos`
+  retires it on the next run, but only after its "this run's own names" test was changed from a
+  **prefix** match to an **exact** match against the LDNs this run registers — under the old
+  prefix test the retired drawer matched its own terminal's prefix and would have been stranded
+  as a phantom device forever. The emptied `ServiceOPOS\CashDrawer` class key is left in place
+  (it enumerates nothing; `-Uninstall` still removes it via `regKeysCreated`).
+- `printer/Collect-PrinterFingerprint.ps1` lost its `CashDrawer` COM probe and `-DrawerName`
+  parameter; it now reads `DrawerOpen` back and the test receipt *is* the drawer test.
+- Nothing in §Q3's method changes. If the drawer ever needs its own device again, the captured
+  33-value table above is still verbatim and still correct.
 
 ### Q5 — Does `POSPrinterSOU.dll` need the Windows print queue? *(RISK CHECK)*
 
@@ -1087,9 +1142,13 @@ full install — because **POS for .NET creates `…\OLEforRetail\ServiceOPOS` i
 uninstall removed our two device keys and the two class keys and **left `ServiceOPOS` alone**.
 Exactly the intended behaviour, and a good demonstration that the guard is not cosmetic.
 
+*(The numbers in 4-6 above are the 2026-08-10 two-device build. Post-2026-08-12: 28 values,
+one device, three keys — see "Q3 addendum 2". `ConnectorPinNo` no longer exists anywhere.)*
+
 **Still unproven — hardware only.** `ClaimDevice` returns **112 (OPOS_E_TIMEOUT)** on a bench
-with no printer (not 107). Printing, the drawer kick, `ConnectorPinNo=2`, the USB VID/PID, and
-whether Alleaves opens these LDNs all need a real terminal — see
+with no printer (not 107). Printing, the drawer kick (now via the printer's `DrawerOpen`, whose
+"Follow Printer" value is itself un-captured), the USB VID/PID, and
+whether Alleaves opens this LDN all need a real terminal — see
 `docs/PRINTER_OPOS_FIELD_RESULTS.md`. A **reboot-between-cycles** re-run is also still
 outstanding; the round-trip above was install → uninstall within one session.
 

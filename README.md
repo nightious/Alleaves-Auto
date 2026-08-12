@@ -77,8 +77,8 @@ latter holds the per-run transcript **and** the install manifest) — so state s
 | `scanner/Scanner_OPOS_barcode.pdf` | One-page printable **USB-OPOS programming barcode** — the DS2208 PRG "OPOS (IBM Hand-Held with Full Disable)" host-type barcode. Scan it once to set OPOS with zero PC software when no scanner was attached during the run; a single scan from the factory HID-Keyboard default, and the same barcode works across Zebra USB families. |
 | `scanner/Collect-ScannerFingerprint.ps1` | Standalone rig tool. **By default it walks the scanner** HID-KB → IBM Hand-held → USB-OPOS (the same two-hop the installer does) while capturing its host mode, USB PID, serial, and model to help finalize the rig-dependent `Set-ScannerOpos` constants; pass `-SnapshotOnly` to read the current state without changing anything. Not part of the install flow. |
 | `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Hardware-validation follow-on for the scanner USB-OPOS step (the design lives in the `Set-ScannerOpos` header comment in `alleaves_setup.ps1`). |
-| `printer/Collect-PrinterFingerprint.ps1` | Standalone field tool for the POS-X receipt printer / cash drawer. Dumps the OPOS device entries, the ProgID→CLSID→DLL chain, and the attached printer's USB VID/PID/device path, then runs a live OPOS probe (**prints a test receipt and opens the drawer**); `-SnapshotOnly` reads state without touching the hardware. Not part of the install flow. |
-| `docs/PRINTER_POSX_OPOS_HANDOFF.md` | Design + evidence for the printer/drawer OPOS step: how the package installs silently, every captured registry value, and the measured answers behind each decision. |
+| `printer/Collect-PrinterFingerprint.ps1` | Standalone field tool for the POS-X receipt printer. Dumps the OPOS device entry (including the `DrawerOpen` setting), the ProgID→CLSID→DLL chain, and the attached printer's USB VID/PID/device path, then runs a live OPOS probe (**prints a test receipt** — watch whether the drawer kicks); `-SnapshotOnly` reads state without touching the hardware. Not part of the install flow. |
+| `docs/PRINTER_POSX_OPOS_HANDOFF.md` | Design + evidence for the printer OPOS step: how the package installs silently, every captured registry value, and the measured answers behind each decision. |
 | `docs/PRINTER_OPOS_FIELD_RESULTS.md` | Running table of real-terminal confirmations, fed by `Collect-PrinterFingerprint.ps1`. |
 
 ## Usage
@@ -101,37 +101,41 @@ run — prompts for the computer name before proceeding; otherwise it runs unatt
 | `-SkipScannerConfig` | Don't flip the connected Zebra scanner(s) to USB-OPOS (leave the scanner's host mode untouched). |
 | `-SkipPrograms <regex...>` | Skip specific products in **both** the download and install phases — any product whose name matches one of the given regex fragments is dropped (e.g. `-SkipPrograms Zebra` skips both Zebra products). Quote a fragment that contains cmd metacharacters, e.g. `-SkipPrograms "Chrome\|NiceLabel"`. |
 | `-ScannerConfigOnly` | Run **only** the USB-OPOS scanner step — skip all downloads, installs, and finishing. Use it to configure a scanner that wasn't attached during the main install (just plug it in and run this), or to re-apply OPOS. Mutually exclusive with `-Uninstall`. |
-| `-SkipPrinterConfig` | Don't register the OPOS receipt-printer / cash-drawer device entries. |
+| `-SkipPrinterConfig` | Don't register the OPOS receipt-printer device entry. |
 | `-PrinterBrand <name>` | `POS-X` (the only one implemented), `Star`, `Epson`, or `None`. Skips the interactive brand prompt (asked once, up front beside the computer-name prompt); Star/Epson select cleanly and warn "not yet implemented" — the POS-X driver still installs. `None` = this terminal has no receipt printer: the `OLE POS Setup` driver is neither downloaded nor installed **and** the OPOS registration is skipped. Single word — no spaces. |
-| `-PrinterConfigOnly` | Run **only** the OPOS printer + cash-drawer registration — skip all downloads, installs, and finishing. Use it to re-apply the entries, or to fix them after the terminal was renamed (entries left under the old name are removed). The POS-X driver must already be installed — if it isn't, the step warns and does nothing rather than registering devices that point at a missing DLL. Mutually exclusive with `-Uninstall`, `-ScannerConfigOnly` and `-SkipPrinterConfig`. |
+| `-PrinterConfigOnly` | Run **only** the OPOS receipt-printer registration — skip all downloads, installs, and finishing. Use it to re-apply the entry, or to fix it after the terminal was renamed (entries left under the old name are removed). The POS-X driver must already be installed — if it isn't, the step warns and does nothing rather than registering a device that points at a missing DLL. Mutually exclusive with `-Uninstall`, `-ScannerConfigOnly` and `-SkipPrinterConfig`. |
 
 ### Exit codes
 
 `0` success · `1` install/uninstall failure · `2` mode ambiguity · `3` not elevated ·
 `4` scanner degraded (CoreScanner missing — re-run) · `5` working-dir creation failed ·
 `6` a scanner was connected but the USB-OPOS switch failed (re-run with the scanner attached) ·
-`7` OPOS printer/cash-drawer registration failed (re-run, or use `-PrinterConfigOnly`).
+`7` OPOS receipt-printer registration failed (re-run, or use `-PrinterConfigOnly`).
 Codes `4`, `6` and `7` are non-fatal "re-run" signals and never mask a hard failure (`1`).
 
-### Receipt printer + cash drawer (OPOS)
+### Receipt printer (OPOS)
 
-The POS-X driver (`OLE POS Setup 2.84`) installs silently, then the installer registers two
-OPOS device entries named after the terminal:
+The POS-X driver (`OLE POS Setup 2.84`) installs silently, then the installer registers one
+OPOS device entry named after the terminal:
 
 | Device | Logical name | Service object |
 | --- | --- | --- |
 | Receipt printer | `<POSname>_Printer` | `RecPrinter.POSPrinter.SOU` |
-| Cash drawer | `<POSname>_Drawer` | `Standard.CashDrawer.SOU` |
 
 `<POSname>` is the computer name entered at the start of the run. **Alleaves must be configured
-to open these exact logical names.** The print path is OPOS end-to-end — no Windows print driver,
+to open this exact logical name.** The print path is OPOS end-to-end — no Windows print driver,
 print queue or spooler involvement — so nothing shows up under Printers & Scanners, and that is
-expected. Both entries are pure registry: fully tracked in the manifest and removed by
-`-Uninstall`.
+expected. The entry is pure registry: fully tracked in the manifest and removed by `-Uninstall`.
+
+**The cash drawer has no device entry of its own.** It hangs off the printer's RJ-11 and is
+kicked by the printer: the installer sets the printer's *Open CashDrawer* option to
+**Follow Printer** (the `DrawerOpen` value inside the printer's key), so the drawer opens on
+receipt print with nothing else to configure. A terminal set up before 2026-08-12 has a
+leftover `<POSname>_Drawer` device; re-running (or `-PrinterConfigOnly`) removes it.
 
 To capture diagnostics from a terminal with a printer attached, run
 `printer\Collect-PrinterFingerprint.ps1` (add `-SnapshotOnly` to read state without printing a
-test receipt or kicking the drawer). It writes one report to the Desktop; send that file back.
+test receipt). It writes one report to the Desktop; send that file back.
 
 ### Scanner USB-OPOS — barcode fallback
 

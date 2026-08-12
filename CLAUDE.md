@@ -32,10 +32,10 @@ Files table is the fuller map.
 ## Architecture / flow
 
 **Install loop, in order:** Chrome → Alleaves Terminal → Zebra 123 Scan → Zebra Scanner SDK →
-POS for .NET → NiceLabel → OLE POS Setup (POS-X printer/drawer driver). Around it: TeamViewer is
+POS for .NET → NiceLabel → OLE POS Setup (POS-X printer driver). Around it: TeamViewer is
 removed first (default; `-SkipUninstallTeamViewer` keeps it), VC++ bootstraps before the Zebra
 products, then after the loop the Master List (`.nlbl`) is copied, the Scanner USB-OPOS switch
-runs, and finally `Set-PrinterOpos` registers the printer + cash-drawer OPOS entries.
+runs, and finally `Set-PrinterOpos` registers the receipt-printer OPOS entry.
 **Splashtop SOS is download-only** — fetched up front and staged for the tech to run
 manually, never installed.
 
@@ -51,7 +51,7 @@ Major function groups in `alleaves_setup.ps1`:
 - **Post-reboot finishing** — computer rename, Chrome taskbar pin / Edge removal, default browser
   via UserChoice hashes (deferred to a logon task; UCPD disabled for next boot).
 - **Scanner USB-OPOS** — see the Gotchas bullet.
-- **Printer/drawer OPOS** (`Set-PrinterOpos`) — final functional step; see the Gotchas bullet.
+- **Receipt-printer OPOS** (`Set-PrinterOpos`) — final functional step; see the Gotchas bullet.
 - **Manifest persistence** — JSON records every install (method, exit code, logs), placed files,
   registry changes, scheduled tasks, TeamViewer removal, scanner results. Uninstall replays it in
   **reverse order**.
@@ -69,7 +69,7 @@ Major function groups in `alleaves_setup.ps1`:
 - **Exit codes** are an RMM contract set in the `$exitCode` dispatch tail (verify there): `0` ok ·
   `1` install/uninstall/download fail · `2` mode ambiguity · `3` not elevated · `4` scanner
   degraded (CoreScanner missing) · `5` working-dir failed · `6` scanner present but switch failed ·
-  `7` OPOS printer/drawer registration failed.
+  `7` OPOS receipt-printer registration failed.
   `4`/`6`/`7` are non-fatal "re-run" codes that only set when nothing else failed — never masking `1`.
 
 ## Gotchas / project rules
@@ -115,26 +115,35 @@ Major function groups in `alleaves_setup.ps1`:
   - `scanner/Scanner_OPOS_barcode.pdf` is the no-PC fallback (one scan from the HID-KB default — the
     two-hop is only the SDK path's constraint). A doc deliverable, **not** embedded, so it needs no
     `.bat` rebuild.
-- **POS-X printer + cash drawer (`Set-PrinterOpos`)** — the LAST functional step, and unlike the
+- **POS-X receipt printer (`Set-PrinterOpos`)** — the LAST functional step, and unlike the
   scanner it is **pure registry**: no COM, no polling, and it works with nothing plugged in
   (`Open()` returns 0 on a bare bench). Full evidence in `docs/PRINTER_POSX_OPOS_HANDOFF.md`.
   Key traps:
+  - **The cash drawer has NO device entry** (dropped 2026-08-12; the `CashDrawer`/`StandardU`
+    element and its 33 values came out of `$PrinterOposDevices`). It hangs off the printer's
+    RJ-11 and `Standard.CashDrawer.SOU` resolved to the printer's own `POSPrinterSOU.dll`
+    anyway, so it follows the printer via the printer key's **`DrawerOpen=1`** — SetupPOS's
+    *Open CashDrawer* = *Follow Printer*. That combo has exactly two items, `CashDrawer` (0)
+    and `Follow Printer` (1); driving it and diffing `OLEforRetail` changed **only** that one
+    value. `Thermal.inf`'s `[UOPTION]` default is `0`, so this is the one shipped value that
+    deliberately differs from the vendor default — still captured, not authored.
   - **The device values are CAPTURED, never authored.** They came from diffing a real
-    `SetupPOS.exe` run (28 printer values, 33 drawer values). Deriving them from
-    `Thermal.inf`/`StdCash.inf` gives a subtly wrong key — `Description` and `PortShare` are in
-    neither file, and the drawer's `IdleSleep`/`Timeout` are `0` where the printer's are
-    `10`/`1000`. If the package version bumps, re-capture; don't hand-edit.
-  - **Logical device names are per-terminal**: `<POSname>_Printer` / `<POSname>_Drawer`, built
+    `SetupPOS.exe` run (28 printer values). Deriving them from `Thermal.inf` gives a subtly
+    wrong key — `Description` and `PortShare` are in neither section of it. If the package
+    version bumps, re-capture; don't hand-edit.
+  - **The logical device name is per-terminal**: `<POSname>_Printer`, built
     from the *requested* rename (`$Manifest.computerRenamed.to`), **not** `$env:COMPUTERNAME` —
     the rename only lands on the post-install reboot, so the env var is stale all run. The
     `applied` flag is part of that test: a rename that *failed* still records `to`, and naming
-    the devices after a name the terminal never gets is silently unopenable. The vendor
-    defaults (`ThermalU`/`StandardU`) are deliberately **not** created. Alleaves must be
-    configured to open these exact names, so a later rename must re-run the step —
-    `Remove-StalePrinterOpos` drops the entries left under the old prefix (manifest-recorded
-    names only, never a device another vendor created).
-  - **The driver must be present before the entries are written** (`Find-InstalledProducts
-    'OLE POS Setup'`, skipped under `-DryRun`): otherwise the step registers two devices
+    the device after a name the terminal never gets is silently unopenable. The vendor
+    default (`ThermalU`) is deliberately **not** created. Alleaves must be
+    configured to open this exact name, so a later rename must re-run the step —
+    `Remove-StalePrinterOpos` drops any manifest-recorded device this run does *not* register
+    (never a device another vendor created). That test is an **exact match against this run's
+    LDNs**, not a prefix match: a prefix match cannot retire a device dropped from the table,
+    which is how the removed `<POSname>_Drawer` reaches already-deployed terminals.
+  - **The driver must be present before the entry is written** (`Find-InstalledProducts
+    'OLE POS Setup'`, skipped under `-DryRun`): otherwise the step registers a device
     pointing at a DLL that isn't there. Check ARP, **not** the ProgID — the vendor uninstaller
     leaves the whole ProgID → CLSID → InprocServer32 chain behind (measured), so a ProgID test
     reports "installed" on a box where the DLL is long gone. Driver absent is a benign
