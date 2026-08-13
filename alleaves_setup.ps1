@@ -85,8 +85,9 @@ param(
     # --- Per-terminal finishing (post-install additions) -------------------
     [string]$ComputerName,        # preset POS name/number (skips the rename prompt)
     [switch]$SkipRename,          # don't prompt/apply a computer rename
-    [switch]$SkipChromeTaskbar,   # don't pin Chrome / remove Edge from the taskbar
+    [switch]$SkipChromeTaskbar,   # don't pin Alleaves/Chrome / remove Edge from the taskbar
     [switch]$SkipDefaultBrowser,  # don't make Chrome the default browser
+    [switch]$SkipChromeBookmark,  # don't add the Alleaves bookmark to Chrome
     [switch]$SkipScannerConfig,   # don't flip the connected Zebra scanner(s) to USB-OPOS
     # --- POS-X receipt printer (OPOS) --------------------------------------
     # Single word, no spaces/apostrophes: build-bat.ps1 double-wraps args through cmd
@@ -128,8 +129,8 @@ $Mode = if ($Uninstall) { 'Uninstall' } elseif ($ScannerConfigOnly) { 'ScannerCo
 Write-Host "Alleaves setup - parsed MODE: $Mode" -ForegroundColor Cyan
 Write-Host ("  Args: Uninstall={0} DryRun={1} SkipMasterList={2} SkipUninstallTeamViewer={3} ForceReinstall={4} ScannerConfigOnly={5} SkipPrograms='{6}'" -f `
     $Uninstall, $DryRun, $SkipMasterList, $SkipUninstallTeamViewer, $ForceReinstall, $ScannerConfigOnly, ($SkipPrograms -join ','))
-Write-Host ("        ComputerName='{0}' SkipRename={1} SkipChromeTaskbar={2} SkipDefaultBrowser={3} SkipScannerConfig={4}" -f `
-    $ComputerName, $SkipRename, $SkipChromeTaskbar, $SkipDefaultBrowser, $SkipScannerConfig)
+Write-Host ("        ComputerName='{0}' SkipRename={1} SkipChromeTaskbar={2} SkipDefaultBrowser={3} SkipChromeBookmark={4} SkipScannerConfig={5}" -f `
+    $ComputerName, $SkipRename, $SkipChromeTaskbar, $SkipDefaultBrowser, $SkipChromeBookmark, $SkipScannerConfig)
 Write-Host ("        PrinterBrand='{0}' SkipPrinterConfig={1} PrinterConfigOnly={2}" -f `
     $PrinterBrand, $SkipPrinterConfig, $PrinterConfigOnly)
 
@@ -218,6 +219,9 @@ $script:ScannerConfigFailed = $false   # set if a connected scanner is present b
 $script:PrinterConfigFailed = $false   # set if the OPOS printer device entry fails to write (exit 7)
 $script:PrinterBrandResolved = $null   # brand answered ONCE up front (see Resolve-PrinterBrand)
 $script:UserAgent       = 'Mozilla/5.0 AlleavesAuto/1.0'   # F3: one UA for BITS + WebClient + HEAD/GET probe
+
+# The Alleaves web POS: Chrome's start page, home button and bookmark all point here.
+$AlleavesUrl = 'https://app.alleaves.com'
 
 # ---------------------------------------------------------------------------
 # Registry uninstall lookup (single copy)
@@ -1690,8 +1694,9 @@ function Save-Manifest {
 }
 
 # ===========================================================================
-# POST-INSTALL FINISHING (per-terminal): computer rename, taskbar pin Chrome /
-# remove Edge, make Chrome the default browser. Every change is tracked in the
+# POST-INSTALL FINISHING (per-terminal): computer rename, taskbar pin Alleaves
+# Terminal + Alleaves POS / remove Edge, make Chrome the default browser,
+# bookmark the Alleaves web POS. Every change is tracked in the
 # manifest so -Uninstall reverses it (rename is recorded but intentionally not
 # reverted - restoring a factory-random name is pointless, same policy as the
 # TeamViewer removal).
@@ -1870,11 +1875,16 @@ function Backup-LoadedTaskbands {
     }
 }
 
-# The taskbar XML: pin Chrome (by all-users .lnk path) + keep File Explorer;
+# The taskbar XML: pin each given all-users .lnk (in order) + keep File Explorer;
 # PinListPlacement="Replace" drops the default Edge pin. NO XML comments (they
-# silently break the file).
+# silently break the file). The caller passes only the apps actually installed,
+# so a missing product just loses its own pin instead of the whole layout.
 function Get-TaskbarXml {
-    @'
+    param([Parameter(Mandatory)][string[]]$LinkPaths)
+    $pins = ($LinkPaths | ForEach-Object {
+        "        <taskbar:DesktopApp DesktopApplicationLinkPath=`"$_`" />"
+    }) -join "`r`n"
+    @"
 <?xml version="1.0" encoding="utf-8"?>
 <LayoutModificationTemplate
     xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification"
@@ -1885,13 +1895,13 @@ function Get-TaskbarXml {
   <CustomTaskbarLayoutCollection PinListPlacement="Replace">
     <defaultlayout:TaskbarLayout>
       <taskbar:TaskbarPinList>
-        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk" />
+$pins
         <taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer" />
       </taskbar:TaskbarPinList>
     </defaultlayout:TaskbarLayout>
   </CustomTaskbarLayoutCollection>
 </LayoutModificationTemplate>
-'@
+"@
 }
 
 function Write-XmlFile {
@@ -1901,21 +1911,112 @@ function Write-XmlFile {
     [IO.File]::WriteAllText($Path, ($Xml -replace "`r?`n","`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# All-users Start Menu: the real path (create / Test-Path) and the %ALLUSERSPROFILE%
+# form the taskbar XML wants. One pair so the two can't drift apart.
+$StartMenuAll    = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs'
+$StartMenuAllEnv = '%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs'
+
+# The shortcuts we create and pin. Named once because -Uninstall has to find them
+# again in a SECOND place: when Explorer applies the layout it COPIES the .lnk into
+# the per-user pinned folder below, and removing only the all-users source (via
+# filesPlaced) strands a pin pointing at a deleted exe. Measured on the rig.
+# Matched by EXACT name so a pin some other vendor created is never touched.
+$TaskbarPinNames  = @('Alleaves Terminal', 'Alleaves POS')
+$UserPinnedRelDir = 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+
+# Create an all-users Start Menu shortcut and record it so -Uninstall removes it
+# (filesPlaced; no new manifest key needed). <taskbar:DesktopApp> can only pin a
+# .lnk, which is why both taskbar entries are built here rather than pinned direct.
+# Returns the .lnk path, or $null if there was nothing to point it at.
+function New-TrackedShortcut {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Target,
+        [string]$Arguments,
+        [string]$Description
+    )
+    if (-not (Test-Path $Target)) { Warn "shortcut target missing ($Target) - skipping '$Name'"; return $null }
+    $lnk = Join-Path $StartMenuAll "$Name.lnk"
+    try {
+        $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $sc.TargetPath       = $Target
+        $sc.Arguments        = $Arguments
+        # Keep WorkingDirectory pinned to the install dir: AlleavesLauncher.exe is an
+        # updater that unpacks its payload RELATIVE to the working directory (measured
+        # - run from a shell it dropped Build\ + version.txt into that shell's cwd).
+        $sc.WorkingDirectory = Split-Path $Target -Parent
+        $sc.Description      = if ($Description) { $Description } else { $Name }
+        $sc.Save()
+    } catch { Warn "could not create '$lnk': $($_.Exception.Message)"; return $null }
+    $Manifest.filesPlaced += $lnk
+    Ok "all-users shortcut created: $lnk"
+    return $lnk
+}
+
+# The Alleaves MSI installs exactly two files (AlleavesLauncher.exe + .config) and
+# NO shortcut anywhere - measured on the rig, docs/PRINTER_POSX_OPOS_HANDOFF.md Q4.
+function Get-AlleavesLauncherPath {
+    $p = @(Find-InstalledProducts -Pattern 'Alleaves Terminal')[0]
+    if (-not $p) { return $null }
+    # ARP InstallLocation is the reliable source; fall back to the measured default.
+    $dir = $p.InstallLocation
+    if (-not $dir) { $dir = 'C:\Program Files (x86)\Alleaves Terminal' }
+    return (Join-Path $dir.TrimEnd('\') 'AlleavesLauncher.exe')
+}
+
+# App Paths is the canonical chrome.exe lookup and is correct for both the
+# Program Files and Program Files (x86) installs; the literals are the fallback.
+function Get-ChromeExePath {
+    $ap = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)'
+    if ($ap -and (Test-Path $ap)) { return $ap }
+    foreach ($c in @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+                     "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe")) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
 # ---------------------------------------------------------------------------
-# Features 2 + 4 - taskbar: pin Chrome, remove Edge. Sets $script:FinishTaskbar
-# so the shared logon task applies it per user after the reboot.
+# Features 2 + 4 - taskbar: pin Alleaves Terminal + "Alleaves POS", remove Edge.
+# Sets $script:FinishTaskbar so the shared logon task applies it per user after
+# the reboot. Pin order below is taskbar order: the terminal app first (the
+# primary app on a POS), then the browser, then File Explorer.
+#
+# "Alleaves POS" is chrome.exe with $AlleavesUrl on its command line, and it
+# REPLACES the plain Google Chrome pin. That is not a stylistic choice: Chrome
+# refuses to honour a start-page policy on a terminal that is not domain-joined
+# or CBCM-enrolled (see Invoke-ChromeBookmark), so a shortcut that carries the
+# URL is the only way to make the cashier's browser icon land on the POS.
 # ---------------------------------------------------------------------------
 function Invoke-ChromeTaskbar {
-    Step 'Taskbar: pin Google Chrome, remove Edge'
+    Step 'Taskbar: pin Alleaves Terminal + Alleaves POS, remove Edge'
     if ($SkipChromeTaskbar) { Ok 'taskbar step skipped (-SkipChromeTaskbar)'; return }
-    if (-not $DryRun -and -not (Find-InstalledProducts -Pattern 'Google Chrome')) {
-        Warn 'Google Chrome not installed - skipping taskbar pin'; return
+
+    # Build the pin list per app rather than bailing out on one missing product:
+    # a single early return here would silently drop the OTHER app's pin too.
+    $terminalPin = $TaskbarPinNames[0]
+    $posPin      = $TaskbarPinNames[1]
+    $pins = @()
+    if ($DryRun) {
+        Dry "would create '$StartMenuAll\$terminalPin.lnk' -> AlleavesLauncher.exe"
+        Dry "would create '$StartMenuAll\$posPin.lnk' -> chrome.exe $AlleavesUrl"
+        $pins = @("$StartMenuAllEnv\$terminalPin.lnk", "$StartMenuAllEnv\$posPin.lnk")
+    } else {
+        $launcher = Get-AlleavesLauncherPath
+        if (-not $launcher) { Warn 'Alleaves Terminal not installed - not pinning it' }
+        elseif (New-TrackedShortcut -Name $terminalPin -Target $launcher) {
+            $pins += "$StartMenuAllEnv\$terminalPin.lnk"
+        }
+        $chrome = Get-ChromeExePath
+        if (-not $chrome) { Warn 'Google Chrome not installed - not pinning the Alleaves POS shortcut' }
+        elseif (New-TrackedShortcut -Name $posPin -Target $chrome -Arguments $AlleavesUrl -Description "Alleaves POS ($AlleavesUrl)") {
+            $pins += "$StartMenuAllEnv\$posPin.lnk"
+        }
     }
-    $chromeLnk = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk'
-    if (-not $DryRun -and -not (Test-Path $chromeLnk)) {
-        Warn "all-users Chrome shortcut missing ($chromeLnk) - the taskbar pin may not resolve"
+    if (-not $pins.Count) {
+        Warn 'neither Alleaves Terminal nor Chrome is installed - skipping the taskbar step'; return
     }
-    $xml = Get-TaskbarXml
+    $xml = Get-TaskbarXml -LinkPaths $pins
 
     # (a) Machine-wide XML + LayoutXMLPath - applies to NEW profiles.
     $machineXml = Join-Path $WorkDir 'TaskbarLayoutModification.xml'
@@ -1984,6 +2085,59 @@ function Invoke-ChromeDefaultBrowser {
     }
     $script:FinishBrowser = $true
     Write-Host '  (Chrome is set default per user at the next logon by AlleavesAuto-FinishUser)'
+}
+
+# ---------------------------------------------------------------------------
+# Feature 5 - the Alleaves bookmark. Chrome exposes no bookmark API, and hand-
+# editing a profile's Bookmarks JSON is a dead end (Chrome checksums it, rewrites
+# it while running, and a brand-new cashier profile would get nothing). The
+# supported mechanism is Chrome's own policy registry: machine-wide, every user,
+# every profile, applied at the next Chrome launch - so unlike the taskbar and
+# default-browser work this needs NO per-user logon task.
+#
+# Deliberately MANDATORY (not the ...\Chrome\Recommended subkey): on a POS the
+# cashier should not be able to delete the bookmark. Chrome will therefore show
+# "managed by your organization" - expected.
+#
+# DO NOT add RestoreOnStartup / RestoreOnStartupURLs / HomepageLocation /
+# HomepageIsNewTabPage / NewTabPageLocation here. MEASURED 2026-08-12 on the rig:
+# chrome://policy reports every one of them "This policy is blocked, its value
+# will be ignored." Chrome blocks the startup / homepage / search-provider
+# policies on a machine that is not AD- or Entra-joined or CBCM-enrolled (an
+# anti-hijacking measure); the ...\Recommended flavour is blocked too, and
+# merging the same keys into Chrome's initial_preferences was also tested and did
+# NOT carry into a brand-new profile. The start page is therefore delivered by
+# the "Alleaves POS" taskbar shortcut instead (see Invoke-ChromeTaskbar), and
+# ShowHomeButton is deliberately NOT set - the Home button would work but could
+# only reach the new-tab page, since HomepageLocation is blocked.
+# The two below are NOT in that blocked set and were verified "OK", in both an
+# existing profile and a freshly created one.
+#
+# Install-Alleaves.bat forces 64-bit PowerShell (build-bat.ps1 Sysnative), so
+# this lands in the native registry view Chrome reads - do NOT "fix" it by
+# adding a WOW6432Node branch.
+# ---------------------------------------------------------------------------
+function Invoke-ChromeBookmark {
+    Step "Chrome: bookmark the Alleaves POS ($AlleavesUrl)"
+    if ($SkipChromeBookmark) { Ok 'Chrome bookmark step skipped (-SkipChromeBookmark)'; return }
+    if (-not $DryRun -and -not (Find-InstalledProducts -Pattern 'Google Chrome')) {
+        Warn 'Google Chrome not installed - skipping the bookmark'; return
+    }
+
+    # A read-only "Alleaves" folder on the bookmarks bar holding one entry.
+    # Built with ConvertTo-Json so the quoting can't be got wrong by hand.
+    $bookmarks = @(
+        @{ toplevel_name = 'Alleaves' }
+        @{ name = 'Alleaves POS'; url = $AlleavesUrl }
+    ) | ConvertTo-Json -Compress
+
+    # Set-TrackedRegValue has its own -DryRun guard and records prior state, so
+    # -Uninstall restores each value and removes the keys we created.
+    $root = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
+    Set-TrackedRegValue -Path $root -Name 'BookmarkBarEnabled' -Value 1 -Type 'DWord'        # or the bookmark is off-screen
+    Set-TrackedRegValue -Path $root -Name 'ManagedBookmarks' -Value $bookmarks -Type 'String'
+    if (-not $DryRun) { Ok "Chrome policy set: 'Alleaves' bookmark -> $AlleavesUrl" }
+    Write-Host '  (applies the next time Chrome starts; verify at chrome://policy)'
 }
 
 function Disable-TrackedTask {
@@ -2842,6 +2996,21 @@ function Invoke-UninstallPhase {
         } catch { Warn "could not restore Taskband for $($tb.sid): $($_.Exception.Message)" }
     }
 
+    # 4e. Drop OUR pins from each user's pinned-taskbar folder. Explorer COPIES the
+    #     .lnk there when it applies the layout, so step 1's filesPlaced sweep (which
+    #     only removes the all-users Start Menu source) strands a pin pointing at a
+    #     deleted exe - measured on the rig. Exact name match against $TaskbarPinNames
+    #     only, so a pin another vendor created is never touched.
+    foreach ($u in (Get-TargetUserProfiles)) {
+        foreach ($n in $TaskbarPinNames) {
+            $pin = Join-Path $u.Profile (Join-Path $UserPinnedRelDir "$n.lnk")
+            if (-not (Test-Path $pin)) { continue }
+            if ($DryRun) { Dry "would remove pinned shortcut: $pin"; continue }
+            try { Remove-Item $pin -Force -ErrorAction Stop; Ok "removed pinned shortcut: $pin" }
+            catch { Warn "could not remove pinned shortcut '$pin': $($_.Exception.Message)" }
+        }
+    }
+
     # computerRenamed is intentionally NOT reverted (restoring a factory-random name
     # is pointless - same policy as the TeamViewer removal).
     if ($man.computerRenamed -and $man.computerRenamed.to) {
@@ -3272,11 +3441,14 @@ try {
             }
         }
 
-        # 3c. Per-terminal finishing: pin Chrome / remove Edge from the taskbar,
-        # make Chrome default. Both defer the visible change to a per-user logon
-        # task that runs after the post-install reboot (see the FINISHING block).
+        # 3c. Per-terminal finishing: pin Alleaves Terminal + Alleaves POS / remove
+        # Edge from the taskbar, make Chrome default, bookmark the Alleaves POS.
+        # The first two defer the visible change to a per-user logon task that runs
+        # after the post-install reboot (see the FINISHING block); the Chrome
+        # bookmark policy is machine-wide and needs no task.
         Invoke-ChromeTaskbar
         Invoke-ChromeDefaultBrowser
+        Invoke-ChromeBookmark
         Register-FinishLogonTask
 
         # 4. Master list -> cashier + admin Documents
@@ -3353,8 +3525,9 @@ try {
         }
         if ($script:FinishBrowser -or $script:FinishTaskbar) {
             Write-Host "  After the reboot, sign in: the taskbar pin / default browser are applied" -ForegroundColor Yellow
-            Write-Host "  automatically at logon (AlleavesAuto-FinishUser). Verify Chrome is pinned," -ForegroundColor Yellow
-            Write-Host "  Edge is gone, and an http link opens in Chrome." -ForegroundColor Yellow
+            Write-Host "  automatically at logon (AlleavesAuto-FinishUser). Verify 'Alleaves Terminal'" -ForegroundColor Yellow
+            Write-Host "  and 'Alleaves POS' are pinned, Edge is gone, and an http link opens in Chrome." -ForegroundColor Yellow
+            Write-Host "  The Alleaves POS pin should open $AlleavesUrl, with an 'Alleaves' bookmark." -ForegroundColor Yellow
         }
     }
 } catch {

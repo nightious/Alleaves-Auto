@@ -48,18 +48,35 @@ Every install also applies a few per-terminal changes so the terminal is floor-r
   non-interactively with `-ComputerName "POS-1"`, or disable the step with `-SkipRename`. The new
   name takes effect on the next reboot. On an unattended/RMM run there is no prompt, so the terminal
   is named **only** if you pass `-ComputerName`.
-- **Chrome taskbar pin / Edge removal** — pins Google Chrome to the taskbar and removes Microsoft
-  Edge from it. Skip with `-SkipChromeTaskbar`.
+- **Taskbar pins / Edge removal** — pins two shortcuts, in this order, and removes Microsoft Edge:
+  **Alleaves Terminal** (the launcher app) and **Alleaves POS** (Chrome opened straight on
+  `https://app.alleaves.com`). Neither ships a shortcut, so the installer creates both all-users
+  Start Menu shortcuts itself (removed on `-Uninstall`). The **Alleaves POS** pin takes the place
+  of a plain Google Chrome pin — see the note below. Skip with `-SkipChromeTaskbar`.
 - **Default browser** — sets Chrome as the default browser. Skip with `-SkipDefaultBrowser`.
+- **Alleaves bookmark** — Chrome gets a read-only **Alleaves** folder on the bookmarks bar
+  containing the POS. Applied machine-wide (every user, every profile) through Chrome's
+  enterprise policy registry, so Chrome will report that it is "managed by your organization" —
+  that is expected, and the cashier can't delete the bookmark. Skip with `-SkipChromeBookmark`.
 
-The taskbar pin and default-browser change are applied automatically at the next logon (via the
-`AlleavesAuto-FinishUser` task), so they take effect after the reboot below.
+> **Why the start page is a shortcut, not a setting.** Chrome refuses to honour the
+> `RestoreOnStartup` / `HomepageLocation` policies on a machine that isn't Active-Directory or
+> Entra-joined, or enrolled in Chrome Browser Cloud Management — `chrome://policy` reports
+> *"This policy is blocked, its value will be ignored."* (Measured on the rig 2026-08-12; the
+> `Recommended` flavour and an `initial_preferences` merge were both tested and fail the same
+> way.) So the terminal instead gets a taskbar shortcut that launches Chrome with the URL on its
+> command line, which works on any machine. Bookmark policies are *not* in Chrome's blocked set,
+> so the bookmark is a real policy.
+
+The taskbar pins and default-browser change are applied automatically at the next logon (via the
+`AlleavesAuto-FinishUser` task), so they take effect after the reboot below. The bookmark needs no
+logon task — it applies the next time Chrome starts (check `chrome://policy`).
 
 ## After install — reboot
 
 The installer never auto-reboots (it uses `/norestart` throughout). **Reboot the terminal once** to
 finalize the Zebra CoreScanner driver and apply the computer rename, then **sign back in** so the
-`AlleavesAuto-FinishUser` logon task applies the Chrome taskbar pin and default-browser change. When
+`AlleavesAuto-FinishUser` logon task applies the taskbar pins and default-browser change. When
 a pending reboot is detected (e.g. the VC++ redistributable requested one), the run prints an
 emphatic `*** REBOOT REQUIRED ***` at the end.
 
@@ -91,13 +108,14 @@ run — prompts for the computer name before proceeding; otherwise it runs unatt
 | _(none)_ | Install (products + per-terminal finishing). |
 | `-ComputerName "POS-1"` | Preset the terminal's computer (POS) name and skip the interactive rename prompt. On an unattended/RMM run this is the **only** way to name the terminal. |
 | `-DryRun` | Simulate everything; make no system changes (no admin required). |
-| `-Uninstall` | Reverse a prior install using the persisted manifest. Does **not** revert the computer rename or the scanner's USB-OPOS mode, and leaves shared runtimes (the VC++ redistributable) in place. To revert the scanner, scan the "USB HID Keyboard" / "Set Defaults" barcode or re-run 123Scan. Mutually exclusive with `-ScannerConfigOnly`. |
+| `-Uninstall` | Reverse a prior install using the persisted manifest — including the Chrome bookmark policy and both taskbar pins (the original pins are restored from a backup taken at install time; **sign out and back in** to see them). Does **not** revert the computer rename or the scanner's USB-OPOS mode, and leaves shared runtimes (the VC++ redistributable) in place. To revert the scanner, scan the "USB HID Keyboard" / "Set Defaults" barcode or re-run 123Scan. Mutually exclusive with `-ScannerConfigOnly`. |
 | `-ForceReinstall` | Re-download even if a valid cached file exists, and pre-clean/reinstall products already present (a normal re-run skips anything already installed). |
 | `-SkipMasterList` | Don't copy the NiceLabel master list (`.nlbl`) into the admin/cashier Documents folders. |
 | `-SkipUninstallTeamViewer` | Keep any existing TeamViewer install (removed by default). |
 | `-SkipRename` | Don't prompt for / apply the computer rename. |
-| `-SkipChromeTaskbar` | Don't pin Chrome / remove Edge from the taskbar. |
+| `-SkipChromeTaskbar` | Don't pin Alleaves Terminal / Alleaves POS, or remove Edge, from the taskbar. |
 | `-SkipDefaultBrowser` | Don't make Chrome the default browser. |
+| `-SkipChromeBookmark` | Don't add the Alleaves bookmark to Chrome (leave Chrome unmanaged). |
 | `-SkipScannerConfig` | Don't flip the connected Zebra scanner(s) to USB-OPOS (leave the scanner's host mode untouched). |
 | `-SkipPrograms <regex...>` | Skip specific products in **both** the download and install phases — any product whose name matches one of the given regex fragments is dropped (e.g. `-SkipPrograms Zebra` skips both Zebra products). Quote a fragment that contains cmd metacharacters, e.g. `-SkipPrograms "Chrome\|NiceLabel"`. |
 | `-ScannerConfigOnly` | Run **only** the USB-OPOS scanner step — skip all downloads, installs, and finishing. Use it to configure a scanner that wasn't attached during the main install (just plug it in and run this), or to re-apply OPOS. Mutually exclusive with `-Uninstall`. |

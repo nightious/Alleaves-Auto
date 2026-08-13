@@ -48,8 +48,9 @@ Major function groups in `alleaves_setup.ps1`:
 - **Silent uninstall** — registry lookup + per-family flags; registry polling is authoritative for
   completion; kills hung launchers.
 - **VC++ bootstrap** — before Zebra CoreScanner, to avoid a mid-install reboot.
-- **Post-reboot finishing** — computer rename, Chrome taskbar pin / Edge removal, default browser
-  via UserChoice hashes (deferred to a logon task; UCPD disabled for next boot).
+- **Post-reboot finishing** — computer rename, Alleaves Terminal + Alleaves POS taskbar pins /
+  Edge removal, default browser via UserChoice hashes (deferred to a logon task; UCPD disabled
+  for next boot), and the Alleaves bookmark policy (`Invoke-ChromeBookmark`, no task).
 - **Scanner USB-OPOS** — see the Gotchas bullet.
 - **Receipt-printer OPOS** (`Set-PrinterOpos`) — final functional step; see the Gotchas bullet.
 - **Manifest persistence** — JSON records every install (method, exit code, logs), placed files,
@@ -179,6 +180,38 @@ Major function groups in `alleaves_setup.ps1`:
     rename's is (F14): it throws on a headless run, and an escaping throw lands in the
     top-level catch and turns a clean install into exit 1. `UserInteractive` alone is not a
     sufficient guard — `powershell -NonInteractive` still reports `$true`.
+- **Chrome → the Alleaves web POS (`$AlleavesUrl`)** — split across two steps for one reason:
+  **Chrome blocks the start-page policies on an unmanaged box.** Measured on the rig 2026-08-12,
+  `chrome://policy` reports *"This policy is blocked, its value will be ignored"* for
+  `RestoreOnStartup`, `RestoreOnStartupURLs`, `HomepageLocation` and `HomepageIsNewTabPage` —
+  Chrome's anti-hijacking gate, which only opens on an AD/Entra-joined or CBCM-enrolled device.
+  The `\Recommended` flavour is blocked identically, and merging the same keys into Chrome's
+  `initial_preferences` was tested and did **not** carry into a brand-new profile. **Don't
+  re-add them.** So:
+  - **Start page** = the `Alleaves POS` taskbar shortcut (`chrome.exe <url>`), which replaces the
+    plain Chrome pin. Verified to open the POS cold-start. `ShowHomeButton` is deliberately *not*
+    set — it works, but the Home button could only reach the new-tab page.
+  - **Bookmark** (`Invoke-ChromeBookmark`) = `ManagedBookmarks` + `BookmarkBarEnabled` under
+    `HKLM:\SOFTWARE\Policies\Google\Chrome` via `Set-TrackedRegValue`, so tracking + uninstall
+    come free and there's **no logon task**. Both verified `OK`, in an existing profile *and* a
+    fresh one. Mandatory, not `\Recommended` — the cashier must not be able to delete it; the
+    "managed by your organization" banner is expected. `BookmarkBarEnabled=1` or it's off-screen.
+    Hand-editing a profile's `Bookmarks` JSON is the wrong answer (Chrome checksums it, rewrites
+    it while running, and a new cashier profile gets nothing). The `.bat` forces 64-bit
+    PowerShell, so the write lands in the view Chrome reads: no `WOW6432Node` branch.
+- **Taskbar pins** — `Get-TaskbarXml` takes the pin list; `Invoke-ChromeTaskbar` builds it per app
+  so one missing product doesn't drop the other's pin (it used to hard-return on "no Chrome").
+  Neither pin target ships a `.lnk` — the Alleaves MSI installs **no shortcut at all** (two files,
+  measured) and `Alleaves POS` is ours — so `New-TrackedShortcut` creates both all-users Start
+  Menu shortcuts that `DesktopApplicationLinkPath` needs, tracked via `filesPlaced`. Targets come
+  from `Get-AlleavesLauncherPath` (ARP `InstallLocation`) and `Get-ChromeExePath` (`App Paths`).
+  Still no XML comments in that here-string.
+  **A pinned `.lnk` lives in TWO places.** Applying the layout makes Explorer *copy* the shortcut
+  into each user's `…\Quick Launch\User Pinned\TaskBar`, so `filesPlaced` — which only knows the
+  all-users source — leaves a pin pointing at a deleted exe (measured: survived a full
+  `-Uninstall`). Uninstall step **4e** deletes `$TaskbarPinNames` from every profile's pinned
+  folder; that list exists so install and uninstall can't drift, and it is an **exact** name match
+  so another vendor's pin is never removed.
 - The four `Invoke-IssSilent` overrides (`ArgFormat`, `WaitNames`, `ReapNames`,
   `RegistryShortCircuit`) all **default to the original Zebra behaviour** — only a row that opts
   in changes anything, which is what keeps the validated Zebra path byte-identical. `ArgFormat`
