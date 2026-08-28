@@ -4,19 +4,18 @@ Running table of real-terminal results for the OPOS receipt-printer step, mirror
 `SCANNER_OPOS_RIG_VALIDATION_PROMPT.md`'s "Field confirmations so far".
 
 Since 2026-08-12 the cash drawer has **no OPOS device of its own** — it follows the printer via
-the printer key's `DrawerOpen` value (`PRINTER_POSX_OPOS_HANDOFF.md`, "Q3 addendum 2").
+the printer key's `DrawerOpen` value (captured below).
 
 Every row is backed by a `printer/Collect-PrinterFingerprint.ps1` report. Add a row per
 terminal; attach or paste the raw capture into `docs/` alongside, as the scanner work does.
 
 ## What is already proven (do not re-litigate)
 
-Verified on the bench rig 2026-08-10, **without any printer attached** — see
-`PRINTER_POSX_OPOS_HANDOFF.md` for the full evidence:
+Verified on the bench rig 2026-08-10, **without any printer attached**:
 
 - Silent install works: `pkg.exe /s /a /s /L0x0409 /f1"<iss>" /f2"<log>"` → `ResultCode=0`,
-  no GUI, ~26 s. **Keep those paths short** — IS5 has a fixed command-line buffer and ~390
-  chars crashes the stub (§3.7).
+  no GUI, ~26 s. **Keep those paths short** — IS5 has a fixed command-line buffer: ~190 chars
+  of inner command line works, ~390 crashes the PFTW stub with an access violation.
 - Silent uninstall works: `IsUninst.exe -y -a -f"…\Uninst.isu"`, ~8 s, no dialog.
 - The registry entries are byte-identical to what the vendor's `SetupPOS.exe` writes
   (28 printer values, diffed — plus the 33 drawer values, before that device was dropped).

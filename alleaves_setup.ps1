@@ -22,9 +22,6 @@
 .PARAMETER Uninstall
     Reverse a prior install using the persisted manifest.
 
-.PARAMETER WorkDir
-    Override the working root (default %ProgramData%\AlleavesAuto).
-
 .PARAMETER DryRun
     Simulate everything; make no system changes. Allowed without admin.
 
@@ -46,11 +43,10 @@
     attached during the main install. Mutually exclusive with -Uninstall.
 
 .PARAMETER PrinterBrand
-    Receipt printer brand: POS-X (the only one implemented), Star, Epson, or None.
-    Supplying it skips the interactive brand prompt. Star/Epson select cleanly and warn
-    "not yet implemented" (the POS-X driver is still installed). None = this terminal has
-    no receipt printer: the OLE POS Setup driver is neither downloaded nor installed, and
-    the OPOS registration is skipped. Single word - see build-bat.ps1's arg double-wrapping.
+    Receipt printer brand: POS-X (the only one implemented) or None. Supplying it skips
+    the interactive brand prompt. None = this terminal has no receipt printer: the OLE POS
+    Setup driver is neither downloaded nor installed, and the OPOS registration is skipped.
+    Single word - see build-bat.ps1's arg double-wrapping.
 
 .PARAMETER SkipPrinterConfig
     Don't register the OPOS receipt printer device entry.
@@ -70,18 +66,22 @@
 .PARAMETER SkipNiceLabelActivation
     Install NiceLabel with plain /s (no license/activation params) - the license must
     then be entered manually on that site.
+
+.PARAMETER ForceFingerprint
+    Write the per-hop scanner fingerprint log even for a model already in
+    $ScannerKnownModels. For rig capture - pair with -ScannerConfigOnly.
 #>
 
 [CmdletBinding()]
 param(
     [switch]$Uninstall,
-    [string]$WorkDir,
     [switch]$DryRun,
     [switch]$SkipMasterList,
     [switch]$SkipUninstallTeamViewer,
     [string[]]$SkipPrograms = @(),
     [switch]$ForceReinstall,
     [switch]$ScannerConfigOnly,   # run ONLY the final USB-OPOS scanner step (no installs)
+    [switch]$ForceFingerprint,    # dump the per-hop scanner fingerprint even for a known model
     # --- Per-terminal finishing (post-install additions) -------------------
     [string]$ComputerName,        # preset POS name/number (skips the rename prompt)
     [switch]$SkipRename,          # don't prompt/apply a computer rename
@@ -92,7 +92,7 @@ param(
     # --- POS-X receipt printer (OPOS) --------------------------------------
     # Single word, no spaces/apostrophes: build-bat.ps1 double-wraps args through cmd
     # %* and a PS single-quoted string on the non-elevated relaunch.
-    [ValidateSet('POS-X','Star','Epson','None')]
+    [ValidateSet('POS-X','None')]
     [string]$PrinterBrand,        # skip the brand prompt (only POS-X is implemented; None = no printer at all)
     [switch]$SkipPrinterConfig,   # don't register the OPOS receipt printer entry
     [switch]$PrinterConfigOnly,   # run ONLY the OPOS printer step (no downloads/installs)
@@ -127,8 +127,8 @@ $IsAdmin = Test-IsAdmin
 # ---------------------------------------------------------------------------
 $Mode = if ($Uninstall) { 'Uninstall' } elseif ($ScannerConfigOnly) { 'ScannerConfig' } elseif ($PrinterConfigOnly) { 'PrinterConfig' } else { 'Install' }
 Write-Host "Alleaves setup - parsed MODE: $Mode" -ForegroundColor Cyan
-Write-Host ("  Args: Uninstall={0} DryRun={1} SkipMasterList={2} SkipUninstallTeamViewer={3} ForceReinstall={4} ScannerConfigOnly={5} SkipPrograms='{6}'" -f `
-    $Uninstall, $DryRun, $SkipMasterList, $SkipUninstallTeamViewer, $ForceReinstall, $ScannerConfigOnly, ($SkipPrograms -join ','))
+Write-Host ("  Args: Uninstall={0} DryRun={1} SkipMasterList={2} SkipUninstallTeamViewer={3} ForceReinstall={4} ScannerConfigOnly={5} ForceFingerprint={6} SkipPrograms='{7}'" -f `
+    $Uninstall, $DryRun, $SkipMasterList, $SkipUninstallTeamViewer, $ForceReinstall, $ScannerConfigOnly, $ForceFingerprint, ($SkipPrograms -join ','))
 Write-Host ("        ComputerName='{0}' SkipRename={1} SkipChromeTaskbar={2} SkipDefaultBrowser={3} SkipChromeBookmark={4} SkipScannerConfig={5}" -f `
     $ComputerName, $SkipRename, $SkipChromeTaskbar, $SkipDefaultBrowser, $SkipChromeBookmark, $SkipScannerConfig)
 Write-Host ("        PrinterBrand='{0}' SkipPrinterConfig={1} PrinterConfigOnly={2}" -f `
@@ -152,6 +152,13 @@ if ($requested) {
 # configures - ambiguous, exit 2 like the guards above).
 if ($ScannerConfigOnly -and $Uninstall) {
     Fail "-ScannerConfigOnly and -Uninstall are mutually exclusive."
+    exit 2
+}
+# ...and not with -SkipScannerConfig either: "run ONLY the scanner step" + "skip the
+# scanner step" is a run that does nothing and exits 0, which reads as success to RMM.
+# (Same contradiction the -PrinterConfigOnly / -SkipPrinterConfig guard below rejects.)
+if ($ScannerConfigOnly -and $SkipScannerConfig) {
+    Fail "-ScannerConfigOnly and -SkipScannerConfig are mutually exclusive (that run would do nothing)."
     exit 2
 }
 
@@ -189,10 +196,9 @@ if (-not $IsAdmin -and -not $DryRun) {
 # ---------------------------------------------------------------------------
 # Working directory (machine-wide so state survives for -Uninstall)
 # ---------------------------------------------------------------------------
-if (-not $WorkDir) {
-    if ($IsAdmin) { $WorkDir = Join-Path $env:ProgramData 'AlleavesAuto' }
-    else          { $WorkDir = Join-Path $env:TEMP        'AlleavesAuto' }  # DryRun fallback
-}
+# Not caller-overridable: a deep path overflows the IS5 stub's fixed command-line
+# buffer (see the OLE POS Setup row), and nothing ever set it.
+$WorkDir = if ($IsAdmin) { Join-Path $env:ProgramData 'AlleavesAuto' } else { Join-Path $env:TEMP 'AlleavesAuto' }   # non-admin = -DryRun fallback
 $DownloadDir  = Join-Path $WorkDir 'downloads'
 $LogDir       = Join-Path $WorkDir 'logs'
 $ManifestPath = Join-Path $LogDir  'install_manifest.json'
@@ -214,6 +220,7 @@ $script:DownloadFailed  = $false
 $script:RebootPending   = $false   # set if VC++ redist returns 3010, or a rename is queued
 $script:FinishBrowser   = $false   # taskbar/browser features set these; if either is
 $script:FinishTaskbar   = $false   # true, a per-user logon task is registered to finish.
+$script:TaskbarStamp    = ''       # the pin list the logon task marks as applied (see Invoke-ChromeTaskbar)
 $script:ScannerDegraded = $false   # F20: set if CoreScanner is missing post-install (exit 4)
 $script:ScannerConfigFailed = $false   # set if a connected scanner is present but the OPOS switch fails (exit 6)
 $script:PrinterConfigFailed = $false   # set if the OPOS printer device entry fails to write (exit 7)
@@ -247,20 +254,6 @@ function Find-InstalledProducts {
                 ($_.PSChildName -notlike 'InstallShield_*')
             }
     }
-}
-
-function ConvertTo-MsiPackedGuid {
-    # MSI "compressed"/packed GUID used as the key name under
-    # HKLM:\SOFTWARE\Classes\Installer\Products|Features and ...\Installer\UserData.
-    # {77FC4FF1-07FA-4A98-8089-090B9E7B7355} -> 1FF4CF77AF7089A4089890B0E9B73755
-    # (reverse the first three groups; swap nibble-pairs in the last two).
-    param([Parameter(Mandatory)][string]$Guid)
-    $h = ($Guid -replace '[{}\-]', '').ToUpper()
-    if ($h.Length -ne 32) { return $null }
-    $rev  = { param($s) $a = $s.ToCharArray(); [Array]::Reverse($a); -join $a }
-    $swap = { param($s) $o = ''; for ($i = 0; $i -lt $s.Length; $i += 2) { $o += $s.Substring($i + 1, 1) + $s.Substring($i, 1) }; $o }
-    (& $rev $h.Substring(0, 8)) + (& $rev $h.Substring(8, 4)) + (& $rev $h.Substring(12, 4)) +
-        (& $swap $h.Substring(16, 4)) + (& $swap $h.Substring(20, 12))
 }
 
 function Invoke-SilentUninstall {
@@ -330,16 +323,18 @@ function Invoke-SilentUninstall {
         # its services, its low-level Installer registration, its ProgramData cache.
         Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'NiceLabel*' } |
             ForEach-Object { & "$env:SystemRoot\System32\sc.exe" delete $_.Name 2>$null | Out-Null; Write-Host "  removed NiceLabel service: $($_.Name)" }
-        if ($guid) {
-            $packed = ConvertTo-MsiPackedGuid $guid
-            if ($packed) {
-                foreach ($reg in "HKLM:\SOFTWARE\Classes\Installer\Products\$packed",
-                                 "HKLM:\SOFTWARE\Classes\Installer\Features\$packed",
-                                 "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed") {
-                    if (Test-Path $reg) { Remove-Item $reg -Recurse -Force -ErrorAction SilentlyContinue }
-                }
-            }
+        # The low-level registration keys are named by a packed GUID; find them by
+        # PRODUCT NAME instead of deriving it (no GUID needed, so this runs on both
+        # paths). Features subkeys carry no ProductName, so they are matched by the
+        # key name of the Products hit; UserData keeps the name one level down.
+        foreach ($p in @(Get-ChildItem 'HKLM:\SOFTWARE\Classes\Installer\Products' -ErrorAction SilentlyContinue |
+                         Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProductName -match '(?i)NiceLabel' })) {
+            Remove-Item "HKLM:\SOFTWARE\Classes\Installer\Features\$($p.PSChildName)" -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $p.PSPath -Recurse -Force -ErrorAction SilentlyContinue
         }
+        Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products' -ErrorAction SilentlyContinue |
+            Where-Object { (Get-ItemProperty "$($_.PSPath)\InstallProperties" -ErrorAction SilentlyContinue).DisplayName -match '(?i)NiceLabel' } |
+            ForEach-Object { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
         # The bootstrapper's cache path is embedded in the uninstall command.
         if ($cmd -match '([A-Za-z]:\\ProgramData\\\{[0-9A-Fa-f-]+\})') {
             if (Test-Path $Matches[1]) { Remove-Item $Matches[1] -Recurse -Force -ErrorAction SilentlyContinue }
@@ -699,11 +694,6 @@ function Get-DriveFile {
     return Get-FileWithRetry -Label $Label -Urls @($primary, $fallback) -TargetPath $TargetPath -MaxRetries $MaxRetries
 }
 
-function Get-SplashtopSos {
-    $target = Join-Path $DownloadDir 'SplashtopSOS.exe'
-    return Get-FileWithRetry -Label 'Splashtop SOS' -Urls @('https://download.splashtop.com/sos/SplashtopSOS.exe') -TargetPath $target -MaxRetries 3
-}
-
 # Download table (core only; filenames MUST match the installer File= column).
 $DriveFiles = @(
     @{ Label='Chrome Setup';          FileId='1XT7Zc0lU6t1OhI4yM_SpD8TH_N0spUaV'; File='Chrome Setup.exe' }
@@ -751,7 +741,9 @@ function Invoke-DownloadPhase {
         $results += [pscustomobject]@{ Label=$d.Label; Ok=$ok }
     }
     if (-not (Test-SkipMatch -Names @('Splashtop','Splashtop SOS','SplashtopSOS.exe'))) {
-        $ok = Get-SplashtopSos
+        $ok = Get-FileWithRetry -Label 'Splashtop SOS' `
+            -Urls @('https://download.splashtop.com/sos/SplashtopSOS.exe') `
+            -TargetPath (Join-Path $DownloadDir 'SplashtopSOS.exe') -MaxRetries 3
         if (-not $ok) { $script:DownloadFailed = $true }
         $results += [pscustomobject]@{ Label='Splashtop SOS'; Ok=$ok }
     }
@@ -795,9 +787,9 @@ function Invoke-Installer {
         [Parameter(Mandatory)][string]   $Path,
         [string[]]                       $ArgList,
         [string]                         $DisplayNameMatch,
-        [int[]]                          $SuccessCodes = @(0, 3010, 1641),
         [switch]                         $ConfirmRegistry   # F6: also require ARP presence (raw-exe installers)
     )
+    $okCodes = @(0, 3010, 1641)   # success exit codes; fixed (no caller varies them)
     Step $Name
 
     # DryRun simulates BEFORE the existence check: on a bare machine the real
@@ -845,7 +837,7 @@ function Invoke-Installer {
         displayNameMatch=$DisplayNameMatch; exitCode=$exit
         stdoutLog=$stdoutLog; stderrLog=$stderrLog
     }
-    if ($SuccessCodes -contains $exit) {
+    if ($okCodes -contains $exit) {
         # F6: a raw-exe installer (Chrome) reports success by exit code alone - an
         # exit-0-but-not-installed case (Group Policy block, AV quarantine, wrong
         # stub) would otherwise record 'ok' with no product. When asked, confirm the
@@ -882,7 +874,7 @@ function Invoke-Msi {
 # and force a reboot that derails the silent flow. The dev rig already had it
 # (so "it worked here"), the client did not -> failure. We install it ourselves,
 # /norestart, BEFORE the Zebra installers. Standalone (NOT routed through
-# Invoke-Installer, whose default SuccessCodes omit 1638 = "newer present").
+# Invoke-Installer, whose success codes omit 1638 = "newer present").
 # ---------------------------------------------------------------------------
 function Test-VcRedistPresent {
     # Authoritative: the VC runtime "Installed" flag (either bitness view).
@@ -928,8 +920,9 @@ function Install-VcRedist {
     }
 
     # Lazy download (only when absent). aka.ms is the evergreen permalink; both
-    # BITS and WebClient follow its 302 to the CDN. Validate with the MZ magic
-    # byte only - do NOT hard-check Content-Length (aka.ms may omit it).
+    # BITS and WebClient follow its 302 to the CDN. Get-FileWithRetry's size guard
+    # self-disables when the server omits Content-Length (aka.ms may), so the MZ
+    # magic byte + .len sidecar carry the validation here.
     $exe      = Join-Path $DownloadDir 'vc_redist.x64.exe'
     $primary  = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
     # F5: a DISTINCT working evergreen permalink (VS 16 channel; ships the same
@@ -939,20 +932,7 @@ function Install-VcRedist {
     # primary could NEVER fall back to a usable exe. This 302s to a valid MZ.
     $fallback = 'https://aka.ms/vs/16/release/vc_redist.x64.exe'
 
-    # F2: trust a cached exe only if its size matches the .len sidecar (aka.ms may
-    # omit Content-Length, so the sidecar - not a live HEAD - is the size authority).
-    $haveExe = (Test-Path $exe) -and (Test-CachedFileValid $exe)
-    if (-not $haveExe) {
-        foreach ($url in @($primary, $fallback)) {
-            Write-Host "  downloading vc_redist.x64.exe from $url"
-            $got = $false
-            try { $got = Invoke-FileDownload -Url $url -Dest $exe } catch { Warn "download error: $($_.Exception.Message)" }
-            if ($got -and (Test-RealBinary $exe)) { Unblock-FileSafe $exe; Save-FileSizeSidecar $exe; $haveExe = $true; break }
-            Warn 'vc_redist body failed MZ validation - trying next source'
-        }
-    } else {
-        Ok 'vc_redist.x64.exe already cached, valid'
-    }
+    $haveExe = Get-FileWithRetry -Label 'Visual C++ x64 redist' -Urls @($primary, $fallback) -TargetPath $exe -MaxRetries 3
 
     if (-not $haveExe) {
         Fail 'could not obtain a valid vc_redist.x64.exe'
@@ -1010,9 +990,9 @@ function Invoke-WrappedMsi {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$WrapperPath,
-        [Parameter(Mandatory)][string]$DisplayNameMatch,
-        [int]                  $TimeoutSeconds = 600
+        [Parameter(Mandatory)][string]$DisplayNameMatch
     )
+    $TimeoutSeconds = 600   # fixed (no caller varies it)
     Step $Name
 
     if ($DryRun) {
@@ -1160,7 +1140,6 @@ function Invoke-IssSilent {
         [Parameter(Mandatory)][string]$IssLeaf,
         [Parameter(Mandatory)][string]$DisplayNameMatch,   # narrow: this item's OWN product (success / idempotency)
         [string]               $RecordMatch = '',           # broad: recorded for uninstall (may add shared CoreScanner)
-        [int]                  $TimeoutSeconds = 900,        # F8: backstop only; worker-tracking ends a healthy install early
         # --- Installer-family overrides. Every default below reproduces the ORIGINAL
         # --- Zebra/IS7 behaviour byte-for-byte; only a row that opts in changes anything.
         # {0}=.iss path, {1}=log path. One format string rather than a switch prefix,
@@ -1179,6 +1158,7 @@ function Invoke-IssSilent {
         # transfer, so breaking on it would kill the worker mid-copy and call it success.
         [bool]     $RegistryShortCircuit = $true
     )
+    $TimeoutSeconds = 900   # F8: backstop only; worker-tracking ends a healthy install early
     Step $Name
     if (-not $RecordMatch) { $RecordMatch = $DisplayNameMatch }
 
@@ -1288,13 +1268,20 @@ function Invoke-IssSilent {
         displayNameMatch=$RecordMatch
         logResultZero=$logOk; registryPresent=$regOk
     }
-    if ($logOk -or $regOk) {
+    # Registry presence only COUNTS AS SUCCESS for families where it means "committed"
+    # - the same distinction $RegistryShortCircuit already draws for the poll loop. For
+    # pure InstallScript (IS5) DeinstallStart() writes ARP BEFORE file transfer, so an
+    # install that died mid-copy is in the registry and would otherwise be recorded 'ok'
+    # (and Set-PrinterOpos would then register a device aimed at a DLL never copied).
+    # Those families must show ResultCode=0; the log is reachable - /f2 forwarding is
+    # proven (measured).
+    if ($logOk -or ($regOk -and $RegistryShortCircuit)) {
         Ok "$Name installed (ResultCode=$(if ($logOk){'0'}else{'n/a'}), registry=$regOk)"
         $entry.result = 'ok'
         $Manifest.installed += $entry
         return 'ok'
     } else {
-        Fail "$Name silent install not confirmed (no ResultCode=0, not in registry) - see $log"
+        Fail "$Name silent install not confirmed (no ResultCode=0$(if (-not $RegistryShortCircuit) { '; registry presence is not proof for this family' } else { ', not in registry' })) - see $log"
         $entry.result = 'fail'   # advisor S2: record the failed attempt so the uninstall @('ok') filter skips it
         $Manifest.installed += $entry
         return 'fail'
@@ -1304,38 +1291,15 @@ function Invoke-IssSilent {
 # ---------------------------------------------------------------------------
 # Master-list placement. Advisor #3B (functional bug): under elevation
 # GetFolderPath('MyDocuments') is the ADMIN's profile, but NiceLabel runs as the
-# cashier and won't find the .nlbl there -> silent broken printing. Resolve the
-# interactive (console) user's Documents and copy to BOTH; record every path.
+# cashier and won't find the .nlbl there -> silent broken printing. Copy to the
+# Documents of EVERY real user profile plus the admin's; record every path.
 # ---------------------------------------------------------------------------
-function Get-CashierDocuments {
-    $paths = @()
-    try {
-        $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop |
-            Select-Object -First 1
-        if ($explorer) {
-            $sidInfo = Invoke-CimMethod -InputObject $explorer -MethodName GetOwnerSid -ErrorAction SilentlyContinue
-            $sid = $sidInfo.Sid
-            if ($sid) {
-                $pp = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
-                if ($pp) { $paths += (Join-Path $pp 'Documents') }
-            }
-            if (-not $paths) {
-                $own = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner -ErrorAction SilentlyContinue
-                if ($own.User) { $paths += (Join-Path (Join-Path $env:SystemDrive ("Users\" + $own.User)) 'Documents') }
-            }
-        }
-    } catch { Warn "could not resolve interactive user's Documents: $($_.Exception.Message)" }
-    return $paths
-}
-
 function Copy-MasterList {
     param([string]$Source)
     Step 'Copy NiceLabel Master List to Documents'
 
-    $dests = @()
-    foreach ($c in (Get-CashierDocuments)) {
-        if ($c -and (Test-Path (Split-Path $c -Parent))) { $dests += $c }
-    }
+    # Get-TargetUserProfiles already validates each ProfileImagePath exists.
+    $dests = @(Get-TargetUserProfiles | ForEach-Object { Join-Path $_.Profile 'Documents' })
     $admin = [Environment]::GetFolderPath('MyDocuments')
     if ($admin) { $dests += $admin }
     $dests = @($dests | Select-Object -Unique)
@@ -1458,8 +1422,6 @@ bOpt1=0
 bOpt2=0
 '@
 
-$IssMap = @{ '123scan' = $Iss123Scan; 'scannersdk' = $IssScannerSdk; 'olepos' = $IssOlePos }
-
 # NiceLabel 2019 takes the activation ID on /s's command line for unattended online
 # activation; LICENSECODE alone lets the server auto-fill name/company/country/email.
 # An ARRAY (not a string) so it runs through Invoke-Installer's -ArgList path - keep it
@@ -1479,8 +1441,9 @@ $Installers = @(
     # UninstallMatch (broad) is recorded for -Uninstall so CoreScanner is also
     # removed. (The single extracted MSI installs the SDK WITHOUT CoreScanner, so
     # the .iss path is required for a working scanner.)
-    @{ Name='Zebra 123 Scan';    File='Zebra 123 Scan.exe';        Match='123Scan';           UninstallMatch='123Scan|Zebra CoreScanner';           Iss='123scan';    CachedMsi='Zebra 123Scan (64bit).msi' }
-    @{ Name='Zebra Scanner SDK'; File='Zebra Scanner SDK.exe';     Match='Zebra Scanner SDK'; UninstallMatch='Zebra Scanner SDK|Zebra CoreScanner'; Iss='scannersdk'; CachedMsi='Zebra Scanner SDK (64bit).msi' }
+    # Iss= names the .iss file written to disk ($IssLeaf); IssContent= is the here-string itself.
+    @{ Name='Zebra 123 Scan';    File='Zebra 123 Scan.exe';        Match='123Scan';           UninstallMatch='123Scan|Zebra CoreScanner';           Iss='123scan';    IssContent=$Iss123Scan;    CachedMsi='Zebra 123Scan (64bit).msi' }
+    @{ Name='Zebra Scanner SDK'; File='Zebra Scanner SDK.exe';     Match='Zebra Scanner SDK'; UninstallMatch='Zebra Scanner SDK|Zebra CoreScanner'; Iss='scannersdk'; IssContent=$IssScannerSdk; CachedMsi='Zebra Scanner SDK (64bit).msi' }
     @{ Name='POS for .NET';      File='POSforDOTNet.msi';          Match='POS for \.NET';     Msi=$true }
     @{ Name='NiceLabel';         File='Nice Label.exe';            Match='NiceLabel';         Args=$NiceLabelArgs }
     # POS-X receipt printer OPOS driver. PackageForTheWeb stub wrapping an
@@ -1509,11 +1472,38 @@ $Installers = @(
     #   NoMsiFallback there is no MSI anywhere in this package; without this the failure
     #                 path drops into Invoke-WrappedMsi, which opens the PFTW GUI and
     #                 polls %TEMP% for 600 s (and can grab an unrelated {GUID} MSI).
-    @{ Name='OLE POS Setup';     File='OLE POS Setup.exe';         Match='OLE POS Setup';     Iss='olepos'
+    @{ Name='OLE POS Setup';     File='OLE POS Setup.exe';         Match='OLE POS Setup';     Iss='olepos'; IssContent=$IssOlePos
        IssArgFormat='/s /a /s /L0x0409 /f1"{0}" /f2"{1}"'
        IssWaitNames=@('setup','_INS*'); IssReapNames=@(); IssRegistryShortCircuit=$false
        NoMsiFallback=$true }
 )
+
+# "Already installed" means SUCCESSFULLY installed. An ARP entry alone doesn't prove
+# that: pure InstallScript writes it before file transfer (see $RegistryShortCircuit),
+# and an MSI rollback can leave one too - so a run that FAILED leaves exactly the
+# registry state a later run reads as "done", and the product is never repaired while
+# every re-run reports success. If the prior manifest recorded this product as anything
+# other than 'ok', don't let ARP short-circuit the install. Read from the on-disk
+# manifest (this run's $Manifest has no row yet) and only once per run.
+$script:PriorManifest = $null
+function Get-PriorManifest {
+    # The on-disk manifest from an EARLIER run, read at most once. Distinct from
+    # $Manifest, which is this run's and is empty when the install loop starts.
+    if ($null -eq $script:PriorManifest) {
+        $script:PriorManifest = @{}
+        if (Test-Path $ManifestPath) {
+            try { $script:PriorManifest = (Get-Content $ManifestPath -Raw | ConvertFrom-Json) }
+            catch { Warn "could not read the prior manifest: $($_.Exception.Message)" }
+        }
+    }
+    return $script:PriorManifest
+}
+function Test-PriorInstallFailed {
+    param([Parameter(Mandatory)][string]$Name)
+    # No prior row = never attempted = trust the registry (a product installed by hand
+    # or by an older build must still be skippable).
+    return [bool](@((Get-PriorManifest).installed | Where-Object { $_.name -eq $Name -and $_.result -and $_.result -ne 'ok' }).Count)
+}
 
 function Invoke-InstallLoop {
     foreach ($i in $Installers) {
@@ -1567,7 +1557,8 @@ function Invoke-InstallLoop {
             # Installer into maintenance/reconfigure mode, whose SecureRepair step
             # can fail to re-verify the original source and exit 1603 (rolling back
             # a product that was working fine). -ForceReinstall pre-cleans above.
-            if (-not $ForceReinstall -and (Find-InstalledProducts -Pattern $i.Match)) {
+            if (-not $ForceReinstall -and -not (Test-PriorInstallFailed -Name $i.Name) -and
+                (Find-InstalledProducts -Pattern $i.Match)) {
                 Step $i.Name
                 Ok 'already installed; skipping'
                 $Manifest.installed += @{
@@ -1587,7 +1578,8 @@ function Invoke-InstallLoop {
             # install over an already-present product. Check this item's OWN
             # product (narrow) - the shared CoreScanner that another Zebra item
             # installs must NOT mark this one as already-installed.
-            if (-not $ForceReinstall -and (Find-InstalledProducts -Pattern $i.Match)) {
+            if (-not $ForceReinstall -and -not (Test-PriorInstallFailed -Name $i.Name) -and
+                (Find-InstalledProducts -Pattern $i.Match)) {
                 Step $i.Name
                 Ok 'already installed; skipping'
                 $Manifest.installed += @{
@@ -1606,7 +1598,7 @@ function Invoke-InstallLoop {
             if ($i.Keys -contains 'IssReapNames')            { $issOpt['ReapNames'] = @($i.IssReapNames) }
             if ($i.Keys -contains 'IssRegistryShortCircuit') { $issOpt['RegistryShortCircuit'] = [bool]$i.IssRegistryShortCircuit }
             $res = Invoke-IssSilent -Name $i.Name -WrapperPath $full `
-                -IssContent $IssMap[$i.Iss] -IssLeaf ("{0}.iss" -f $i.Iss) `
+                -IssContent $i.IssContent -IssLeaf ("{0}.iss" -f $i.Iss) `
                 -DisplayNameMatch $i.Match -RecordMatch $uMatch @issOpt
             # Fall back ONLY if the .iss method failed AND the product is still
             # absent: cached extracted MSI if present, else the fixed wrapper.
@@ -1665,6 +1657,10 @@ function Save-Manifest {
             $prior = Get-Content $ManifestPath -Raw | ConvertFrom-Json
             $Manifest.installed              = Merge-PriorList $Manifest.installed              $prior.installed              { param($e) $e.name }   -Announce 'entry'
             $Manifest.filesPlaced            = Merge-PriorList $Manifest.filesPlaced            $prior.filesPlaced            { param($e) $e }
+            # PRIOR wins (args swapped), same reason as regValuesSet below: only the FIRST
+            # run saw the original file, so keeping a later run's row would point the
+            # restore at a backup of our own output.
+            $Manifest.filesReplaced          = Merge-PriorList $prior.filesReplaced          $Manifest.filesReplaced       { param($e) $e.path }
             $Manifest.teamViewerRemoved      = Merge-PriorList $Manifest.teamViewerRemoved      $prior.teamViewerRemoved      { param($e) $e }
             $Manifest.dependencies           = Merge-PriorList $Manifest.dependencies           $prior.dependencies           { param($e) $e.name }   -Announce 'dependency'
             # PRIOR wins here (args swapped vs every other list): 'prev' is the pre-install
@@ -1686,11 +1682,32 @@ function Save-Manifest {
                 foreach ($pn in $prior.computerRenamed.PSObject.Properties) { $Manifest.computerRenamed[$pn.Name] = $pn.Value }
             }
         } catch {
-            Warn "could not merge prior manifest (overwriting): $($_.Exception.Message)"
+            # An unreadable prior manifest is the ONLY record of what a previous run
+            # placed. Overwriting it turns every earlier install into something
+            # -Uninstall can no longer see (it would report "nothing recorded" and
+            # exit 0). Keep the bytes so they can be repaired by hand.
+            $keep = "$ManifestPath.unreadable"
+            try {
+                Move-Item -LiteralPath $ManifestPath -Destination $keep -Force -ErrorAction Stop
+                Warn "prior manifest unreadable ($($_.Exception.Message)) - kept as $keep"
+            } catch {
+                Warn "prior manifest unreadable and could not be preserved: $($_.Exception.Message)"
+            }
+            Warn 'this run''s manifest will NOT contain earlier runs - check the kept copy before -Uninstall.'
         }
     }
-    ($Manifest | ConvertTo-Json -Depth 6) | Set-Content -Path $ManifestPath -Encoding UTF8
-    Ok "manifest written: $ManifestPath"
+    # Write via a temp file + replace: Set-Content straight onto $ManifestPath leaves a
+    # TRUNCATED file if the run is killed mid-write, and a truncated manifest is exactly
+    # what trips the unreadable path above on the next run.
+    $tmp = "$ManifestPath.tmp"
+    try {
+        ($Manifest | ConvertTo-Json -Depth 6) | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $ManifestPath -Force -ErrorAction Stop
+        Ok "manifest written: $ManifestPath"
+    } catch {
+        Fail "could not write manifest ${ManifestPath}: $($_.Exception.Message)"
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ===========================================================================
@@ -1729,7 +1746,12 @@ function Set-TrackedRegValue {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)]$Value,
-        [ValidateSet('String','ExpandString','DWord','QWord','Binary','MultiString')][string]$Type='String'
+        [ValidateSet('String','ExpandString','DWord','QWord','Binary','MultiString')][string]$Type='String',
+        # Say so out loud when we are about to replace SOMEONE ELSE'S value rather than
+        # one of our own. The prior state is recorded either way (so -Uninstall restores
+        # it), but a silently clobbered ManagedBookmarks / deliberately-0
+        # BookmarkBarEnabled is invisible in the transcript until someone complains.
+        [string]$WarnIfPresent
     )
     # Internal DryRun guard. The two original callers guard externally, but a new
     # caller that forgets would write to HKLM during a -DryRun. Guard here instead.
@@ -1740,6 +1762,9 @@ function Set-TrackedRegValue {
         $existing = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
         $prev = $existing.$Name; $prevAbsent = $false
     } catch { $prevAbsent = $true }
+    if ($WarnIfPresent -and -not $prevAbsent -and "$prev" -ne "$Value") {
+        Warn "$WarnIfPresent - existing value '$prev' is being replaced (restored on -Uninstall)"
+    }
 
     # Record the keys New-Item -Force is about to create, so -Uninstall can remove
     # them again. Walk UP from $Path to the shallowest ancestor that doesn't exist
@@ -1908,6 +1933,25 @@ function Write-XmlFile {
     param([string]$Path, [string]$Xml)
     $dir = Split-Path $Path -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    # Preserve a file we are about to REPLACE. LayoutModification.xml is a file OEM
+    # images legitimately ship, and it goes into filesPlaced either way (leaving our
+    # layout behind on uninstall would be worse - it would strand pins aimed at deleted
+    # exes), so uninstall needs the original back after the delete.
+    # "Existing" must mean SOMEONE ELSE'S: on any re-run the file is there because WE
+    # wrote it last time, and backing that up would hand -Uninstall a copy of our own
+    # layout to restore. The prior manifest is the authority on what we placed.
+    $prior = Get-PriorManifest
+    $ours  = (@($prior.filesPlaced) -contains $Path) -or
+             (@($prior.filesReplaced | ForEach-Object { $_.path }) -contains $Path)
+    if ((Test-Path -LiteralPath $Path) -and $Manifest -and -not $ours -and
+        -not @($Manifest.filesReplaced | Where-Object { $_.path -eq $Path })) {
+        $bak = "$Path.alleaves-orig"
+        try {
+            if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $Path -Destination $bak -Force -ErrorAction Stop }
+            $Manifest.filesReplaced += @{ path=$Path; backup=$bak }
+            Write-Host "  backed up existing $Path (restored on uninstall)"
+        } catch { Warn "could not back up existing ${Path}: $($_.Exception.Message)" }
+    }
     [IO.File]::WriteAllText($Path, ($Xml -replace "`r?`n","`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
@@ -1954,25 +1998,20 @@ function New-TrackedShortcut {
 }
 
 # The Alleaves MSI installs exactly two files (AlleavesLauncher.exe + .config) and
-# NO shortcut anywhere - measured on the rig, docs/PRINTER_POSX_OPOS_HANDOFF.md Q4.
+# NO shortcut anywhere - measured on the rig. ARP InstallLocation is the only source;
+# no literal fallback, so a $null here means "don't pin it" rather than a pin aimed at
+# a guessed path.
 function Get-AlleavesLauncherPath {
     $p = @(Find-InstalledProducts -Pattern 'Alleaves Terminal')[0]
-    if (-not $p) { return $null }
-    # ARP InstallLocation is the reliable source; fall back to the measured default.
-    $dir = $p.InstallLocation
-    if (-not $dir) { $dir = 'C:\Program Files (x86)\Alleaves Terminal' }
-    return (Join-Path $dir.TrimEnd('\') 'AlleavesLauncher.exe')
+    if (-not $p -or -not $p.InstallLocation) { return $null }
+    return (Join-Path $p.InstallLocation.TrimEnd('\') 'AlleavesLauncher.exe')
 }
 
 # App Paths is the canonical chrome.exe lookup and is correct for both the
-# Program Files and Program Files (x86) installs; the literals are the fallback.
+# Program Files and Program Files (x86) installs.
 function Get-ChromeExePath {
     $ap = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)'
     if ($ap -and (Test-Path $ap)) { return $ap }
-    foreach ($c in @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-                     "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe")) {
-        if (Test-Path $c) { return $c }
-    }
     return $null
 }
 
@@ -2024,10 +2063,16 @@ function Invoke-ChromeTaskbar {
         Dry "would write taskbar XML -> $machineXml"
         Dry 'would set HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\LayoutXMLPath (new profiles)'
     } else {
-        Write-XmlFile -Path $machineXml -Xml $xml
-        $Manifest.filesPlaced += $machineXml
-        Set-TrackedRegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name 'LayoutXMLPath' -Value $machineXml -Type 'String'
-        Ok "LayoutXMLPath set (new profiles): $machineXml"
+        # try/catch like (b) and (c) below: $ErrorActionPreference='Continue' does NOT
+        # suppress a .NET method exception, so an unguarded throw here would abort the
+        # whole run at the top-level catch - after every download and install has
+        # already happened - for one cosmetic file.
+        try {
+            Write-XmlFile -Path $machineXml -Xml $xml
+            $Manifest.filesPlaced += $machineXml
+            Set-TrackedRegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name 'LayoutXMLPath' -Value $machineXml -Type 'String'
+            Ok "LayoutXMLPath set (new profiles): $machineXml"
+        } catch { Warn "could not write the machine taskbar XML: $($_.Exception.Message)" }
     }
 
     # (b) Default profile XML - brand-new accounts pick it up at first logon.
@@ -2040,13 +2085,32 @@ function Invoke-ChromeTaskbar {
 
     # (c) Existing profiles (incl. the auto-login cashier): drop the per-user XML.
     # The logon task clears Taskband + restarts Explorer so this XML is applied.
+    $userXmlPlaced = 0
     if (-not $DryRun) { Backup-LoadedTaskbands }
     foreach ($u in (Get-TargetUserProfiles)) {
         $uXml = Join-Path $u.Profile 'AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml'
-        if ($DryRun) { Dry "would write per-user taskbar XML -> $uXml (sid $($u.Sid))"; continue }
-        try { Write-XmlFile -Path $uXml -Xml $xml; $Manifest.filesPlaced += $uXml; Ok "per-user taskbar XML placed for $($u.Sid)" }
+        if ($DryRun) { Dry "would write per-user taskbar XML -> $uXml (sid $($u.Sid))"; $userXmlPlaced++; continue }
+        try { Write-XmlFile -Path $uXml -Xml $xml; $Manifest.filesPlaced += $uXml; $userXmlPlaced++; Ok "per-user taskbar XML placed for $($u.Sid)" }
         catch { Warn "could not write per-user XML for $($u.Sid): $($_.Exception.Message)" }
     }
+
+    # Only arm the logon task if a layout actually landed. The task's first act is to
+    # DELETE the user's Taskband pins and restart Explorer so the new XML is read; with
+    # no XML written (e.g. a read-only per-user file on an OEM image, warned about just
+    # above) that is a pure destruction - the cashier loses their pins and gets whatever
+    # layout was already on disk, and ours never appears.
+    if (-not $userXmlPlaced) {
+        Warn 'no per-user taskbar layout could be written - not scheduling the per-user taskbar finish'
+        Write-Host '  (the pinned shortcuts were still created; pin them by hand or re-run)'
+        return
+    }
+    # The per-user marker records WHICH layout was applied, not merely that one was.
+    # A bare "already applied" flag makes every later pin-set change invisible to a
+    # terminal that is already deployed: the XML above is rewritten, but the logon task
+    # sees the flag, skips the Taskband clear + Explorer restart that is the only thing
+    # making Explorer re-read the XML, and the cashier keeps the OLD pins forever. The
+    # pin list is the stamp - no hashing needed, and it changes exactly when the pins do.
+    $script:TaskbarStamp  = ($pins -join '|')
     $script:FinishTaskbar = $true
     Write-Host '  (taskbar is applied per user at the next logon by AlleavesAuto-FinishUser)'
 }
@@ -2134,8 +2198,10 @@ function Invoke-ChromeBookmark {
     # Set-TrackedRegValue has its own -DryRun guard and records prior state, so
     # -Uninstall restores each value and removes the keys we created.
     $root = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
-    Set-TrackedRegValue -Path $root -Name 'BookmarkBarEnabled' -Value 1 -Type 'DWord'        # or the bookmark is off-screen
-    Set-TrackedRegValue -Path $root -Name 'ManagedBookmarks' -Value $bookmarks -Type 'String'
+    Set-TrackedRegValue -Path $root -Name 'BookmarkBarEnabled' -Value 1 -Type 'DWord' `
+        -WarnIfPresent 'Chrome BookmarkBarEnabled policy was already set'                 # or the bookmark is off-screen
+    Set-TrackedRegValue -Path $root -Name 'ManagedBookmarks' -Value $bookmarks -Type 'String' `
+        -WarnIfPresent 'another ManagedBookmarks policy is already present (its bookmarks will disappear while this install is in place)'
     if (-not $DryRun) { Ok "Chrome policy set: 'Alleaves' bookmark -> $AlleavesUrl" }
     Write-Host '  (applies the next time Chrome starts; verify at chrome://policy)'
 }
@@ -2287,14 +2353,22 @@ if ($DoBrowser) {
 }
 
 if ($DoTaskbar) {
+    # The marker holds the LAYOUT (the pin list), not a bare 1: a terminal deployed by an
+    # older build carries TaskbarApplied=1, which never equals a stamp, so a changed pin
+    # set re-applies exactly once and then settles. Compared as strings so the old DWORD
+    # 1 and the new REG_SZ compare cleanly.
+    $stamp='__TASKBAR_STAMP__'
     $applied=(Get-ItemProperty $markRoot -ErrorAction SilentlyContinue).TaskbarApplied
-    if ($applied -ne 1) {
+    if ("$applied" -ne $stamp) {
         $tb='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
         try { Remove-ItemProperty -Path $tb -Name 'Favorites' -ErrorAction SilentlyContinue } catch {}
         try { Remove-ItemProperty -Path $tb -Name 'FavoritesResolve' -ErrorAction SilentlyContinue } catch {}
         if (-not (Test-Path $markRoot)) { New-Item -Path $markRoot -Force | Out-Null }
-        Set-ItemProperty -Path $markRoot -Name 'TaskbarApplied' -Value 1
-        L 'taskbar reset (cleared Taskband); restarting explorer'
+        # New-ItemProperty -Force, not Set-ItemProperty: the deployed value is a DWORD and
+        # Set-ItemProperty would try to coerce the stamp into it and fail. -Force replaces
+        # the value AND its type.
+        New-ItemProperty -Path $markRoot -Name 'TaskbarApplied' -Value $stamp -PropertyType String -Force | Out-Null
+        L "taskbar reset (cleared Taskband) for layout '$stamp'; restarting explorer"
         Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
         if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
@@ -2304,6 +2378,10 @@ L 'finish done'
 '@
     $body = $body -replace '__DO_BROWSER__', $(if ($DoBrowser) { '$true' } else { '$false' })
     $body = $body -replace '__DO_TASKBAR__', $(if ($DoTaskbar) { '$true' } else { '$false' })
+    # The layout stamp lands inside a single-quoted literal in the generated script, so
+    # double any apostrophe (same treatment as __INSTALL_USER__ below). Empty stamp =>
+    # the marker can never match => the apply runs, which is the safe direction.
+    $body = $body.Replace('__TASKBAR_STAMP__', ("$($script:TaskbarStamp)").Replace("'","''"))
     # F15: bake the installer's username (literal .Replace, doubled quotes) so the
     # finish skips the tech/admin account that ran the install.
     $body = $body.Replace('__INSTALL_USER__', ("$env:USERNAME").Replace("'","''"))
@@ -2711,10 +2789,12 @@ function Set-ScannerOpos {
             # rig constants can be finalized for it. Matched as a family regex, since the
             # reported model is a kit SKU (DS2208-SR7U2100SGW), not the bare family name.
             # Model is read post-hop (blank up front for a HID-KB start). Records-only;
-            # never touches the exit code.
+            # never touches the exit code. -ForceFingerprint dumps it for a KNOWN model
+            # too (rig capture), but newModel stays honest - it means the model really is
+            # unknown, not "we asked for the log".
             $newModel = $script:ScannerFinalModel
-            if ($newModel -and ($newModel -notmatch $ScannerKnownModels)) {
-                $entry.newModel       = $true
+            if ($newModel -and ($ForceFingerprint -or ($newModel -notmatch $ScannerKnownModels))) {
+                if ($newModel -notmatch $ScannerKnownModels) { $entry.newModel = $true }
                 $entry.fingerprintLog = Write-NewScannerFingerprint -Model $newModel -Hops $script:ScannerHopLog
             }
             $Manifest.scannerConfigured += $entry
@@ -2815,6 +2895,19 @@ function Invoke-UninstallPhase {
         }
     }
 
+    # 1b. Put back any pre-existing file step 1 just deleted (an OEM taskbar layout we
+    #     overwrote at install). Must run AFTER the deletion loop above, which removes
+    #     the path this restores to.
+    foreach ($fr in @($man.filesReplaced)) {
+        if (-not $fr.path -or -not $fr.backup) { continue }
+        if ($DryRun) { Dry "would restore $($fr.path) from $($fr.backup)"; continue }
+        if (-not (Test-Path -LiteralPath $fr.backup)) { Warn "backup $($fr.backup) is gone - cannot restore $($fr.path)"; continue }
+        try {
+            Move-Item -LiteralPath $fr.backup -Destination $fr.path -Force -ErrorAction Stop
+            Ok "restored original $($fr.path)"
+        } catch { Warn "could not restore $($fr.path): $($_.Exception.Message)" }
+    }
+
     # 2. Uninstall installed programs in REVERSE order
     Step 'Uninstall Alleaves stack'
     $allowedResults = if ($DryRun) { @('ok','dryrun') } else { @('ok') }
@@ -2867,23 +2960,11 @@ function Invoke-UninstallPhase {
         }
     }
 
-    # 3. Uninstall bootstrap deps we installed (none currently, but honored)
+    # 3. Bootstrap deps. Shared runtimes (VC++ - the only thing ever recorded here)
+    # are reported but NEVER removed: other software on the terminal may depend on them.
     if ($man.dependencies) {
         Step 'Uninstall bootstrap dependencies'
-        foreach ($dep in $man.dependencies) {
-            # Shared runtimes (VC++) are recorded but NEVER removed on -Uninstall:
-            # other software on the terminal may depend on them.
-            if ($dep.removable -eq $false) { Ok "keeping shared dependency: $($dep.name)"; continue }
-            if ($dep.method -eq 'dryrun') { Dry "manifest dep was a dryrun: $($dep.name)"; continue }
-            $pattern = if ($dep.displayNameMatch) { $dep.displayNameMatch } else { $dep.name }
-            $found = Find-InstalledProducts -Pattern $pattern
-            foreach ($m in $found) {
-                if (-not (Invoke-SilentUninstall -DisplayName $m.DisplayName `
-                    -UninstallString $m.UninstallString `
-                    -QuietUninstallString $m.QuietUninstallString `
-                    -ProductCode $m.PSChildName)) { $uninstallFailures++ }
-            }
-        }
+        foreach ($dep in $man.dependencies) { Ok "keeping shared dependency: $($dep.name)" }
     }
     # 4. Reverse the post-install finishing (taskbar / default browser / UCPD).
     #    The placed XMLs + the staged finish script come out via filesPlaced above.
@@ -2917,8 +2998,15 @@ function Invoke-UninstallPhase {
                         try {
                             $sub = $rv.path -replace '(?i)^HKLM:\\', ''
                             $h = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($sub, $true)
-                            if ($h) { try { $h.DeleteValue('', $false) } finally { $h.Close() } }
-                            Ok "removed $($rv.path)\(default)"
+                            # Report what actually happened: a null handle (access denied,
+                            # or the key is already gone) is NOT a removal, and logging one
+                            # hides the phantom device this deletion exists to retire.
+                            if ($h) {
+                                try { $h.DeleteValue('', $false) } finally { $h.Close() }
+                                Ok "removed $($rv.path)\(default)"
+                            } else {
+                                Write-Host "  $($rv.path) not open for write (already gone?) - (default) left alone"
+                            }
                         } catch { Warn "could not remove $($rv.path)\(default): $($_.Exception.Message)" }
                     } else {
                         Remove-ItemProperty -Path $rv.path -Name $rv.name -Force -ErrorAction SilentlyContinue
@@ -3031,8 +3119,8 @@ function Invoke-UninstallPhase {
 # The vendor installer ("OLE POS Setup 2.84") stages the files and registers the
 # COM objects; SetupPOS.exe is only a GUI over the registry. So we make the device
 # entry ourselves - silent, tracked, and reversible. Everything below was CAPTURED
-# from a real SetupPOS run and diffed (see docs/PRINTER_POSX_OPOS_HANDOFF.md Q3);
-# NONE of it is authored. The OPOS spec mandates only (default)=ProgID - the rest is
+# from a real SetupPOS run and diffed; NONE of it is authored. The OPOS spec mandates
+# only (default)=ProgID - the rest is
 # vendor-private, and deriving it from Thermal.inf would have been subtly wrong
 # (Description and PortShare appear in neither section of it).
 #
@@ -3051,30 +3139,29 @@ function Invoke-UninstallPhase {
 # ===========================================================================
 $PrinterOposRoot = 'HKLM:\SOFTWARE\WOW6432Node\OLEforRetail\ServiceOPOS'
 
-# Captured verbatim 2026-08-10 from OLE POS Setup 2.84 on the rig.
-$PrinterOposDevices = @(
-    @{
-        Class = 'POSPrinter'; Suffix = '_Printer'; Type = 'ThermalU'
-        ProgId = 'RecPrinter.POSPrinter.SOU'
-        Strings = [ordered]@{
-            '(default)'='RecPrinter.POSPrinter.SOU'; ADKConfig='Thermal1.0'
-            Description='OLE POS Printer OPOS Service Object'
-            DeviceDesc='Thermal POS Printer (USB)'; DeviceName='ThermalU'
-            Port='USB'; Version='1.0'
-            BaudrateSel=''; BitLengthSel=''; HandShakeSel=''; IP=''; ParitySel=''; StopSel=''; XonXoffSel=''
-        }
-        DWords = [ordered]@{
-            # DrawerOpen=1 is SetupPOS's "Open CashDrawer" = "Follow Printer" - the cash
-            # drawer's whole configuration now that it has no device entry of its own.
-            # CAPTURED 2026-08-12, not authored: driving the real SetupPOS combo from
-            # 'CashDrawer' (0) to 'Follow Printer' (1) and diffing HKLM\...\OLEforRetail
-            # changed exactly this one value. Thermal.inf's [UOPTION] default is 0.
-            Baudrate=0; BitLength=0; DrawerOpen=1; HandShake=0; IdleSleep=10; InputBuf=0
-            InputSleep=10; OutputBuf=1024; Parity=0; PortShare=0; Stop=0; Timeout=1000
-            USBSerialNumber=0; XonXoff=0
-        }
-    }
-)
+# Captured verbatim 2026-08-10 from OLE POS Setup 2.84 on the rig. ONE device - the
+# drawer's entry was dropped 2026-08-12 (see above), so there is nothing to iterate.
+$PrinterOposClass  = 'POSPrinter'
+$PrinterOposSuffix = '_Printer'
+$PrinterOposType   = 'ThermalU'
+$PrinterOposProgId = 'RecPrinter.POSPrinter.SOU'
+$PrinterOposStrings = [ordered]@{
+    '(default)'='RecPrinter.POSPrinter.SOU'; ADKConfig='Thermal1.0'
+    Description='OLE POS Printer OPOS Service Object'
+    DeviceDesc='Thermal POS Printer (USB)'; DeviceName='ThermalU'
+    Port='USB'; Version='1.0'
+    BaudrateSel=''; BitLengthSel=''; HandShakeSel=''; IP=''; ParitySel=''; StopSel=''; XonXoffSel=''
+}
+$PrinterOposDWords = [ordered]@{
+    # DrawerOpen=1 is SetupPOS's "Open CashDrawer" = "Follow Printer" - the cash
+    # drawer's whole configuration now that it has no device entry of its own.
+    # CAPTURED 2026-08-12, not authored: driving the real SetupPOS combo from
+    # 'CashDrawer' (0) to 'Follow Printer' (1) and diffing HKLM\...\OLEforRetail
+    # changed exactly this one value. Thermal.inf's [UOPTION] default is 0.
+    Baudrate=0; BitLength=0; DrawerOpen=1; HandShake=0; IdleSleep=10; InputBuf=0
+    InputSleep=10; OutputBuf=1024; Parity=0; PortShare=0; Stop=0; Timeout=1000
+    USBSerialNumber=0; XonXoff=0
+}
 
 # The LDN prefix is the terminal's POS name. Deliberately NOT $env:COMPUTERNAME: the
 # rename only takes effect on the post-install reboot, so the env var is stale for the
@@ -3122,14 +3209,17 @@ function Resolve-PrinterBrand {
             Write-Host ''
             Write-Host '  Receipt printer brand:' -ForegroundColor Cyan
             Write-Host '    1) POS-X   (default)'
-            Write-Host '    2) Star TSP'
-            Write-Host '    3) Epson'
-            Write-Host '    4) None - no receipt printer (skips the driver install too)'
-            $sel = Read-Host '  Select 1-4 (Enter for POS-X)'
-            switch ("$sel".Trim()) {
-                '2' { $brand = 'Star' }
-                '3' { $brand = 'Epson' }
-                '4' { $brand = 'None' }
+            Write-Host '    2) None - no receipt printer (skips the driver install too)'
+            $sel = Read-Host '  Select 1-2 (Enter for POS-X)'
+            # The WORDS are accepted alongside the digits: README documents -PrinterBrand
+            # None, so typing "None" here is the natural mistake - and with no default
+            # case it used to fall through to POS-X, installing the driver and registering
+            # a phantom <POSname>_Printer on a terminal that has no printer at all.
+            switch -Regex ("$sel".Trim()) {
+                '^$'            { }                      # Enter = the POS-X default
+                '^(1|POS-?X)$'  { $brand = 'POS-X' }
+                '^(2|None)$'    { $brand = 'None' }
+                default         { Warn "unrecognized answer '$sel' - using POS-X" }
             }
         } catch {
             Warn "no console for the printer-brand prompt - defaulting to POS-X ($($_.Exception.Message))"
@@ -3142,7 +3232,7 @@ function Resolve-PrinterBrand {
 # Drop device entries WE created that this run no longer registers. Two cases, one test:
 # a rename (the advertised "re-run -PrinterConfigOnly to fix the names" would otherwise
 # leave <OLDNAME>_Printer behind and the terminal advertises two), and a device RETIRED
-# from $PrinterOposDevices - which is how the 2026-08-12 cash-drawer removal reaches
+# from the device table - which is how the 2026-08-12 cash-drawer removal reaches
 # terminals already deployed with a <POSname>_Drawer entry. The old prefix-match test
 # ("-like $Prefix_*") could not do the second: on the same terminal the retired drawer
 # matched this run's own prefix and was stranded as a phantom device forever.
@@ -3154,18 +3244,36 @@ function Resolve-PrinterBrand {
 # ponytail: the emptied CLASS key (ServiceOPOS\CashDrawer) is left in place - it
 # enumerates no devices, and -Uninstall still removes it via regKeysCreated.
 function Remove-StalePrinterOpos {
-    param([Parameter(Mandatory)][string]$Prefix)
+    param(
+        [Parameter(Mandatory)][string]$Prefix,
+        # The names that ACTUALLY registered this run. Defaults to the name this run would
+        # register, for the -DryRun preview; the real path passes only what it
+        # verified, so a partial run never retires the device it just failed to replace.
+        [string[]]$Registered
+    )
     if (-not (Test-Path $ManifestPath)) { return }
     $prior = try { Get-Content $ManifestPath -Raw | ConvertFrom-Json } catch { return }
-    $keep = @($PrinterOposDevices | ForEach-Object { "$Prefix$($_.Suffix)" })
+    $keep = if ($PSBoundParameters.ContainsKey('Registered')) { @($Registered) }
+            else { @("$Prefix$PrinterOposSuffix") }
     foreach ($p in @($prior.printerConfigured)) {
         if (-not $p.logicalName -or -not $p.deviceClass) { continue }          # skips the (none:*) rows
         if ($keep -contains $p.logicalName) { continue }                        # this run's own names
         $stale = "$PrinterOposRoot\$($p.deviceClass)\$($p.logicalName)"
         if (-not (Test-Path $stale)) { continue }
         if ($DryRun) { Dry "would remove stale OPOS device: $($p.logicalName)"; continue }
-        try { Remove-Item -Path $stale -Force -ErrorAction Stop; Ok "removed stale OPOS device: $($p.logicalName)" }
-        catch { Warn "could not remove stale OPOS device '$($p.logicalName)': $($_.Exception.Message)" }
+        # Same guard the uninstall path applies: a SUBKEY under a device may be a
+        # co-installed vendor device that landed under us, and a non-recursive
+        # Remove-Item on a key with children raises ShouldContinue - which prompts on an
+        # interactive host and THROWS on an RMM one, so the stale device would silently
+        # survive the very function whose job is to remove it.
+        try {
+            if ((Get-Item $stale -ErrorAction Stop).SubKeyCount -gt 0) {
+                Warn "stale OPOS device '$($p.logicalName)' has subkeys - left in place (may hold another vendor's device)"
+                continue
+            }
+            Remove-Item -Path $stale -Force -ErrorAction Stop
+            Ok "removed stale OPOS device: $($p.logicalName)"
+        } catch { Warn "could not remove stale OPOS device '$($p.logicalName)': $($_.Exception.Message)" }
     }
 }
 
@@ -3175,23 +3283,15 @@ function Set-PrinterOpos {
     if ($SkipPrinterConfig) { Ok 'printer OPOS skipped (-SkipPrinterConfig)'; return }
 
     $brand = Resolve-PrinterBrand
-    # Deliberate "this terminal has no receipt printer" - distinct from 'not-implemented' so
-    # the manifest doesn't blame an unimplemented brand for a choice the tech made. Returns
-    # BEFORE Remove-StalePrinterOpos: None means skip, not retro-uninstall a prior run's
-    # entries (-Uninstall is what removes those).
+    # Deliberate "this terminal has no receipt printer", recorded as its own result so the
+    # manifest shows a choice the tech made rather than a failure. Returns BEFORE
+    # Remove-StalePrinterOpos: None means skip, not retro-uninstall a prior run's entries
+    # (-Uninstall is what removes those).
     if ($brand -eq 'None') {
         Ok 'no receipt printer selected - skipping OPOS registration'
         $Manifest.printerConfigured += @{
             logicalName='(none:None)'; deviceClass=$null; deviceType=$null
             progId=$null; brand=$brand; result='skipped'; removable=$true
-        }
-        return
-    }
-    if ($brand -ne 'POS-X') {
-        Warn "$brand printers are not yet implemented - skipping OPOS registration."
-        $Manifest.printerConfigured += @{
-            logicalName="(none:$brand)"; deviceClass=$null; deviceType=$null
-            progId=$null; brand=$brand; result='not-implemented'; removable=$true
         }
         return
     }
@@ -3203,7 +3303,12 @@ function Set-PrinterOpos {
     # Checked via ARP, NOT the ProgID: the vendor uninstaller leaves the whole
     # ProgID -> CLSID -> InprocServer32 chain behind (measured), so a ProgID test says
     # "installed" on a box where the DLL is long gone. The ARP entry does go.
-    if (-not $DryRun -and -not (Find-InstalledProducts -Pattern 'OLE POS Setup')) {
+    # Skipped only for a DryRun of the FULL install, where the driver is legitimately
+    # absent because the install loop that would have placed it was itself simulated.
+    # Under -DryRun -PrinterConfigOnly nothing installs anything, so a real run would
+    # refuse here - and a preview that "registers" devices the real run would decline is
+    # a preview of the wrong run.
+    if (-not ($DryRun -and -not $PrinterConfigOnly) -and -not (Find-InstalledProducts -Pattern 'OLE POS Setup')) {
         Warn 'POS-X OLE POS driver is not installed - skipping OPOS registration.'
         Warn 'Install it (full run, or without -SkipPrograms), then re-run with -PrinterConfigOnly.'
         $Manifest.printerConfigured += @{
@@ -3214,56 +3319,74 @@ function Set-PrinterOpos {
     }
 
     $prefix = Get-PosNamePrefix
-    Remove-StalePrinterOpos -Prefix $prefix
 
     # DryRun BEFORE any registry touch. Set-TrackedRegValue guards internally too, but
     # returning here also keeps the manifest entries honest (result='dryrun').
+    $ldn = "$prefix$PrinterOposSuffix"
     if ($DryRun) {
-        foreach ($d in $PrinterOposDevices) {
-            $ldn = "$prefix$($d.Suffix)"
-            Dry "would register OPOS $($d.Class) '$ldn' -> $($d.ProgId) ($($d.Strings.Count + $d.DWords.Count) values)"
-            $Manifest.printerConfigured += @{
-                logicalName=$ldn; deviceClass=$d.Class; deviceType=$d.Type
-                progId=$d.ProgId; brand=$brand; result='dryrun'; removable=$true
-            }
+        Remove-StalePrinterOpos -Prefix $prefix
+        Dry "would register OPOS $PrinterOposClass '$ldn' -> $PrinterOposProgId ($($PrinterOposStrings.Count + $PrinterOposDWords.Count) values)"
+        $Manifest.printerConfigured += @{
+            logicalName=$ldn; deviceClass=$PrinterOposClass; deviceType=$PrinterOposType
+            progId=$PrinterOposProgId; brand=$brand; result='dryrun'; removable=$true
         }
         return
     }
 
-    foreach ($d in $PrinterOposDevices) {
-        $ldn  = "$prefix$($d.Suffix)"
-        $key  = "$PrinterOposRoot\$($d.Class)\$ldn"
-        $entry = @{
-            logicalName=$ldn; deviceClass=$d.Class; deviceType=$d.Type
-            progId=$d.ProgId; brand=$brand; removable=$true
-        }
-        try {
-            foreach ($n in $d.Strings.Keys) { Set-TrackedRegValue -Path $key -Name $n -Value $d.Strings[$n] -Type String }
-            foreach ($n in $d.DWords.Keys)  { Set-TrackedRegValue -Path $key -Name $n -Value ([int]$d.DWords[$n]) -Type DWord }
-
-            # Verify by reading the key back. This works with no hardware attached, which
-            # is why exit 7 is meaningful on a printer-less bench run.
-            #   * (default) is the ONE value the OPOS spec mandates - check it by content.
-            #   * the COUNT catches a partial write: $ErrorActionPreference is 'Continue',
-            #     so a failed New-ItemProperty is non-terminating and Set-TrackedRegValue
-            #     would record a value it never actually wrote. A total failure throws on
-            #     the Get-Item below; without the count, a partial one reported 'ok'.
-            #     ValueCount includes the default value, so the expected total is exact.
-            $k     = Get-Item $key -ErrorAction Stop
-            $wrote = $k.GetValue('')
-            if ($wrote -ne $d.ProgId) { throw "readback mismatch: (default)='$wrote' expected '$($d.ProgId)'" }
-            $want = $d.Strings.Count + $d.DWords.Count
-            if ($k.ValueCount -lt $want) { throw "partial write: $($k.ValueCount)/$want values present" }
-
-            Ok "OPOS $($d.Class): $ldn -> $($d.ProgId)"
-            $entry.result = 'ok'
-        } catch {
-            Fail "could not register OPOS $($d.Class) '$ldn': $($_.Exception.Message)"
-            $entry.result = "fail: $($_.Exception.Message)"
-            $script:PrinterConfigFailed = $true
-        }
-        $Manifest.printerConfigured += $entry
+    $key   = "$PrinterOposRoot\$PrinterOposClass\$ldn"
+    $entry = @{
+        logicalName=$ldn; deviceClass=$PrinterOposClass; deviceType=$PrinterOposType
+        progId=$PrinterOposProgId; brand=$brand; removable=$true
     }
+    $registered = $false
+    try {
+        foreach ($n in $PrinterOposStrings.Keys) { Set-TrackedRegValue -Path $key -Name $n -Value $PrinterOposStrings[$n] -Type String }
+        foreach ($n in $PrinterOposDWords.Keys)  { Set-TrackedRegValue -Path $key -Name $n -Value ([int]$PrinterOposDWords[$n]) -Type DWord }
+
+        # Verify by reading EVERY value back, by name, against the same tables that
+        # were just written. This works with no hardware attached, which is why
+        # exit 7 is meaningful on a printer-less bench run.
+        # Per-name, NOT a value COUNT: $ErrorActionPreference is 'Continue', so a
+        # failed New-ItemProperty is non-terminating and Set-TrackedRegValue records
+        # a value it never wrote - and on a key that ALREADY holds the full set (any
+        # re-run, or a terminal deployed before this table changed) the count is
+        # already satisfied, so it can never catch that. The migration this misses is
+        # the real one: DrawerOpen 0 -> 1 silently not applied, reported 'ok', and the
+        # cash drawer never kicks. (default) is a Strings member, so it is covered
+        # here too - by content, as the OPOS spec requires.
+        $k = Get-Item $key -ErrorAction Stop
+        foreach ($n in $PrinterOposStrings.Keys) {
+            # '(default)' is an ALIAS the *ItemProperty cmdlets accept for the key's default
+            # value, whose real name is the empty string. GetValue does NOT accept it - it
+            # looks for a value literally called "(default)", finds none, and returns $null,
+            # so this loop failed on the very first key every run: the 28 values were all
+            # written correctly yet the step reported 'fail' and exit 7, forever. Mirror
+            # image of the trap the uninstall path documents for Remove-ItemProperty.
+            $got = $k.GetValue($(if ($n -eq '(default)') { '' } else { $n }))
+            if ("$got" -cne "$($PrinterOposStrings[$n])") { throw "readback mismatch: '$n'='$got' expected '$($PrinterOposStrings[$n])'" }
+        }
+        foreach ($n in $PrinterOposDWords.Keys) {
+            $got = $k.GetValue($n)
+            if ($null -eq $got -or [int]$got -ne [int]$PrinterOposDWords[$n]) { throw "readback mismatch: '$n'='$got' expected '$($PrinterOposDWords[$n])'" }
+        }
+
+        Ok "OPOS ${PrinterOposClass}: $ldn -> $PrinterOposProgId"
+        $entry.result = 'ok'
+        $registered = $true
+    } catch {
+        Fail "could not register OPOS $PrinterOposClass '$ldn': $($_.Exception.Message)"
+        $entry.result = "fail: $($_.Exception.Message)"
+        $script:PrinterConfigFailed = $true
+    }
+    $Manifest.printerConfigured += $entry
+
+    # Retire stale devices only AFTER the replacement verifies. Deleting first means a
+    # failed write (exit 7, "re-run with -PrinterConfigOnly") leaves the terminal with NO
+    # OPOS printer where it had a working one under the old name a second earlier - and
+    # the delete has no rollback. Pass only the name that actually registered, so a
+    # failed run never retires the device it failed to replace.
+    if ($registered) { Remove-StalePrinterOpos -Prefix $prefix -Registered @($ldn) }
+    else { Warn 'nothing registered - leaving any existing OPOS device entries alone' }
 
     Write-Host "  Alleaves must be configured to open this exact logical name." -ForegroundColor Yellow
 }
@@ -3286,6 +3409,11 @@ function New-InstallManifest {
         teamViewerRemoved = @()
         installed         = @()
         filesPlaced       = @()
+        # Files that ALREADY EXISTED and were overwritten (the OEM taskbar layouts). They
+        # are in filesPlaced too, so uninstall deletes them; this list puts the original
+        # back afterwards. Without it, uninstalling strips an OEM's Default-profile
+        # taskbar and every account created later gets Microsoft's stock layout instead.
+        filesReplaced     = @()   # { path; backup } - uninstall restores backup -> path
         # Post-install finishing (rename / taskbar / default browser):
         computerRenamed        = @{}   # { from=...; to=... } - recorded only, NOT reverted
         regValuesSet           = @()   # { hive; path; name; type; value; prev } - uninstall restores prev (or removes if prev=$null)
@@ -3310,65 +3438,60 @@ function New-InstallManifest {
 $exitCode = 0
 $RunLog = $null
 try {
-    if ($ScannerConfigOnly) {
-        # Scanner-config-only: run ONLY the final USB-OPOS step - no downloads, no
-        # installs, no finishing. For iterating the OPOS switch on the rig, or to
-        # (re)configure a scanner that was unplugged during the main install. Still
-        # admin (COM + permanent switch); -DryRun works non-elevated. Save-Manifest
-        # MERGES onto any prior install_manifest.json, so this only updates
-        # scannerConfigured and preserves the rest.
-        $RunLog = Join-Path $LogDir ("scannercfg_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+    if ($ScannerConfigOnly -or $PrinterConfigOnly) {
+        # Single-step mode: run ONLY the final USB-OPOS scanner switch (-ScannerConfigOnly)
+        # or ONLY the OPOS printer registration (-PrinterConfigOnly) - no downloads, no
+        # installs, no finishing. For iterating the switch on the rig, (re)configuring a
+        # scanner that was unplugged during the main install, or re-applying the printer
+        # entries / fixing them after a rename (the vendor driver must already be
+        # installed - this step only writes registry entries pointing at its service
+        # objects). Still admin (COM + permanent switch / HKLM); -DryRun works
+        # non-elevated. Save-Manifest MERGES onto any prior install_manifest.json, so only
+        # the one step's rows are updated and the rest of the install is preserved.
+        # No Invoke-ComputerRename here, so computerRenamed is empty and Get-PosNamePrefix
+        # falls back to the CURRENT name - the right answer for a standalone run: by now
+        # the rename reboot has already happened. Entries left under a PREVIOUS name are
+        # removed by Remove-StalePrinterOpos inside.
+        $scan   = [bool]$ScannerConfigOnly
+        $RunLog = Join-Path $LogDir ("{0}_{1:yyyyMMdd_HHmmss}.log" -f $(if ($scan) { 'scannercfg' } else { 'printercfg' }), (Get-Date))
         Start-Transcript -Path $RunLog -Append | Out-Null
-        Write-Host "Alleaves SCANNER-CONFIG ONLY (USB-OPOS)" -ForegroundColor Cyan
+        Write-Host $(if ($scan) { 'Alleaves SCANNER-CONFIG ONLY (USB-OPOS)' } else { 'Alleaves PRINTER-CONFIG ONLY (OPOS)' }) -ForegroundColor Cyan
         Write-Host "WorkDir:  $WorkDir"
         Write-Host "Manifest: $ManifestPath"
         if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
 
         $Manifest = New-InstallManifest
-        Set-ScannerOpos
+        if ($scan) { Set-ScannerOpos } else { Set-PrinterOpos }
+
+        # A single-step run that changed NOTHING is not a success, even though every skip
+        # inside these two steps is benign in a full install (no scanner attached during
+        # the bench build is normal; a driver that failed to install already trips exit 1
+        # there). Here the one requested step didn't happen - and these modes exist
+        # precisely because the scanner IS attached / the driver IS installed now - so
+        # exit 0 would tell RMM the remediation worked. Covers the scanner's 'no-scanner'
+        # and missing-Interop/Open() bails and the printer's 'no-driver', none of which
+        # set their *ConfigFailed flag; it is also the reason the guards near the top
+        # reject -SkipScannerConfig / -SkipPrinterConfig here. Evaluated BEFORE
+        # Save-Manifest so a prior run's merged-in 'ok' row cannot mask it.
+        # Scanner counts 'already-opos' too: the scanner is in the requested state, which
+        # is the point of the run - re-running to confirm must not report failure.
+        if (-not $DryRun) {
+            $changed = if ($scan) { @($Manifest.scannerConfigured | Where-Object { $_.result -in @('ok','already-opos') }) }
+                       else       { @($Manifest.printerConfigured | Where-Object { $_.result -eq 'ok' }) }
+            if (-not $changed) {
+                if ($scan) { $script:ScannerConfigFailed = $true } else { $script:PrinterConfigFailed = $true }
+            }
+        }
         Save-Manifest
 
-        # Same non-fatal "re-run with the scanner attached" code as the full install.
-        if ($script:ScannerConfigFailed -and $exitCode -eq 0) {
+        # Own copy of the non-fatal exit-code block (6 / 7) - without it this branch
+        # always exits 0, whatever the step reported.
+        if ($scan -and $script:ScannerConfigFailed -and $exitCode -eq 0) {
             $exitCode = 6
             Warn 'Scanner present but USB-OPOS switch failed - re-run (scanner attached).'
             Show-ScannerBarcodeFallback
         }
-        Step 'Done'
-        Write-Host "Manifest: $ManifestPath"
-        Write-Host "Log:      $RunLog"
-    } elseif ($PrinterConfigOnly) {
-        # Printer-config-only: run ONLY the OPOS device registration - no downloads, no
-        # installs, no finishing. For re-applying the entries, or fixing them after the
-        # terminal was renamed. The vendor driver must already be installed (this step
-        # only writes registry entries that point at its service objects).
-        # Save-Manifest MERGES onto any prior install_manifest.json, so this updates
-        # printerConfigured / regValuesSet / regKeysCreated and preserves the rest.
-        $RunLog = Join-Path $LogDir ("printercfg_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
-        Start-Transcript -Path $RunLog -Append | Out-Null
-        Write-Host "Alleaves PRINTER-CONFIG ONLY (OPOS)" -ForegroundColor Cyan
-        Write-Host "WorkDir:  $WorkDir"
-        Write-Host "Manifest: $ManifestPath"
-        if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
-
-        $Manifest = New-InstallManifest
-        # No Invoke-ComputerRename here, so computerRenamed is empty and
-        # Get-PosNamePrefix falls back to the CURRENT name - which is the right answer
-        # for a standalone run: by now the rename reboot has already happened. Entries
-        # left under a PREVIOUS name are removed by Remove-StalePrinterOpos inside.
-        Set-PrinterOpos
-        # A printer-only run that registered NOTHING is not a success, even though every
-        # skip inside Set-PrinterOpos is benign in a full install (a driver that failed to
-        # install already trips exit 1 there). Here the one requested step didn't happen,
-        # so exit 0 would report success to RMM - the same reason line ~164 rejects
-        # -PrinterConfigOnly -SkipPrinterConfig. Covers 'no-driver' and 'not-implemented'.
-        if (-not $DryRun -and -not @($Manifest.printerConfigured | Where-Object { $_.result -eq 'ok' })) {
-            $script:PrinterConfigFailed = $true
-        }
-        Save-Manifest
-
-        # Own copy of the non-fatal exit-code block: without it this branch always exits 0.
-        if ($script:PrinterConfigFailed -and $exitCode -eq 0) {
+        if (-not $scan -and $script:PrinterConfigFailed -and $exitCode -eq 0) {
             $exitCode = 7
             Warn 'OPOS device registration did not complete (no device registered) - see the log above.'
         }
@@ -3408,7 +3531,15 @@ try {
         # before it: no printer means the vendor driver isn't wanted either, and feeding
         # $SkipPrograms reuses Test-SkipMatch for both the download and the install row
         # instead of adding a second skip mechanism.
-        if (-not $SkipPrinterConfig -and (Resolve-PrinterBrand) -eq 'None') {
+        # The brand answer is about the HARDWARE, so it is tested independently of
+        # -SkipPrinterConfig (which only says "don't write the OPOS entry"). Gating the
+        # two together meant "-PrinterBrand None -SkipPrinterConfig" - this terminal has
+        # no receipt printer AND don't register one - still downloaded and installed the
+        # vendor driver. -PrinterBrand is read directly rather than via
+        # Resolve-PrinterBrand when the registration is skipped, so -SkipPrinterConfig
+        # still suppresses the interactive prompt exactly as before.
+        $brand0 = if ($SkipPrinterConfig) { $PrinterBrand } else { Resolve-PrinterBrand }
+        if ($brand0 -eq 'None') {
             $SkipPrograms += 'OLE POS Setup'
             Ok 'no receipt printer - OLE POS Setup will not be downloaded or installed'
         }
@@ -3467,6 +3598,15 @@ try {
         # not care whether anything is plugged in.
         Set-PrinterOpos
 
+        # Snapshot THIS run's results BEFORE Save-Manifest: the merge carries prior-run
+        # rows forward into $Manifest for every product this run didn't touch (skipped
+        # via -SkipPrograms, or dropped by -PrinterBrand None). Tallying after the merge
+        # counts an OLD failure as a new one, so a run that fixed nothing but broke
+        # nothing exits 1 forever - and that phantom 1 also suppresses the non-fatal
+        # 4/6/7 re-run signals below, which are all gated on $exitCode -eq 0.
+        $failed    = @($Manifest.installed    | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
+        $depFailed = @($Manifest.dependencies | Where-Object { $_.result -and ($_.result -notin @('ok','already-present','dryrun')) })
+
         # 6. Persist manifest (merged)
         Save-Manifest
 
@@ -3479,8 +3619,7 @@ try {
         # F19: a failed VC++ x64 redist (the exact fresh-box gap this bootstrap
         # closes; CoreScanner hard-depends on it) lands in $Manifest.dependencies,
         # which the old scan ignored - so a broken dependency exited 0. Count it too.
-        $failed    = @($Manifest.installed    | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
-        $depFailed = @($Manifest.dependencies | Where-Object { $_.result -and ($_.result -notin @('ok','already-present','dryrun')) })
+        # ($failed / $depFailed are snapshotted above, before the manifest merge.)
         if ($failed.Count -gt 0 -or $depFailed.Count -gt 0 -or $script:DownloadFailed) {
             $exitCode = 1
             Fail "$($failed.Count) install / $($depFailed.Count) dependency failure(s); download failure=$($script:DownloadFailed)"
