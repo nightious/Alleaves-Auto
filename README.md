@@ -7,7 +7,13 @@ everything downloads and installs from one `.bat`.
 ## Prerequisites
 
 - **Stock Windows 10 or 11** — no prior preparation needed.
-- **Local administrator rights** — the `.bat` self-elevates once via UAC on double-click.
+- **A signed-in local administrator account** — *not* a Microsoft account, and not a domain /
+  Entra ID account. The installer checks this before it downloads anything and refuses to run
+  otherwise (exit `8`), printing the steps to create one. Elevating the run with a *different*
+  admin's credentials at the UAC prompt does not satisfy it: the account the terminal is signed
+  into is the one that has to be a local administrator, because that's the profile that will run
+  the POS. There is no override switch. The `.bat` self-elevates via UAC on double-click, so on a
+  standard-user terminal the UAC prompt still appears first and this message second.
 - **An active internet connection** reaching Google Drive and the vendor CDNs — every product is
   downloaded at runtime, so there is no offline/bundled installer.
 
@@ -129,7 +135,11 @@ run — prompts for the computer name before proceeding; otherwise it runs unatt
 `6` the USB-OPOS switch failed (re-run with the scanner attached) — during a full install this
 means a scanner was connected and could not be switched; under `-ScannerConfigOnly` it also covers
 a run that switched nothing at all ·
-`7` OPOS receipt-printer registration failed (re-run, or use `-PrinterConfigOnly`).
+`7` OPOS receipt-printer registration failed (re-run, or use `-PrinterConfigOnly`) ·
+`8` account precheck failed — the terminal is not signed into a local administrator account
+(Microsoft account, domain/Entra account, standard user, or no interactive user). Nothing is
+downloaded or written; the console output names the fix. Skipped for `-Uninstall`; `-DryRun`
+reports the verdict and continues.
 Codes `4`, `6` and `7` are non-fatal "re-run" signals and never mask a hard failure (`1`).
 
 ### Receipt printer (OPOS)

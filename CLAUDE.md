@@ -69,13 +69,28 @@ Major function groups in `alleaves_setup.ps1`:
 - **Exit codes** are an RMM contract set in the `$exitCode` dispatch tail (verify there): `0` ok ·
   `1` install/uninstall/download fail · `2` mode ambiguity · `3` not elevated · `4` scanner
   degraded (CoreScanner missing) · `5` working-dir failed · `6` scanner present but switch failed ·
-  `7` OPOS receipt-printer registration failed.
-  `4`/`6`/`7` are non-fatal "re-run" codes that only set when nothing else failed — never masking `1`.
+  `7` OPOS receipt-printer registration failed · `8` account precheck failed (not signed into a
+  local admin account). `4`/`6`/`7` are non-fatal "re-run" codes that only set when nothing else
+  failed — never masking `1`. `2`/`3`/`5`/`8` are pre-dispatch `exit`s, before the try/`$exitCode`
+  machinery and before `Start-Transcript` — console-only, nothing logged to file.
 
 ## Gotchas / project rules
 
 - **Production bar for every install step: bootstrap + track (manifest) + reverse (uninstall).**
   Don't add a step that can't be cleanly uninstalled.
+- **Account precheck (`Test-InstallAccount`, exit 8)** — sits right after the elevation abort and
+  *before* `$WorkDir` is created, so a rejected box gets nothing written. It reads the **signed-in**
+  user (`Win32_ComputerSystem.UserName`), never the process token: a standard user can launch the
+  `.bat` and type someone else's admin credentials at UAC, which makes `Test-IsAdmin` pass while
+  the profile that will actually run the POS is not an admin — the token is the wrong answer for
+  exactly the case being tested. Order matters: **domain/Entra before the SID-shape test** (an
+  Entra SID is `S-1-12-1-*` and would otherwise report as "no interactive user"), and the MSA test
+  is `PrincipalSource`/IdentityStore, **not** the domain test — an MSA profile still presents as
+  `COMPUTERNAME\shortname`. No bypass switch, so an undetermined verdict must **block**: failing
+  open would be the bypass. `-Uninstall` skips the check (a blocker there would strand a terminal
+  that later acquired an MSA with no way to reverse the install); `-DryRun` reports and continues
+  (it writes nothing, and it's how the tech gets the verdict before touching the terminal) — and
+  that `-DryRun` print is the only runnable check on the classification logic.
 - The master list is a `.nlbl` — copy **as-is, never unzip** (the "encryption" is NiceLabel's
   internal format); copied into every real user profile's Documents (`Get-TargetUserProfiles`).
 - NiceLabel gets an explicit service / registry / ProgramData sweep on uninstall, and must **never

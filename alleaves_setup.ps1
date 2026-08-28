@@ -19,6 +19,12 @@
     SINGLE ELEVATION OWNER = Install-Alleaves.bat. This script NEVER relaunches
     itself; it aborts if not admin (except -DryRun, which falls back to %TEMP%).
 
+    ACCOUNT PRECHECK (exit 8, no bypass): the terminal must be signed into a
+    plain LOCAL account that is a local administrator. A Microsoft account, a
+    domain / Entra ID account, or a standard user who elevated this run with
+    someone else's credentials is refused before anything is downloaded.
+    -Uninstall skips the check; -DryRun reports the verdict and continues.
+
 .PARAMETER Uninstall
     Reverse a prior install using the persisted manifest.
 
@@ -121,6 +127,104 @@ function Test-IsAdmin {
 $IsAdmin = Test-IsAdmin
 
 # ---------------------------------------------------------------------------
+# Account precheck helpers (the blocker itself is below the elevation abort).
+#
+# "Is this process elevated?" is NOT the same question as "is this terminal
+# signed into a local admin account", and two real failures live in the gap:
+#   - a MICROSOFT ACCOUNT profile ties the cashier terminal to someone's
+#     personal MSA (Store/sync, and OneDrive can redirect Documents - which is
+#     exactly where the .nlbl master list is copied); it can't be handed over.
+#   - a STANDARD USER can launch the .bat and type someone else's admin
+#     credentials at UAC: the process is elevated, Test-IsAdmin passes, exit 3
+#     never fires - but the profile that will actually run the POS is not an
+#     administrator.
+# So read the SIGNED-IN user, never the process token: on that second case the
+# token is the wrong answer for exactly the thing being tested.
+# ---------------------------------------------------------------------------
+function Get-SignedInAccount {
+    $name = $null
+    try { $name = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+    # Empty = no console session (RDP-only, service/RMM context): fall back to
+    # the process token, which is at least a real account.
+    if (-not $name) { try { $name = [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch {} }
+    if (-not $name) { return $null }
+    $sid = $null
+    try { $sid = ([Security.Principal.NTAccount]$name).Translate([Security.Principal.SecurityIdentifier]).Value } catch {}
+    [pscustomobject]@{
+        Name   = $name
+        Sid    = $sid
+        Domain = $(if ($name -like '*\*') { $name.Split('\')[0] } else { '' })
+    }
+}
+
+# MSA-linked accounts still present as COMPUTERNAME\shortname, so the "is it
+# local?" test does NOT catch them - only this does. Returns the linked email
+# (or a placeholder) when the account is MSA-backed, $null when it is not.
+# TODO[rig]: confirm on a real MSA terminal which of the two probes answers.
+function Get-MicrosoftAccountId($sid) {
+    if (-not $sid) { return $null }
+    # IdentityStore cache: UserName under the account's own SID is the email.
+    try {
+        $ic = "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$sid\IdentityCache\$sid"
+        $email = (Get-ItemProperty -Path $ic -Name UserName -ErrorAction Stop).UserName
+        if ($email) { return $email }
+    } catch {}
+    # PrincipalSource is the documented answer but comes back $null on some builds.
+    try {
+        if ((Get-LocalUser -SID $sid -ErrorAction Stop).PrincipalSource -eq 'MicrosoftAccount') {
+            return '(linked email unknown)'
+        }
+    } catch {}
+    return $null
+}
+
+# ponytail: direct members of BUILTIN\Administrators only - no nested-group
+# expansion. An admin-via-nested-group therefore reads as not-admin, which is
+# the safe direction on a POS terminal (block, don't wave through).
+function Test-LocalAdminSid($sid, $name) {
+    try {
+        foreach ($m in (Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)) {
+            if ($m.SID.Value -eq $sid) { return $true }
+        }
+        return $false
+    } catch {
+        # Get-LocalGroupMember throws on builds where the group holds an
+        # orphaned SID; fall back to matching the name in the net output.
+        $short = $name.Split('\')[-1]
+        foreach ($line in (& net localgroup Administrators 2>$null)) {
+            $t = "$line".Trim()
+            if ($t -eq $short -or $t -eq $name) { return $true }
+        }
+        return $false
+    }
+}
+
+# Verdict: @{ Ok; Reason; Detail }. Every probe is guarded, and an UNDETERMINED
+# result blocks - there is no bypass switch, so failing open would be the bypass.
+function Test-InstallAccount {
+    $a = Get-SignedInAccount
+    if (-not $a) {
+        return [pscustomobject]@{ Ok=$false; Reason='no-interactive-user'; Detail='no account resolved' }
+    }
+    # Checked before the SID shape: an Entra sign-in has an S-1-12-1-* SID and
+    # would otherwise fall out as "no interactive user", which misleads the tech.
+    if ($a.Domain -and $a.Domain -ne $env:COMPUTERNAME) {
+        return [pscustomobject]@{ Ok=$false; Reason='not-local'; Detail=$a.Name }
+    }
+    if (-not $a.Sid -or $a.Sid -notmatch '^S-1-5-21-') {
+        return [pscustomobject]@{ Ok=$false; Reason='no-interactive-user'; Detail="$($a.Name) [$($a.Sid)]" }
+    }
+    $msa = Get-MicrosoftAccountId $a.Sid
+    if ($msa) {
+        return [pscustomobject]@{ Ok=$false; Reason='microsoft-account'; Detail="$($a.Name) -> $msa" }
+    }
+    if (-not (Test-LocalAdminSid $a.Sid $a.Name)) {
+        return [pscustomobject]@{ Ok=$false; Reason='not-admin'; Detail=$a.Name }
+    }
+    return [pscustomobject]@{ Ok=$true; Reason='ok'; Detail=$a.Name }
+}
+
+# ---------------------------------------------------------------------------
 # Mode echo + ambiguity guard (Advisor #1B/#3 - destructive if wrong)
 # Make the parsed mode unambiguous BEFORE any dispatch, and refuse to run an
 # INSTALL when the launcher actually asked for an UNINSTALL (dropped switch).
@@ -191,6 +295,67 @@ if (-not $IsAdmin -and -not $DryRun) {
     Fail "Not elevated. This script must be launched by Install-Alleaves.bat (single elevation owner)."
     Fail "Run the .bat (one UAC prompt), or pass -DryRun for a non-elevated plumbing test."
     exit 3
+}
+
+# ---------------------------------------------------------------------------
+# Account precheck (blocker) - see Test-InstallAccount for WHY elevation alone
+# is not enough. The terminal must be signed into a plain LOCAL account that is
+# a local administrator. Runs before the working dir is created: nothing gets
+# written on a box that is about to be turned away.
+#   -Uninstall skips it. A blocker there would strand a terminal that later
+#     acquired an MSA with no way to run the manifest-driven removal.
+#   -DryRun reports and continues. It writes nothing, so it is the diagnostic
+#     that gives the tech the verdict BEFORE touching the terminal - not a
+#     bypass. The config-only sub-modes DO get the check; they mutate state.
+# Console-only (Start-Transcript lives inside the dispatch branches), same as
+# the exit 2 / 3 / 5 aborts above.
+# ---------------------------------------------------------------------------
+if (-not $Uninstall) {
+    $acct = Test-InstallAccount
+    if ($acct.Ok) {
+        Ok "signed-in account '$($acct.Detail)' is a local administrator"
+    } else {
+        Fail "Account precheck FAILED - this terminal is not ready for the Alleaves install."
+        switch ($acct.Reason) {
+            'microsoft-account' {
+                Fail "Signed in with a MICROSOFT ACCOUNT: $($acct.Detail)"
+                Fail "Alleaves must be installed from a plain LOCAL administrator account."
+            }
+            'not-local' {
+                Fail "Signed in with a DOMAIN / ENTRA ID account: $($acct.Detail)"
+                Fail "Alleaves must be installed from a plain LOCAL administrator account."
+            }
+            'not-admin' {
+                Fail "Signed-in account '$($acct.Detail)' is NOT a local administrator."
+                Fail "Elevating this run with someone else's credentials is not enough - the"
+                Fail "account the terminal is signed into is the one that has to be an admin."
+            }
+            default {
+                Fail "Could not identify an interactive signed-in user ($($acct.Detail))."
+                Fail "Run this from the terminal's own signed-in local administrator session."
+            }
+        }
+        Write-Host ''
+        if ($acct.Reason -eq 'not-admin') {
+            Write-Host '  Fix it - promote the signed-in account:' -ForegroundColor Yellow
+            Write-Host '    1. Settings > Accounts > Other users > (the account) > Change account type'
+            Write-Host '    2. Account type = Administrator'
+            Write-Host '    3. Sign out and back in, then re-run Install-Alleaves.bat'
+            Write-Host "    CLI:  net localgroup Administrators `"$($acct.Detail.Split('\')[-1])`" /add"
+        } else {
+            Write-Host '  Fix it - create a local administrator account and sign into it:' -ForegroundColor Yellow
+            Write-Host '    1. Settings > Accounts > Other users > Add account'
+            Write-Host "    2. Choose 'I don't have this person's sign-in information'"
+            Write-Host "    3. Choose 'Add a user without a Microsoft account', set a name + password"
+            Write-Host '    4. Change account type > Administrator'
+            Write-Host '    5. Sign into that account, then re-run Install-Alleaves.bat'
+            Write-Host '    CLI:  net user <name> <password> /add'
+            Write-Host '          net localgroup Administrators <name> /add'
+        }
+        Write-Host ''
+        if (-not $DryRun) { exit 8 }
+        Dry 'account precheck would block a real run (exit 8) - continuing, -DryRun changes nothing'
+    }
 }
 
 # ---------------------------------------------------------------------------
