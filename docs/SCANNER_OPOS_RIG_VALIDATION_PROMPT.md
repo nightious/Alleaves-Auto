@@ -162,6 +162,25 @@ no hop status, no reconnect timing. The `RIG-DEPENDENT` / `TODO[rig]` constants
 `$ScannerRetryWaitSec`) and the in-session status-112 recovery remain **unvalidated**. Capturing
 them needs a scanner deliberately reset to HID-KB (step 4 above).
 
+**Changed 2026-09-09 (audit), still needs a HID-KB run to confirm on hardware:**
+
+- The terminal **status-112 verdict on hop 1 is now tested BEFORE `Wait-ScannerReenum`**, not
+  after. A 112 that never cleared means the RSM channel was unavailable, the command never
+  reached the scanner, and it therefore cannot have re-enumerated — so the old order spent the
+  full `$ScannerReenumMaxWaitSec` (40 s) polling for a device sitting untouched in HID-KB, to
+  reach a verdict that was already known. **What to capture:** on a real in-session 112 run,
+  confirm the step now fails within the retry budget alone (roughly
+  `$ScannerSwitchMaxRetries × ($ScannerServiceSettleSec + $ScannerRetryWaitSec)`) with no 40 s
+  tail, and that the hop log still carries an `after hop1 (IBM)` entry (it is now synthesised
+  with `s=$null; seconds=0` on that path).
+- `Set-OneScannerToOpos` **no longer returns `ok` for a post-switch mode of `unknown`** even
+  with a clean status. `USBOPOS` is per-*mode*, not per-model, so `unknown` means the unit came
+  back in some other mode. **What to capture:** the post-hop2 `type` string for any model that
+  is not a DS2208 — if a real OPOS unit ever reports something other than `USBOPOS`,
+  `$ScannerTypeOpos` needs widening rather than this arm coming back.
+- Each scanner in the loop now has its **own** try/catch, so one unit throwing no longer skips
+  the rest or loses its manifest row. Only observable with two scanners attached.
+
 ## Conventions + guardrails
 
 - Match existing style: `Step`/`Ok`/`Warn`/`Fail`/`Dry` helpers, `$DryRun` guard, per-function
