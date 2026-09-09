@@ -1102,7 +1102,13 @@ function Invoke-SilentUninstall {
         return $true
     }
     if (-not $cmd) { Warn "no uninstall command for $DisplayName"; return $false }
-    $okCodes = @(0, 3010, 1641)   # success exit codes; widened per-installer below
+    # 1605 = "this action is only valid for products that are currently installed" = fine,
+    # same reason the NiceLabel branch above accepts it: a sibling ARP entry already removed
+    # the product. Find-InstalledProducts snapshots BOTH entries of a broad displayNameMatch
+    # ('Zebra Scanner SDK|Zebra CoreScanner'), and removing the SDK chain also removes
+    # CoreScanner - so the second pass ran a stale UninstallString, returned $false, and made
+    # -Uninstall exit 1 on a terminal that was actually clean. Every time.
+    $okCodes = @(0, 3010, 1641, 1605)   # success exit codes; widened per-installer below
     if ($DryRun) { Dry "would uninstall: $cmd"; return $true }
     Write-Host "  $DisplayName"
     Write-Host "    cmd: $cmd"
@@ -1119,7 +1125,14 @@ function Invoke-SilentUninstall {
             if ($argstr -notmatch '/qn|/quiet') { $argstr += ' /qn /norestart' }
             $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $argstr -Wait -PassThru -WindowStyle Hidden
         } else {
-            if ($cmd -match '^"([^"]+)"\s*(.*)$') { $exe=$Matches[1]; $rest=$Matches[2] }
+            # Split on the .exe boundary, not on the first space: an UNQUOTED ARP string
+            # ("C:\Program Files\Vendor\uninst.exe /S" - common on older InstallScript/NSIS
+            # products) used to yield $exe='C:\Program', which Start-Process -Stop threw on,
+            # and the catch reported a bare "uninstall failed" with no hint the path was
+            # mangled -> $uninstallFailures++ -> exit 1. The optional quotes cover the quoted
+            # shape too; the first-space split stays as the fallback for a non-.exe command.
+            if ($cmd -match '(?i)^\s*"?(.*?\.exe)"?\s*(.*)$') { $exe=$Matches[1]; $rest=$Matches[2] }
+            elseif ($cmd -match '^"([^"]+)"\s*(.*)$') { $exe=$Matches[1]; $rest=$Matches[2] }
             else { $parts = $cmd -split ' ',2; $exe=$parts[0]; $rest = if($parts.Length -gt 1){$parts[1]}else{''} }
             # A blanket "/S" is WRONG (and hangs the unattended uninstall) for two
             # products we actually ship. Pick the silent flag per installer family:
@@ -1422,7 +1435,17 @@ function Get-FileWithRetry {
         }
     }
     Fail "could not download $Label after $MaxRetries attempts"
-    Remove-Item $TargetPath -Force -ErrorAction SilentlyContinue
+    # Delete ONLY a file this call actually broke. The old unconditional delete destroyed a
+    # previously VALID cached download: -ForceReinstall bypasses the cache guard at the top,
+    # so a tech re-running on a flaky link lost a good 471 MB Star zip (and orphaned its .len
+    # sidecar) that was byte-correct a minute earlier. Test-CachedFileValid is the same
+    # sniff+sidecar test the cache guard uses - if it still passes, nothing here wrote over it.
+    if (Test-CachedFileValid $TargetPath) {
+        Warn "keeping the existing valid cached copy of $Label"
+    } else {
+        Remove-Item $TargetPath -Force -ErrorAction SilentlyContinue
+        Remove-Item "$TargetPath.len" -Force -ErrorAction SilentlyContinue   # never leave the sidecar orphaned
+    }
     return $false
 }
 
@@ -1782,6 +1805,7 @@ function Invoke-WrappedMsi {
     Write-Host "  wrapper PID: $($proc.Id)"
 
     $extractedMsi = $null
+    $acceptedSize = 0      # the stabilized size we accepted (re-checked before caching)
     $lastSize     = @{}    # MSI path -> size at previous poll (stabilization)
     $stableCount  = @{}    # F9: MSI path -> consecutive polls the size held steady
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -1799,21 +1823,29 @@ function Invoke-WrappedMsi {
             # 3 s polls happened to read the same partial size (Defender pause / slow
             # fresh-box disk on the 446 MB MSI) -> truncated stage -> msiexec 1603.
             # Require a longer steady dwell (5 consecutive equal polls ~= 15 s of no
-            # growth) while the writer is ALIVE; accept instantly only once the
-            # wrapper has actually exited.
+            # growth), whether or not the writer is still alive.
             $prev = $lastSize[$msi.FullName]
             if ($null -ne $prev -and $prev -eq $msi.Length) { $stableCount[$msi.FullName]++ }
             else { $stableCount[$msi.FullName] = 0 }
             $lastSize[$msi.FullName] = $msi.Length
-            if ($proc.HasExited -or $stableCount[$msi.FullName] -ge 5) {
-                $extractedMsi = $msi.FullName; break
+            # HasExited is NOT a substitute for stabilization: an InstallShield Setup
+            # Launcher is exactly "a wrapper that exits fast but leaves a writer behind"
+            # (see the early-out below), so accepting the instant the launcher vanished
+            # staged a 40 MB fragment of the 446 MB MSI - msiexec 1603, and the same
+            # fragment cached into downloads/ forever. The dwell is now mandatory.
+            if ($stableCount[$msi.FullName] -ge 5) {
+                $extractedMsi = $msi.FullName; $acceptedSize = $msi.Length; break
             }
         }
         # A wrapper that died at t=3 s (bad payload, AV kill, wrong bitness) extracts
         # nothing and nothing will ever appear, yet the loop used to sleep out the full
         # 600 s before saying so. Invoke-IssSilent has this early-out; its sibling didn't.
         # The 30 s floor lets a wrapper that exits fast but leaves a writer behind finish.
-        if ($proc.HasExited -and -not $extractedMsi -and (Get-Date) -gt $launchTime.AddSeconds(30)) {
+        # $lastSize.Count -eq 0 = no candidate MSI has EVER been seen: now that acceptance
+        # always waits out the 5-poll dwell (~15 s), a fast-exiting wrapper whose MSI is
+        # still stabilizing at t=30 s would otherwise trip this early-out and be reported
+        # as "extracted nothing".
+        if ($proc.HasExited -and -not $extractedMsi -and $lastSize.Count -eq 0 -and (Get-Date) -gt $launchTime.AddSeconds(30)) {
             Warn 'wrapper exited without extracting an MSI - not waiting out the timeout'
             break
         }
@@ -1844,12 +1876,20 @@ function Invoke-WrappedMsi {
     }
 
     # Cache into downloads/ under the MSI's real filename so future runs skip
-    # the wrapper entirely and stay fully silent.
+    # the wrapper entirely and stay fully silent. Re-validate FIRST: this copy is
+    # PERMANENT (the .iss fallback consults it on Test-Path alone), so a fragment that
+    # got here would be installed by every future run, -ForceReinstall included, until
+    # someone deleted it by hand.
     try {
-        $cacheTarget = Join-Path $DownloadDir (Split-Path $extractedMsi -Leaf)
-        if (-not (Test-Path $cacheTarget)) {
-            Copy-Item $extractedMsi $cacheTarget -Force -ErrorAction Stop
-            Write-Host "  cached MSI to $cacheTarget for future silent runs"
+        $srcNow = (Get-Item $extractedMsi -ErrorAction Stop).Length
+        if ($srcNow -ne $acceptedSize -or -not (Test-RealBinary $extractedMsi)) {
+            Warn "extracted MSI is not stable/valid ($srcNow bytes vs $acceptedSize accepted) - NOT caching it"
+        } else {
+            $cacheTarget = Join-Path $DownloadDir (Split-Path $extractedMsi -Leaf)
+            if (-not (Test-Path $cacheTarget)) {
+                Copy-Item $extractedMsi $cacheTarget -Force -ErrorAction Stop
+                Write-Host "  cached MSI to $cacheTarget for future silent runs"
+            }
         }
     } catch {
         Warn "could not cache MSI to downloads/: $($_.Exception.Message)"
@@ -1868,6 +1908,10 @@ function Invoke-WrappedMsi {
     if ($p.ExitCode -in 0,3010,1641) {
         Ok "$Name installed (exit $($p.ExitCode))"
         $entry.result = 'ok'
+        # Third writer of the flag (Invoke-Installer and Install-VcRedist are the others,
+        # and this one was missed): a 3010 here left the summary printing the soft
+        # "recommended: reboot" line, so a tech walked away from pending file-rename ops.
+        if ($p.ExitCode -in 3010,1641) { $script:RebootPending = $true; Warn "$Name requests a reboot ($($p.ExitCode)) - deferred to end of run" }
     } else {
         Fail "$Name msiexec exited $($p.ExitCode) - see $msiLog"
         $entry.result = 'fail'
@@ -1982,7 +2026,14 @@ function Invoke-IssSilent {
     # finish ON ITS OWN. CRITICAL (advisor C4): never force-kill msiexec -
     # killing it mid-install bricks the product. Only reap orphaned
     # setup/ISBEW64/ISSetupPrerequisites helpers (mirrors Invoke-WrappedMsi).
-    try { $proc.WaitForExit() } catch {}
+    # CAPPED wait. An uncapped WaitForExit() made $TimeoutSeconds no backstop at all: for a
+    # family whose launcher IS the whole install (OLE POS Setup - PFTW/IS5, $ReapNames empty),
+    # a stub blocked on an unexpected dialog on its hidden window hung the ENTIRE unattended
+    # run forever, with nothing left to click it. Never KILL it though - for exactly those
+    # families the launcher is the install engine (advisor C4).
+    $launcherExited = $false
+    try { $launcherExited = $proc.WaitForExit($TimeoutSeconds * 1000) } catch { $launcherExited = $true }
+    if (-not $launcherExited) { Warn "$Name launcher still running after $TimeoutSeconds s - continuing without killing it (it may BE the install engine)" }
     Start-Sleep -Seconds 5    # let the spawned worker appear before we poll
 
     # F8: poll only OUR workers - msiexec that appeared after launch (new PID) plus
@@ -1992,17 +2043,29 @@ function Invoke-IssSilent {
     # finish immediately; if it never appears after a generous grace, fall through so
     # the caller's fallback runs - instead of looping the full timeout on an
     # unrelated/absent msiexec. Registry presence short-circuits as committed.
-    $deadline  = $launchTime.AddSeconds($TimeoutSeconds)
+    # The deadline is anchored HERE, after the launcher returned - not at $launchTime. A
+    # launcher that ran 16 minutes left zero worker budget, the loop never executed once,
+    # and the verdict was taken while msiexec was still copying 446 MB. (Same shape as
+    # Invoke-WrappedMsi / Invoke-SilentUninstall: budget starts when the wait starts.)
+    $deadline  = (Get-Date).AddSeconds($TimeoutSeconds)
     $sawWorker = $false
     $idlePolls = 0
     while ((Get-Date) -lt $deadline) {
-        if ($RegistryShortCircuit -and (Find-InstalledProducts -Pattern $DisplayNameMatch)) { Start-Sleep -Seconds 2; break }
         $busy = @(@(Get-Process -Name 'msiexec' -ErrorAction SilentlyContinue |
                     Where-Object { $_.Id -notin $msiexecBefore }) +
                   @(Get-Process -Name $WaitNames -ErrorAction SilentlyContinue |
                     Where-Object { try { $_.StartTime -gt $launchTime.AddMinutes(-1) } catch { $false } }))
         if ($busy.Count -gt 0) { $sawWorker = $true; $idlePolls = 0 }
         else {
+            # ARP presence is only trustworthy once OUR workers are idle, so this test lives
+            # in the no-workers branch. As the FIRST statement of the loop it fired on the
+            # very first poll of a REPAIR run - a prior run that failed AFTER InstallShield
+            # wrote the ARP entry, which is precisely when Test-PriorInstallFailed declines
+            # the ARP skip and re-runs the installer - and the break fell straight into the
+            # $ReapNames sweep, force-killing the setup.exe driving the live multi-MSI chain
+            # and then recording result='ok'. The one path meant to repair a broken Zebra
+            # install was the one guaranteed to break it, silently, exit 0.
+            if ($RegistryShortCircuit -and (Find-InstalledProducts -Pattern $DisplayNameMatch)) { Start-Sleep -Seconds 2; break }
             $idlePolls++
             if ($sawWorker -or $idlePolls -ge 10) { break }   # worker done, or never showed (~30 s grace)
         }
@@ -2365,9 +2428,30 @@ function Invoke-InstallLoop {
             # $full is rewritten either way so the -DryRun preview shows the command line
             # the real run would use; only the extraction itself is guarded (the zip is
             # not on disk during a dry run, and bsdtar would print a raw error).
-            if ($DryRun) { Dry "would extract $($i.ZipMember) from $($i.File)" }
-            elseif ($skipInstalled) { Write-Host "  $($i.Name) already installed - not re-extracting $($i.ZipMember)" }
-            else { & "$env:SystemRoot\System32\tar.exe" -xf $full -C $DownloadDir $i.ZipMember }
+            # $skipInstalled is tested BEFORE $DryRun: it is computed from live ARP even
+            # under -DryRun, so the old order made a terminal that already has futurePRNT
+            # preview a 471 MB extraction ("would extract ...") and then immediately print
+            # "already installed; skipping" - a preview of a run that would never happen.
+            if ($skipInstalled) { Write-Host "  $($i.Name) already installed - not re-extracting $($i.ZipMember)" }
+            elseif ($DryRun) { Dry "would extract $($i.ZipMember) from $($i.File)" }
+            else {
+                & "$env:SystemRoot\System32\tar.exe" -xf $full -C $DownloadDir $i.ZipMember
+                # tar's exit code is the only truncation signal there is. A disk that fills
+                # mid-extraction of the 111 MB setup_x64.exe (the 471 MB zip sits in the same
+                # directory) leaves a PARTIAL exe that Invoke-Installer's existence check
+                # passes happily - it catches absence, not truncation - so a truncated binary
+                # would be launched, and once ARP/SkipIfInstalled is satisfied it is never
+                # re-extracted. Skip the install instead.
+                if ($LASTEXITCODE -ne 0) {
+                    Step $i.Name
+                    Fail "could not extract $($i.ZipMember) from $($i.File) (tar exit $LASTEXITCODE) - not installing a possibly partial binary"
+                    $Manifest.installed += @{
+                        name=$i.Name; source=$full; method='exe'
+                        displayNameMatch=$i.Match; result='fail-extract'
+                    }
+                    continue
+                }
+            }
             $full = Join-Path $DownloadDir ($i.ZipMember -replace '/','\')
         }
         if ($i.Msi) {
@@ -2644,7 +2728,11 @@ function Set-TrackedRegValue {
             if ($parent -eq $walk) { break }
             $walk = $parent
         }
-        New-Item -Path $Path -Force | Out-Null
+        # -Stop for the same reason as the New-ItemProperty below: under 'Continue' a refused
+        # New-Item (ACL/policy on HKLM\SOFTWARE\Policies\...) was non-terminating, yet every
+        # walked ancestor was still appended to regKeysCreated - so the manifest shipped rows
+        # for keys that do not exist and -Uninstall counted each as a removal failure (exit 1).
+        New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
         foreach ($m in $missing) {
             if ($Manifest.regKeysCreated -notcontains $m) { $Manifest.regKeysCreated += $m }
         }
