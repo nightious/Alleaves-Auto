@@ -264,6 +264,16 @@ function Test-InstallAccount {
     if (-not $a) {
         return [pscustomobject]@{ Ok=$false; Reason='no-interactive-user'; Detail='no account resolved' }
     }
+    # Well-known SERVICE SIDs, tested BEFORE the domain arm. Get-SignedInAccount falls back
+    # to the process token when there is no console session, and under an RMM / service that
+    # token is NT AUTHORITY\SYSTEM - which carries a backslash, so Domain 'NT AUTHORITY' is
+    # not $env:COMPUTERNAME and the domain arm claimed the terminal was domain-joined. Right
+    # block, wrong problem: the tech was handed "create a local admin account" for a run
+    # whose only fault was having no console session. Everything below keeps its order
+    # (domain/Entra still ahead of the SID-shape test - an Entra SID is S-1-12-1-*).
+    if ($a.Sid -match '^S-1-5-(18|19|20)$') {
+        return [pscustomobject]@{ Ok=$false; Reason='service-account'; Detail="$($a.Name) [$($a.Sid)]" }
+    }
     # Checked before the SID shape: an Entra sign-in has an S-1-12-1-* SID and
     # would otherwise fall out as "no interactive user", which misleads the tech.
     if ($a.Domain -and $a.Domain -ne $env:COMPUTERNAME) {
@@ -422,7 +432,14 @@ function Set-OneShotAutoLogon($name, $plainPassword) {
     foreach ($v in $AutoLogonValues) {
         try {
             $cur = (Get-ItemProperty -Path $WinlogonKey -Name $v -ErrorAction Stop).$v
-            $prior[$v] = @{ present = $true; value = $cur }
+            # DefaultPassword is captured as PRESENT but its VALUE is deliberately dropped.
+            # This whole hashtable is serialized into the account_swap.json marker under
+            # %ProgramData%, whose inherited ACL grants BUILTIN\Users read - so a
+            # pre-existing plaintext Winlogon password would land in a world-readable file.
+            # The registry copy is a documented one-boot trade (Winlogon clears it itself);
+            # a file copy has no such self-clear. Restore-AutoLogon removes the value
+            # instead of writing it back - it is the one we KNOW we overwrote.
+            $prior[$v] = @{ present = $true; value = $(if ($v -eq 'DefaultPassword') { $null } else { $cur }) }
         } catch { $prior[$v] = @{ present = $false; value = $null } }
     }
     $script:AutoLogonPrior = $prior
@@ -437,19 +454,35 @@ function Set-OneShotAutoLogon($name, $plainPassword) {
     # returning the hashtable here would dump it to the console.
 }
 
+# Returns the COUNT of values that could not be put back, or $null when there was
+# nothing to restore. The caller needs both: nothing in here throws (every statement is
+# individually caught), so an unconditional "restored" message was green even after a
+# WARN, and on the promote path - which arms no autologon at all - it announced a
+# restore that never happened.
 function Restore-AutoLogon($prior) {
-    if (-not $prior) { return }
+    if (-not $prior) { return $null }
+    $failed = 0
     foreach ($v in $AutoLogonValues) {
         $p = $prior.$v
         try {
-            if ($p -and $p.present) {
+            # DefaultPassword is never written back: Set-OneShotAutoLogon deliberately keeps
+            # no copy of it (see there), and it is the one value we know we overwrote, so
+            # removing it IS the correct restore.
+            if ($p -and $p.present -and $v -ne 'DefaultPassword') {
                 $type = if ($v -eq 'AutoLogonCount') { 'DWord' } else { 'String' }
                 New-ItemProperty -Path $WinlogonKey -Name $v -Value $p.value -PropertyType $type -Force -EA Stop | Out-Null
             } else {
                 Remove-ItemProperty -Path $WinlogonKey -Name $v -Force -EA SilentlyContinue
+                # -EA SilentlyContinue cannot tell "already absent" (normal) from "could not
+                # delete", and a surviving DefaultPassword leaves cleartext in a key Users can
+                # read - so the one that matters is verified by reading it back.
+                if ($v -eq 'DefaultPassword' -and (Get-ItemProperty -Path $WinlogonKey -Name $v -EA SilentlyContinue)) {
+                    throw 'the value is still present after the removal'
+                }
             }
-        } catch { Warn "could not restore Winlogon\$v : $($_.Exception.Message)" }
+        } catch { Warn "could not restore Winlogon\$v : $($_.Exception.Message)"; $failed++ }
     }
+    return $failed
 }
 
 # Re-serialize this run's arguments so the resumed run is the same run. Takes
@@ -530,10 +563,23 @@ function Clear-AccountSwapState {
         Unregister-ScheduledTask -TaskName $AccountSwapTask -Confirm:$false -EA Stop
         Ok "removed resume task '$AccountSwapTask'"
     } catch { Warn "could not remove resume task '$AccountSwapTask': $($_.Exception.Message)" }
+    # Same treatment, same reason: the resume directory is a CONSTANT, so it never needed
+    # the marker either. It used to be (Split-Path $m.scriptCopy -Parent) inside the if ($m),
+    # which recursively deleted whatever the marker happened to name as the parent - for a
+    # scriptCopy written into the working root that is the working root itself (manifest,
+    # logs, downloads) - and an unreadable marker stranded a full copy of the installer
+    # forever while the only pointer to it was deleted below.
+    try { Remove-Item (Join-Path $AccountSwapDir 'resume') -Recurse -Force -EA SilentlyContinue } catch {}
     if ($m) {
-        try { Restore-AutoLogon $m.winlogonPrior; Ok 'autologon values restored to their pre-swap state' }
-        catch { Fail "could not restore autologon: $($_.Exception.Message)" }
-        try { if ($m.scriptCopy) { Remove-Item (Split-Path $m.scriptCopy -Parent) -Recurse -Force -EA SilentlyContinue } } catch {}
+        # Restore-AutoLogon never throws (every statement in it is individually caught), so
+        # the old catch here was dead and the Ok printed green even after a WARN. $null back
+        # means there was nothing to restore - the promote path arms no autologon at all, and
+        # claiming otherwise was simply false.
+        $restoreFailures = Restore-AutoLogon $m.winlogonPrior
+        if ($null -ne $restoreFailures) {
+            if ($restoreFailures -eq 0) { Ok 'autologon values restored to their pre-swap state' }
+            else { Fail "$restoreFailures autologon value(s) could not be restored - check Winlogon by hand" }
+        }
         # Held for the manifest; recorded only, never reversed (see below).
         $script:AccountSwapDone = @{ name=$m.account; sid=$m.sid; created=[bool]$m.created; removable=$false }
         Ok "resumed as '$($m.account)'"
@@ -592,7 +638,12 @@ function Invoke-AccountSwapOffer($acct, $bound) {
     # it stands on its own; only the resume plumbing failed.
     $script:AutoLogonPrior = $null
     $rollback = {
-        Restore-AutoLogon $script:AutoLogonPrior
+        # $null = : Restore-AutoLogon returns a failure COUNT, and every caller of this
+        # scriptblock is "& $rollback; return $false". A bare call would put that int in
+        # the function's output next to $false, so `if (Invoke-AccountSwapOffer ...)` at
+        # the dispatch would test a 2-element array - always truthy - and a swap that
+        # FAILED to arm would exit 9, rebooting a terminal with nothing set up to resume.
+        $null = Restore-AutoLogon $script:AutoLogonPrior
         try { Unregister-ScheduledTask -TaskName $AccountSwapTask -Confirm:$false -EA SilentlyContinue } catch {}
         if ($created) {
             try { Remove-LocalUser -SID $sid -EA Stop; Warn "rolled back: removed '$name'" }
@@ -724,6 +775,20 @@ if ($PrinterConfigOnly -and $PrinterBrand -eq 'None') {
     Fail "-PrinterConfigOnly and -PrinterBrand None are mutually exclusive (that run would do nothing)."
     exit 2
 }
+# Invoke-ComputerRename returns on -SkipRename before it ever looks at -ComputerName, so
+# this pair silently dropped the name AND left the OPOS logical device names built from the
+# old one - a terminal Alleaves cannot open, discovered at the till.
+if ($ComputerName -and $SkipRename) {
+    Fail "-ComputerName and -SkipRename are mutually exclusive (the name would be ignored)."
+    exit 2
+}
+# Same shape: the license is silently dropped and NiceLabel installs unlicensed. Tested on
+# ContainsKey, NOT on the variable - -NiceLabelLicense has a non-empty DEFAULT in param(),
+# so a plain -SkipNiceLabelActivation would otherwise exit 2 for everyone.
+if ($PSBoundParameters.ContainsKey('NiceLabelLicense') -and $SkipNiceLabelActivation) {
+    Fail "-NiceLabelLicense and -SkipNiceLabelActivation are mutually exclusive (the license would be ignored)."
+    exit 2
+}
 
 # ---------------------------------------------------------------------------
 # Single-elevation-owner rule: the .bat elevates once; this script must NOT
@@ -774,6 +839,12 @@ if (-not $Uninstall) {
                 Fail "Elevating this run with someone else's credentials is not enough - the"
                 Fail "account the terminal is signed into is the one that has to be an admin."
             }
+            'service-account' {
+                Fail "Ran with NO console session: the precheck could only see this process's"
+                Fail "own token ($($acct.Detail))."
+                Fail "That is a service identity, not a user - the account the terminal is"
+                Fail "actually signed into was never examined, and the install will not guess."
+            }
             'account-type-unknown' {
                 Fail "Could not determine whether '$($acct.Detail)' is a local or a Microsoft"
                 Fail "account - every probe declined to answer. The install will not guess:"
@@ -786,7 +857,16 @@ if (-not $Uninstall) {
             }
         }
         Write-Host ''
-        if ($acct.Reason -eq 'not-admin') {
+        if ($acct.Reason -eq 'service-account') {
+            # Nothing about the ACCOUNT is broken here, so the create-an-admin steps below
+            # would send the tech to fix something that isn't wrong.
+            Write-Host "  Fix it - run this from the terminal's own signed-in session:" -ForegroundColor Yellow
+            Write-Host "    1. Sign into the terminal as its local administrator account"
+            Write-Host '    2. Run Install-Alleaves.bat from that session'
+            Write-Host '    An RMM running as SYSTEM cannot answer this check - dispatch it to the'
+            Write-Host '    logged-on user instead, or run it by hand.'
+        }
+        elseif ($acct.Reason -eq 'not-admin') {
             Write-Host '  Fix it - promote the signed-in account:' -ForegroundColor Yellow
             Write-Host '    1. Settings > Accounts > Other users > (the account) > Change account type'
             Write-Host '    2. Account type = Administrator'
@@ -1362,7 +1442,7 @@ $DriveFiles = @(
     # -SkipPrograms fragment hit only ONE phase: -SkipPrograms NiceLabel used to download
     # the whole suite and then never install it. Same discipline the printer rows require.
     @{ Label='Google Chrome';         FileId='1XT7Zc0lU6t1OhI4yM_SpD8TH_N0spUaV'; File='Chrome Setup.exe' }
-    @{ Label='Alleaves Terminal App'; FileId='1UAqW1zzxj9LJ-Pk0riNsZ8MiYoSQNoxP'; File='Alleaves Terminal App.msi' }
+    @{ Label='Alleaves Terminal';     FileId='1UAqW1zzxj9LJ-Pk0riNsZ8MiYoSQNoxP'; File='Alleaves Terminal App.msi' }
     @{ Label='Zebra 123 Scan';        FileId='1VBCRHD3hyNzlfoOuYsac9LpeHizAkruo'; File='Zebra 123 Scan.exe' }
     @{ Label='Zebra Scanner SDK';     FileId='1K5DR-STIxxtsnwklcbTCpo8cPFCwcIUa'; File='Zebra Scanner SDK.exe' }
     @{ Label='POS for .NET';          FileId='1pYr5skO85h8baFByy9z_ZN1ZPiDnfN_D'; File='POSforDOTNet.msi' }   # F7: Label aligned with install Name so one -SkipPrograms fragment hits both phases
@@ -4674,7 +4754,10 @@ try {
         Register-FinishLogonTask
 
         # 4. Master list -> cashier + admin Documents
-        if (-not $SkipMasterList) {
+        # Test-SkipMatch too, same as the Splashtop fetch: the .nlbl is a $DriveFiles row, so
+        # -SkipPrograms 'Nice Label' correctly skips its DOWNLOAD - and this step then failed
+        # "not found", set $script:FinishFailed and exited 1 on a deliberate skip.
+        if (-not $SkipMasterList -and -not (Test-SkipMatch -Names @('Master List','Alleaves Nice Label Master List.nlbl'))) {
             $source = Join-Path $DownloadDir 'Alleaves Nice Label Master List.nlbl'
             Copy-MasterList -Source $source
         }

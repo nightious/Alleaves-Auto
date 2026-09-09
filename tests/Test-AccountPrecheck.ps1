@@ -66,7 +66,14 @@ Assert-Eq 'not-admin'            (Get-Verdict 'POS01\till'     'S-1-5-21-1-2-3-1
 Assert-Eq 'microsoft-account'    (Get-Verdict 'POS01\till'     'S-1-5-21-1-2-3-1001' 'a@b.com' $true)  'MSA blocks even when admin'
 Assert-Eq 'not-local'            (Get-Verdict 'CONTOSO\till'   'S-1-5-21-9-9-9-1001' $null     $true)  'domain account blocks'
 Assert-Eq 'not-local'            (Get-Verdict 'AzureAD\a@b.com' 'S-1-12-1-11-22-33-44' $null   $true)  'Entra with domain prefix blocks'
-Assert-Eq 'no-interactive-user'  (Get-Verdict 'SYSTEM'         'S-1-5-18'            $null     $true)  'SYSTEM is not an interactive user'
+# The shape a real service/RMM run produces: Get-SignedInAccount finds no console session
+# and falls back to the process token. 'NT AUTHORITY' is not the computer name, so this used
+# to hit the DOMAIN arm and hand the tech the "fix your domain join / create a local admin"
+# remediation for a run whose only fault was having no console session.
+Assert-Eq 'service-account'      (Get-Verdict 'NT AUTHORITY\SYSTEM' 'S-1-5-18'       $null     $true)  'SYSTEM reports service-account, not not-local'
+Assert-Eq 'service-account'      (Get-Verdict 'NT AUTHORITY\LOCAL SERVICE' 'S-1-5-19' $null    $true)  'LocalService too'
+# Still reachable: a name that resolved to no SID at all (NTAccount.Translate threw).
+Assert-Eq 'no-interactive-user'  (Get-Verdict 'till'           $null                 $null     $true)  'an unresolvable account is not an interactive user'
 
 # The two regressions this file exists for.
 # 1b: an undetermined account type used to return $null from the MSA probe,
@@ -137,7 +144,7 @@ function New-ItemProperty { param($Path,$Name,$Value,$PropertyType,[switch]$Forc
 function Remove-ItemProperty { param($Path,$Name,[switch]$Force,$ErrorAction) $script:Removed += $Name }
 $AutoLogonValues = @('AutoAdminLogon','DefaultUserName','DefaultDomainName','DefaultPassword','AutoLogonCount')
 $WinlogonKey = 'HKLM:\fake'
-Restore-AutoLogon ([pscustomobject]@{
+$failures = Restore-AutoLogon ([pscustomobject]@{
     AutoAdminLogon    = [pscustomobject]@{ present = $true;  value = '0' }   # pre-existing
     DefaultUserName   = [pscustomobject]@{ present = $false; value = $null }
     DefaultDomainName = [pscustomobject]@{ present = $false; value = $null }
@@ -148,16 +155,39 @@ Assert-Eq '0/String' $script:Wrote['AutoAdminLogon']       'a pre-existing AutoA
 Assert-Eq $true      ($script:Removed -contains 'DefaultPassword') 'the password we added is removed'
 Assert-Eq 4          $script:Removed.Count                 'exactly the four values that were absent are removed'
 Assert-Eq $true      ($script:Removed -notcontains 'AutoAdminLogon') 'a value that existed is never removed'
+Assert-Eq 0          $failures                             'a clean restore reports zero failures (not $null, not silence)'
+
+# A PRE-EXISTING DefaultPassword is still REMOVED, never written back: Set-OneShotAutoLogon
+# deliberately keeps no copy of it (it would land in a Users-readable JSON marker), and it is
+# the one value we know we overwrote.
+$script:Wrote = @{}; $script:Removed = @()
+Restore-AutoLogon ([pscustomobject]@{
+    AutoAdminLogon    = [pscustomobject]@{ present = $false; value = $null }
+    DefaultUserName   = [pscustomobject]@{ present = $false; value = $null }
+    DefaultDomainName = [pscustomobject]@{ present = $false; value = $null }
+    DefaultPassword   = [pscustomobject]@{ present = $true;  value = $null }
+    AutoLogonCount    = [pscustomobject]@{ present = $false; value = $null }
+}) | Out-Null
+Assert-Eq $true  ($script:Removed -contains 'DefaultPassword') 'a pre-existing DefaultPassword is removed, not restored'
+Assert-Eq $false ($script:Wrote.ContainsKey('DefaultPassword')) 'no password is ever written back'
+
+# $null (not 0) when there is nothing to restore - the PROMOTE path arms no autologon at
+# all, and the caller used to print a green "autologon restored" for it anyway.
+Assert-Eq $true ($null -eq (Restore-AutoLogon $null)) 'nothing to restore returns $null, not a count'
 
 # LAST section on purpose: its stubs shadow Restore-AutoLogon, Test-Path, Get-Content and
 # Remove-Item, so anything after it would be testing the stubs.
 Write-Host "`nClear-AccountSwapState" -ForegroundColor Cyan
 # Three regressions live here. The marker is the ONLY record that a swap was armed, and
 # this function is the only thing that disarms it.
-$AccountSwapMarker = 'X:\fake\account_swap.json'
+# A real drive letter on purpose: nothing here is ever touched (Test-Path / Remove-Item are
+# stubbed below), but Clear-AccountSwapState builds the resume dir with Join-Path, which
+# THROWS on a qualifier no PSDrive matches - the whole step would then be skipped untested.
+$AccountSwapDir    = 'C:\fake-alleaves-test'
+$AccountSwapMarker = 'C:\fake-alleaves-test\account_swap.json'
 $AccountSwapTask   = 'AlleavesAuto-Resume'
 $script:MarkerBody = $null      # $null => Get-Content throws (unreadable marker)
-$script:Unregistered = 0; $script:MarkerDeleted = 0; $script:Restored = 0
+$script:Unregistered = 0; $script:MarkerDeleted = 0; $script:Restored = 0; $script:ResumeDirDeleted = 0
 function Step($m) {}
 function Ok($m) {}
 function Fail($m) {}
@@ -166,9 +196,10 @@ function Test-Path { param($Path, $LiteralPath, $ErrorAction) $true }
 function Get-Content { param($Path, [switch]$Raw, $EA, $ErrorAction) if ($null -eq $script:MarkerBody) { throw 'truncated' }; $script:MarkerBody }
 function Unregister-ScheduledTask { param($TaskName, [switch]$Confirm, $EA, $ErrorAction) $script:Unregistered++ }
 function Restore-AutoLogon($prior) { $script:Restored++ }
-function Remove-Item { param($Path, [switch]$Recurse, [switch]$Force, $EA, $ErrorAction) $script:MarkerDeleted++ }
+function Remove-Item { param($Path, [switch]$Recurse, [switch]$Force, $EA, $ErrorAction)
+                       if ("$Path" -eq $AccountSwapMarker) { $script:MarkerDeleted++ } else { $script:ResumeDirDeleted++ } }
 
-function Reset-SwapStubs { $script:Unregistered=0; $script:MarkerDeleted=0; $script:Restored=0
+function Reset-SwapStubs { $script:Unregistered=0; $script:MarkerDeleted=0; $script:Restored=0; $script:ResumeDirDeleted=0
                            $script:AccountSwapAttempted=$false; $script:AccountSwapDone=$null }
 
 # 1. -DryRun must touch NOTHING. A tech who armed a swap and then ran -DryRun to re-check
@@ -179,6 +210,7 @@ Clear-AccountSwapState
 Assert-Eq 0     $script:Unregistered      '-DryRun does not unregister the resume task'
 Assert-Eq 0     $script:MarkerDeleted     '-DryRun does not delete the marker'
 Assert-Eq 0     $script:Restored          '-DryRun does not touch autologon'
+Assert-Eq 0     $script:ResumeDirDeleted  '-DryRun does not delete the staged resume copy'
 Assert-Eq $true $script:AccountSwapAttempted '-DryRun still trips the loop guard'
 
 # 2. An UNREADABLE marker must still unregister the task. It used to sit inside "if ($m)"
@@ -189,6 +221,9 @@ Reset-SwapStubs; $DryRun = $false; $script:MarkerBody = $null
 Clear-AccountSwapState
 Assert-Eq 1 $script:Unregistered  'unreadable marker: the resume task is STILL unregistered'
 Assert-Eq 1 $script:MarkerDeleted 'unreadable marker: the marker is cleaned up'
+# The resume dir is a CONSTANT path, so it never needed the marker either. Inside "if ($m)"
+# an unreadable marker stranded a full copy of the installer with its only pointer deleted.
+Assert-Eq 1 $script:ResumeDirDeleted 'unreadable marker: the staged resume copy is STILL removed'
 
 # 3. The normal resume path still does all three.
 Reset-SwapStubs; $script:MarkerBody = '{"account":"POS01\\till","sid":"S-1-5-21-1-2-3-1001","created":true,"winlogonPrior":{}}'
