@@ -71,8 +71,12 @@ Major function groups in `alleaves_setup.ps1`:
 - TLS 1.2 forced before any network call (stock Win10 defaults too low for the CDNs).
 - **Exit codes** are an RMM contract set in the `$exitCode` dispatch tail (verify there): `0` ok ·
   `1` install/uninstall/download/**finishing** fail (`$script:FinishFailed` — the master-list
-  copy, the Chrome bookmark policy and the logon-task staging/registration write no
-  `$Manifest.installed` row, so the tally could not see them and they exited 0) · `2` mode
+  copy, the Chrome bookmark policy, the logon-task staging/registration, a failed **computer
+  rename**, and a failed `Disable-TrackedTask` write no `$Manifest.installed` row, so the tally
+  could not see them and they exited 0; a failed rename also silently poisons the OPOS device
+  names, since `Get-PosNamePrefix` correctly falls back to the *current* name. A manifest that
+  could not be written is its own flag, `$script:ManifestWriteFailed`, read **after**
+  `Save-Manifest` — the tally itself is still snapshotted before it) · `2` mode
   ambiguity · `3` not elevated · `4` scanner
   degraded (CoreScanner missing) · `5` working-dir failed · `6` scanner present but switch failed ·
   `7` OPOS receipt-printer registration failed · `8` account precheck failed and was not
@@ -408,7 +412,13 @@ Major function groups in `alleaves_setup.ps1`:
   is a whole format string rather than a prefix because InstallShield rejects a line mixing `-`
   and `/` switch styles. `RegistryShortCircuit=$false` is mandatory for pure InstallScript:
   `DeinstallStart()` writes the ARP entry *before* file transfer, so the "in the registry ⇒ done"
-  break would kill the worker mid-copy and record success. **`RegistryShortCircuit` also gates the
+  break would kill the worker mid-copy and record success. **The ARP test lives in the poll loop's
+  NO-WORKERS branch**, not as its first statement: as the first statement it fired on the very
+  first poll of a *repair* run — a prior run that failed after InstallShield wrote the ARP entry,
+  which is exactly when `Test-PriorInstallFailed` declines the ARP skip and re-runs the installer —
+  and the `break` fell straight into the `$ReapNames` sweep, force-killing the live `setup.exe`
+  and then recording `ok`. ARP presence only means "committed" once nothing of ours is still
+  running. **`RegistryShortCircuit` also gates the
   SUCCESS VERDICT**, not just the poll loop: the verdict is `$logOk -or ($regOk -and
   $RegistryShortCircuit)`, so a `$false` family must show `ResultCode=0` in the response log
   (reachable — `/f2` forwarding is proven). Without that, a half-copied install was
@@ -468,6 +478,11 @@ Major function groups in `alleaves_setup.ps1`:
 - **`-Uninstall` counts EVERY reversal failure, not just products.** `$uninstallFailures` used to
   be incremented in one place; a scheduled task that wouldn't unregister, a reg key that wouldn't
   delete, a value that wouldn't restore and a locked pinned `.lnk` were all `Warn`-and-return-0.
+  Four more were still uncounted until 2026-09-09: the step-1 file delete, the step-1b file
+  restore, the step-4c UCPD task **re-enable**, and — worst — step 4b's `(default)` deletion,
+  whose *inner* try/catch intercepted before the outer `$uninstallFailures++`; that is the value
+  whose survival leaves the phantom OPOS device, so it was the wrong one to swallow. The summary
+  line says "reversal(s)", not "product(s)", because it has counted more than products for a while.
   The load-bearing case: `AlleavesAuto-FinishUser` surviving keeps clearing `Taskband` and
   re-applying our pins at every logon. Relatedly, the non-`(default)` value deletion is
   `-ErrorAction Stop` — its `Ok "removed …"` is unconditional, so `SilentlyContinue` reported

@@ -960,6 +960,12 @@ $script:FinishFailed    = $false
 $script:ScannerConfigFailed = $false   # set if a connected scanner is present but the OPOS switch fails (exit 6)
 $script:PrinterConfigFailed = $false   # set if the OPOS printer device entry fails to write (exit 7)
 $script:PrinterBrandResolved = $null   # brand answered ONCE up front (see Resolve-PrinterBrand)
+# Set if Save-Manifest could not write install_manifest.json (disk full, AV holding the
+# file). It used to Fail on the console and exit 0 - the one failure path in the dispatch
+# tail that could not reach a non-zero code - while UCPD Start=4, the AlleavesAuto-FinishUser
+# task, the OPOS device keys and every placed file now had NO record at all, making a later
+# -Uninstall permanently a no-op. Folds into exit 1, like $script:FinishFailed.
+$script:ManifestWriteFailed = $false
 $script:UserAgent       = 'Mozilla/5.0 AlleavesAuto/1.0'   # F3: one UA for BITS + WebClient + HEAD/GET probe
 
 # The Alleaves web POS: Chrome's start page, home button and bookmark all point here.
@@ -2346,7 +2352,23 @@ function Get-PriorManifest {
     if ($null -eq $script:PriorManifest) {
         $script:PriorManifest = @{}
         if (Test-Path $ManifestPath) {
-            try { $script:PriorManifest = (Get-Content $ManifestPath -Raw | ConvertFrom-Json) }
+            # -ErrorAction Stop on BOTH, same guard as Invoke-UninstallPhase's read. MEASURED:
+            # malformed JSON is statement-terminating and did reach the catch, but a manifest
+            # LOCKED by AV / a backup agent fails in Get-Content, which is NON-TERMINATING
+            # under 'Continue' - the pipeline then yields nothing, $script:PriorManifest is
+            # assigned $null over the @{} default (so the read-once memo never satisfies and
+            # every call re-reads and re-errors), and every caller reads it as an EMPTY
+            # manifest: Test-PriorInstallFailed returns $false for a product that failed last
+            # run and ARP alone skips its repair, and Write-XmlFile's $ours test reads $false
+            # so run 2 backs up OUR OWN layout as the "OEM" one.
+            # A ZERO-BYTE manifest is the third shape and needs its own test: Get-Content -Raw
+            # returns $null with NO error, ConvertFrom-Json never runs, no catch fires - and the
+            # result is the same silent "empty manifest" as the two above.
+            try {
+                $raw = Get-Content $ManifestPath -Raw -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace($raw)) { throw 'the manifest file is empty' }
+                $script:PriorManifest = ($raw | ConvertFrom-Json -ErrorAction Stop)
+            }
             catch { Warn "could not read the prior manifest: $($_.Exception.Message)" }
         }
     }
@@ -2582,7 +2604,12 @@ function Save-Manifest {
     if ($DryRun) { Ok 'dry-run: manifest not persisted (real manifest preserved)'; return }
     if (Test-Path $ManifestPath) {
         try {
-            $prior = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+            # -ErrorAction Stop on BOTH or the catch below never runs for the case that
+            # matters most: a manifest LOCKED by AV / a backup agent fails in Get-Content,
+            # which is non-terminating under 'Continue', so $prior lands $null, every merge
+            # reads it as empty, and the Move-Item that preserves the only record of earlier
+            # runs is skipped - the file is silently overwritten instead.
+            $prior = Get-Content $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $Manifest.installed              = Merge-PriorList $Manifest.installed              $prior.installed              { param($e) $e.name }   -Announce 'entry'
             $Manifest.filesPlaced            = Merge-PriorList $Manifest.filesPlaced            $prior.filesPlaced            { param($e) $e }
             # PRIOR wins (args swapped), same reason as regValuesSet below: only the FIRST
@@ -2647,6 +2674,9 @@ function Save-Manifest {
         Ok "manifest written: $ManifestPath"
     } catch {
         Fail "could not write manifest ${ManifestPath}: $($_.Exception.Message)"
+        # Nothing this run did is recorded anywhere now, so -Uninstall would report
+        # "nothing recorded" and exit 0. Must not be an exit-0 run (see the flag's decl).
+        $script:ManifestWriteFailed = $true
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -2774,7 +2804,12 @@ function Invoke-ComputerRename {
     $name = $null
     if ($ComputerName) {
         $err = & $validate $ComputerName
-        if ($err) { Fail "preset -ComputerName '$ComputerName' invalid: $err"; Warn 'skipping rename'; return }
+        # $script:FinishFailed on both failure arms: the tally only scans installed/
+        # dependencies, so a failed rename printed red [FAIL] and exited 0 - and
+        # Get-PosNamePrefix then correctly refuses the unapplied name and falls back to the
+        # CURRENT one, so Set-PrinterOpos registers OLDNAME_Printer and Alleaves (configured
+        # for the new name) can never open it.
+        if ($err) { Fail "preset -ComputerName '$ComputerName' invalid: $err"; Warn 'skipping rename'; $script:FinishFailed = $true; return }
         $name = $ComputerName
     } elseif ([Environment]::UserInteractive -and -not $env:ALLEAVES_NOPAUSE) {
         # F14: the rename prompt is install step 0. On a headless / RMM run there is
@@ -2813,6 +2848,7 @@ function Invoke-ComputerRename {
     } catch {
         Fail "rename failed: $($_.Exception.Message)"
         $Manifest.computerRenamed = @{ from=$current; to=$name; applied=$false; error="$($_.Exception.Message)" }
+        $script:FinishFailed = $true
     }
 }
 
@@ -3216,7 +3252,16 @@ function Disable-TrackedTask {
         # explicitly so the invariant survives future changes).
         $Manifest.scheduledTasksDisabled += @{ path=$TaskPath; name=$TaskName; prevState="$($t.State)" }
         Ok "disabled scheduled task: $TaskPath$TaskName"
-    } catch { Warn "could not disable task '$TaskName': $($_.Exception.Message)" }
+    } catch {
+        # Flagged like its sibling (the UCPD Start=4 write, which sets the same flag at the
+        # call site): the only caller is the 'UCPD velocity' task, whose whole job is to
+        # re-enable UCPD. Leaving it enabled means UCPD reloads at boot, every
+        # Set-UserChoiceDefault burns its retries and Chrome silently never becomes default -
+        # while $script:FinishBrowser is still $true and the end-of-run banner tells the tech
+        # the default browser is applied automatically at logon. That must not be exit 0.
+        Fail "could not disable task '$TaskName': $($_.Exception.Message)"
+        $script:FinishFailed = $true
+    }
 }
 
 # The per-user finish script body (runs at logon, in the user's own context,
@@ -3550,6 +3595,12 @@ function Get-ScannerHostMode {
     return 'unknown'
 }
 
+# Status of the LAST GetScanners call (-1 = it threw). An empty inventory means two very
+# different things - "nothing is plugged in" (benign) and "the call failed" - and the two
+# are only separable here, so the status is parked for the caller that must tell them
+# apart. Read ONLY straight after a call (Set-ScannerOpos's zero-count branch); the
+# re-enum poll loop calls this repeatedly and its transient failures are expected.
+$script:ScannerInventoryStatus = 0
 function Get-CoreScannerInventory {
     # Call GetScanners and parse OutXML into one object per connected scanner.
     # scannerID changes across re-enumeration; SERIAL is stable, so callers
@@ -3560,7 +3611,8 @@ function Get-CoreScannerInventory {
     $outXml = ''
     $st     = 0
     try { $Obj.GetScanners([ref]$count, $ids, [ref]$outXml, [ref]$st) }
-    catch { Warn "GetScanners failed: $($_.Exception.Message)"; return @() }
+    catch { Warn "GetScanners failed: $($_.Exception.Message)"; $script:ScannerInventoryStatus = -1; return @() }
+    $script:ScannerInventoryStatus = [int]$st
     $list = @()
     if ($outXml) {
         try {
@@ -3717,7 +3769,17 @@ function Write-NewScannerFingerprint {
                     $h.label,$s.Type,$s.Pid,$s.Vid,$s.Serial,$s.Model,$s.Id,$s.Firmware,$h.status,$h.seconds) }
         else    { $out += ("[{0}] (no scanner re-enumerated)  | status={1} reconnect={2}s" -f $h.label,$h.status,$h.seconds) }
     }
-    $out | Set-Content -Path $path -Encoding UTF8
+    # -Stop: under 'Continue' a read-only $LogDir / full disk failed non-terminatingly and
+    # $path was still returned, so $entry.fingerprintLog pointed at a file that was never
+    # written - the manifest telling the tech to send a log that does not exist. (Same
+    # "recorded a thing we never wrote" shape as Set-TrackedRegValue.) Caught HERE, not
+    # left to the caller's per-device catch: this dump is records-only and must never turn
+    # a successful OPOS switch into a failure. $null -> no fingerprintLog key value.
+    try { $out | Set-Content -Path $path -Encoding UTF8 -ErrorAction Stop }
+    catch {
+        Warn "new scanner model '$Model' - could NOT write its fingerprint log: $($_.Exception.Message)"
+        return $null
+    }
     Warn '*********************************************************************'
     Warn '*  NEW SCANNER MODEL - PLEASE SAVE / SEND THESE LOGS                *'
     Warn '*  No confirmed OPOS timing for this model yet. A per-hop           *'
@@ -3777,6 +3839,17 @@ function Set-ScannerOpos {
         Confirm-ScannerServicesReady | Out-Null
 
         $scanners = @(Get-CoreScannerInventory $obj)
+        # A FAILED enumeration is not the same answer as "no scanner attached". The status
+        # was declared, passed as [ref] and never read, so a non-zero GetScanners (RSM not
+        # attached yet - the same class of condition the 112 retries exist for) fell into
+        # the benign branch below: a DS2208 physically plugged in shipped in HID-KB mode on
+        # a green exit-0 run. RECORD + FLAG instead, like the no-interop / open-failed bails.
+        if ($scanners.Count -eq 0 -and $script:ScannerInventoryStatus -ne 0) {
+            Fail "GetScanners failed (status $script:ScannerInventoryStatus) - cannot enumerate scanners"
+            $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result="enum-failed:$script:ScannerInventoryStatus"; removable=$false }
+            $script:ScannerConfigFailed = $true
+            return
+        }
         if ($scanners.Count -eq 0) {
             # Benign: a terminal set up before its scanner is plugged in still
             # succeeds (exit 0); just re-run the .bat later with the scanner attached.
@@ -3967,7 +4040,11 @@ function Invoke-UninstallPhase {
             if (-not (Test-Path $f)) { Warn "$f already gone"; continue }
             if ($DryRun) { Dry "would delete $f"; continue }
             try { Remove-Item -Path $f -Force -ErrorAction Stop; Ok "deleted $f" }
-            catch { Warn "could not delete ${f}: $($_.Exception.Message)" }
+            # Counted like every other reversal failure: a locked all-users 'Alleaves POS.lnk'
+            # survives pointing at a Chrome step 2 is about to uninstall - and step 4e already
+            # counts the PINNED copy of that same .lnk, so leaving this one silent was a
+            # straight inconsistency.
+            catch { Warn "could not delete ${f}: $($_.Exception.Message)"; $uninstallFailures++ }
         }
     }
 
@@ -3981,7 +4058,9 @@ function Invoke-UninstallPhase {
         try {
             Move-Item -LiteralPath $fr.backup -Destination $fr.path -Force -ErrorAction Stop
             Ok "restored original $($fr.path)"
-        } catch { Warn "could not restore $($fr.path): $($_.Exception.Message)" }
+        # Counted too: this is the OEM taskbar layout. Un-restored, EVERY account created
+        # after the uninstall still gets our pins, aimed at exes that are gone.
+        } catch { Warn "could not restore $($fr.path): $($_.Exception.Message)"; $uninstallFailures++ }
     }
 
     # 2. Uninstall installed programs in REVERSE order
@@ -4090,7 +4169,11 @@ function Invoke-UninstallPhase {
                             } else {
                                 Write-Host "  $($rv.path) not open for write (already gone?) - (default) left alone"
                             }
-                        } catch { Warn "could not remove $($rv.path)\(default): $($_.Exception.Message)" }
+                        # Counted HERE: this inner catch intercepts before the outer one that
+                        # does the counting, and OpenSubKey throws SecurityException (it does
+                        # NOT return $null) when write access is denied - so the one value
+                        # whose survival leaves a phantom device was the only one uncounted.
+                        } catch { Warn "could not remove $($rv.path)\(default): $($_.Exception.Message)"; $uninstallFailures++ }
                     } else {
                         # -Stop, not -SilentlyContinue: the Ok below is unconditional, so a
                         # swallowed access-denied reported a removal that never happened -
@@ -4150,7 +4233,9 @@ function Invoke-UninstallPhase {
         if (-not $wasEnabled) { Ok "task $($dt.name) was disabled before install - leaving disabled"; continue }
         if ($DryRun) { Dry "would re-enable scheduled task: $($dt.path)$($dt.name)"; continue }
         try { Enable-ScheduledTask -TaskPath $dt.path -TaskName $dt.name -ErrorAction Stop | Out-Null; Ok "re-enabled scheduled task: $($dt.name)" }
-        catch { Warn "could not re-enable task $($dt.name): $($_.Exception.Message)" }
+        # Counted: leaving it silent reports a clean decommission on a machine where a
+        # Microsoft-shipped task (UCPD velocity) stays permanently disabled by us.
+        catch { Warn "could not re-enable task $($dt.name): $($_.Exception.Message)"; $uninstallFailures++ }
     }
 
     # 4d. Restore the original taskbar pins for any LOADED user hive (profiles not
@@ -4204,7 +4289,7 @@ function Invoke-UninstallPhase {
 
     # F12: fail the phase if any product failed to uninstall (dispatch propagates a
     # non-zero rc). DryRun never increments (Invoke-SilentUninstall returns $true).
-    if ($uninstallFailures -gt 0) { Fail "$uninstallFailures product(s) failed to uninstall"; return 1 }
+    if ($uninstallFailures -gt 0) { Fail "$uninstallFailures reversal(s) failed (products, files, registry, tasks or pins)"; return 1 }
     return 0
 }
 
@@ -4278,9 +4363,10 @@ $PosXPrinterDWords = [ordered]@{
 # produced a subtly wrong key. Fill these from the bench capture (before/after
 # Collect-PrinterFingerprint.ps1 -SnapshotOnly, diffed; procedure and results table in
 # docs/PRINTER_OPOS_FIELD_RESULTS.md), then set each device's Type/ProgId below.
-# An EMPTY Strings table is what Set-PrinterOpos's not-captured guard tests, so leaving
-# these blank makes a StarTSP100 run exit 7 with result='not-captured' instead of writing
-# a valueless key and reporting success. Do not "stub" them with plausible values.
+# An EMPTY Strings OR DWords table is what Set-PrinterOpos's not-captured guard tests
+# (both, since filling one of the four and forgetting the other is a one-line omission),
+# so leaving these blank makes a StarTSP100 run exit 7 with result='not-captured' instead
+# of writing a valueless key and reporting success. Do not "stub" them with plausible values.
 $StarPrinterStrings = [ordered]@{}   # TODO[rig]
 $StarPrinterDWords  = [ordered]@{}   # TODO[rig]
 $StarDrawerStrings  = [ordered]@{}   # TODO[rig]
@@ -4414,8 +4500,14 @@ function Remove-StalePrinterOpos {
         # Set-PrinterOpos) so a half-failed run never retires a device it failed to replace.
         [Parameter(Mandatory)][string[]]$Registered
     )
-    if (-not (Test-Path $ManifestPath)) { return }
-    $prior = try { Get-Content $ManifestPath -Raw | ConvertFrom-Json } catch { return }
+    # Read through Get-PriorManifest rather than a private copy of the same read: that one
+    # is -ErrorAction Stop on both cmdlets and Warns. This one caught nothing on a LOCKED
+    # manifest (Get-Content is non-terminating under 'Continue') and swallowed the Warn on a
+    # malformed one, so an unreadable manifest silently meant "no stale devices" - after a
+    # rename the terminal advertised TWO OPOS printers and Alleaves could open the dead one.
+    # Safe here: this step runs BEFORE Save-Manifest, so the memoised copy is still an
+    # EARLIER run's, which is exactly what "stale" means.
+    $prior = Get-PriorManifest
     $keep = @($Registered)
     foreach ($p in @($prior.printerConfigured)) {
         if (-not $p.logicalName -or -not $p.deviceClass) { continue }          # skips the (none:*) rows
@@ -4503,7 +4595,13 @@ function Set-PrinterOpos {
     # 'ok' after creating an empty device key - a phantom device plus a false success,
     # which is strictly worse than doing nothing. Loud failure (exit 7) instead, so a
     # build shipped ahead of the capture cannot be mistaken for a working one.
-    $uncaptured = @($brandDef.Devices | Where-Object { $_.Strings.Count -eq 0 })
+    # BOTH tables, not just Strings: the capture fills four of them, and a filled
+    # $StarPrinterStrings beside a still-empty $StarPrinterDWords (a one-line omission)
+    # passed the Strings-only test - the DWord write loop AND its readback loop both
+    # iterated zero times, so the step reported 'ok' on a device with no pulse width, no
+    # drawer number and no port settings. The same phantom, through the half of the tables
+    # the guard was not looking at.
+    $uncaptured = @($brandDef.Devices | Where-Object { $_.Strings.Count -eq 0 -or $_.DWords.Count -eq 0 })
     if ($uncaptured) {
         Warn "$brand OPOS values have not been captured yet ($(($uncaptured | ForEach-Object { $_.Class }) -join ', '))."
         Warn 'Run the bench capture in docs/PRINTER_OPOS_FIELD_RESULTS.md, fill the tables, then re-run with -PrinterConfigOnly.'
@@ -4727,6 +4825,10 @@ try {
             }
         }
         Save-Manifest
+        # A manifest that could not be written is a HARD failure (1), not a re-run signal:
+        # this mode's entire durable output is the merged row it just failed to persist.
+        # Set before the 6/7 block so it is never masked by it (they gate on $exitCode -eq 0).
+        if ($script:ManifestWriteFailed) { $exitCode = 1 }
 
         # Own copy of the non-fatal exit-code block (6 / 7) - without it this branch
         # always exits 0, whatever the step reported.
@@ -4868,6 +4970,11 @@ try {
         # 4/6/7 re-run signals below, which are all gated on $exitCode -eq 0.
         $failed    = @($Manifest.installed    | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
         $depFailed = @($Manifest.dependencies | Where-Object { $_.result -and ($_.result -notin @('ok','already-present','dryrun')) })
+        # Snapshot THIS run's rename for the reboot banner below, for the same reason: the
+        # merge carries a PRIOR run's computerRenamed forward when this run has none, so a
+        # -SkipRename re-run on a box where VC++ returned 3010 announced "will be renamed
+        # to 'POS01' on reboot" for a rename that landed weeks ago.
+        $renamedTo = $Manifest.computerRenamed.to
 
         # 6. Persist manifest (merged)
         Save-Manifest
@@ -4887,9 +4994,11 @@ try {
         # staging/registration of the per-user logon task. Each of those used to Fail on the
         # console and still exit 0 - a terminal with no .nlbl and no logon task reported
         # clean to the RMM.
-        if ($failed.Count -gt 0 -or $depFailed.Count -gt 0 -or $script:DownloadFailed -or $script:FinishFailed) {
+        # $script:ManifestWriteFailed is read HERE, after Save-Manifest - the tally above is
+        # snapshotted before it on purpose, but the flag only exists once the write ran.
+        if ($failed.Count -gt 0 -or $depFailed.Count -gt 0 -or $script:DownloadFailed -or $script:FinishFailed -or $script:ManifestWriteFailed) {
             $exitCode = 1
-            Fail "$($failed.Count) install / $($depFailed.Count) dependency failure(s); download failure=$($script:DownloadFailed); finishing failure=$($script:FinishFailed)"
+            Fail "$($failed.Count) install / $($depFailed.Count) dependency failure(s); download failure=$($script:DownloadFailed); finishing failure=$($script:FinishFailed); manifest write failure=$($script:ManifestWriteFailed)"
         }
         # F20: a degraded scanner (CoreScanner missing - e.g. the .iss path fell back
         # to the extracted MSI, which omits CoreScanner) is not a hard failure but DOES
@@ -4924,7 +5033,7 @@ try {
         # tech here. Emphatic if VC++ flagged a pending reboot (3010). No auto-reboot.
         if ($script:RebootPending) {
             Warn '*** REBOOT REQUIRED before this terminal is ready.                    ***'
-            if ($Manifest.computerRenamed.to) { Warn ("*** Computer will be renamed to '{0}' on reboot.{1}***" -f $Manifest.computerRenamed.to, (' ' * [Math]::Max(1, 21 - $Manifest.computerRenamed.to.Length))) }
+            if ($renamedTo) { Warn ("*** Computer will be renamed to '{0}' on reboot.{1}***" -f $renamedTo, (' ' * [Math]::Max(1, 21 - $renamedTo.Length))) }
             Warn '*** Reboot before using the Zebra scanner.                           ***'
         } else {
             Write-Host "  Recommended: reboot this terminal once to finalize Zebra CoreScanner." -ForegroundColor Yellow

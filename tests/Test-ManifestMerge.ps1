@@ -30,7 +30,7 @@ $errs = $null
 $ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
 if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
 
-$wanted = @('Merge-PriorList')
+$wanted = @('Merge-PriorList', 'Get-PriorManifest')
 $found  = @{}
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($wanted -contains $f.Name) { $found[$f.Name] = $f.Extent.Text }
@@ -105,6 +105,34 @@ Assert-Eq 0     $failed.Count 'the exit tally sees no failure'
 $priorFailed = [bool]@($installed | Where-Object { $_.name -eq 'Zebra Scanner SDK' -and $_.result -ne 'ok' }).Count
 Assert-Eq $false $priorFailed 'Test-PriorInstallFailed will not force a replay next run'
 Assert-Eq 'Chrome' $installed[0].name 'other products are untouched by the drop'
+
+Write-Host "`nGet-PriorManifest does not read an unreadable manifest as empty" -ForegroundColor Cyan
+# The manifest is LOCKED here (AV / a backup agent holding it open), not malformed:
+# malformed JSON is statement-terminating and always reached the catch, but Get-Content
+# failing is NON-TERMINATING under the installer's $ErrorActionPreference = 'Continue'.
+# Without -ErrorAction Stop the pipeline then yields nothing, the assignment lands $null
+# over the @{} default, the read-once memo never satisfies (every call re-reads and
+# re-errors), and every consumer reads an EMPTY manifest. The one that bites is
+# Test-PriorInstallFailed: it returns $false for a product that FAILED last run, bare ARP
+# presence skips its repair, and the run reports success forever.
+# The preference is flipped here on purpose - under this file's 'Stop' the bug is invisible.
+$script:Warned = 0
+function Warn($m) { $script:Warned++ }
+$ManifestPath = Join-Path $env:TEMP ("alleaves_manifest_test_{0}.json" -f [guid]::NewGuid())
+Set-Content -Path $ManifestPath -Value '{"installed":[{"name":"Zebra Scanner SDK","result":"fail"}]}' -Encoding UTF8
+$lock = [System.IO.File]::Open($ManifestPath, 'Open', 'Read', 'None')
+$script:PriorManifest = $null
+$ErrorActionPreference = 'Continue'
+try {
+    Get-PriorManifest | Out-Null
+    Get-PriorManifest | Out-Null      # memo: a second call must not re-read (and not re-Warn)
+} finally {
+    $ErrorActionPreference = 'Stop'
+    $lock.Close()
+    Remove-Item -LiteralPath $ManifestPath -Force
+}
+$state = "warned=$($script:Warned) memo=$(if ($null -eq $script:PriorManifest) { 'null' } else { 'hashtable' })"
+Assert-Eq 'warned=1 memo=hashtable' $state 'a locked manifest reaches the catch once and leaves the memo non-null'
 
 Write-Host ''
 if ($script:Failures) { Write-Host "$($script:Failures) FAILED" -ForegroundColor Red; exit 1 }
