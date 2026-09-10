@@ -30,7 +30,7 @@ $errs = $null
 $ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
 if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
 
-$wanted = @('Merge-PriorList', 'Get-PriorManifest')
+$wanted = @('Merge-PriorList', 'Get-PriorManifest', 'Test-PriorInstallFailed')
 $found  = @{}
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($wanted -contains $f.Name) { $found[$f.Name] = $f.Extent.Text }
@@ -99,12 +99,30 @@ $installed += @{ name='Zebra Scanner SDK'; result='ok'; method='wrapper-extract'
 $rows = @($installed | Where-Object { $_.name -eq 'Zebra Scanner SDK' })
 Assert-Eq 1  $rows.Count      'exactly one row survives for the fallback product'
 Assert-Eq 'ok' $rows[0].result 'and it is the fallback result, not the .iss attempt'
-# The two consumers that read it:
+# The consumer that reads 'result':
 $failed = @($installed | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
 Assert-Eq 0     $failed.Count 'the exit tally sees no failure'
-$priorFailed = [bool]@($installed | Where-Object { $_.name -eq 'Zebra Scanner SDK' -and $_.result -ne 'ok' }).Count
-Assert-Eq $false $priorFailed 'Test-PriorInstallFailed will not force a replay next run'
 Assert-Eq 'Chrome' $installed[0].name 'other products are untouched by the drop'
+
+Write-Host "`nTest-PriorInstallFailed treats an msi-fallback row as not-installed" -ForegroundColor Cyan
+# Neither fallback MSI carries the shared "Zebra CoreScanner Driver" the .iss install does.
+# So a fallback that "succeeded" leaves the product in ARP with result='ok' - the guard in
+# Invoke-InstallLoop skips it on every future run while CoreScanner stays absent, the run
+# exits 4 (scanner degraded) forever, and exit 4 printed remediation ("re-run the
+# installer") can never take effect. The loop stamps note='msi-fallback' for exactly this.
+function Warn($m) {}
+# Seeding the memo makes Get-PriorManifest return this without touching the disk.
+$script:PriorManifest = [pscustomobject]@{ installed = @(
+    [pscustomobject]@{ name='Chrome';            result='ok'                             }
+    [pscustomobject]@{ name='Zebra Scanner SDK'; result='ok'; note='msi-fallback'         }
+    [pscustomobject]@{ name='Zebra 123 Scan';    result='ok'; note='already-installed'    }
+    [pscustomobject]@{ name='POS for .NET';      result='fail'                            }
+) }
+Assert-Eq $false (Test-PriorInstallFailed -Name 'Chrome')            'a plain ok row still short-circuits on ARP'
+Assert-Eq $true  (Test-PriorInstallFailed -Name 'Zebra Scanner SDK') 'an msi-fallback ok row forces the .iss to be re-attempted'
+Assert-Eq $false (Test-PriorInstallFailed -Name 'Zebra 123 Scan')    'note=already-installed is NOT confused with the fallback stamp'
+Assert-Eq $true  (Test-PriorInstallFailed -Name 'POS for .NET')      'a failed row still forces a repair'
+Assert-Eq $false (Test-PriorInstallFailed -Name 'NiceLabel')         'no prior row at all = trust the registry'
 
 Write-Host "`nGet-PriorManifest does not read an unreadable manifest as empty" -ForegroundColor Cyan
 # The manifest is LOCKED here (AV / a backup agent holding it open), not malformed:
@@ -133,6 +151,61 @@ try {
 }
 $state = "warned=$($script:Warned) memo=$(if ($null -eq $script:PriorManifest) { 'null' } else { 'hashtable' })"
 Assert-Eq 'warned=1 memo=hashtable' $state 'a locked manifest reaches the catch once and leaves the memo non-null'
+
+Write-Host "`nUninstall step 4b survives a STALE regValuesSet row" -ForegroundColor Cyan
+# Remove-StalePrinterOpos retires a device key but deliberately leaves its rows to merge
+# forward, so after any computer rename (or the drawer retirement reaching a deployed
+# terminal) all 28 of them point at a path that no longer exists - FOREVER. Both arms used
+# to mishandle that: the delete arm threw (Remove-ItemProperty on a missing path, -Stop,
+# straight into the counting catch = ~27 "reversal failures" and exit 1 on a decommission
+# that actually succeeded), and the restore arm New-Item'd the retired key back, RESURRECTING
+# the phantom OPOS device. Lifted as the real loop body, run against a scratch HKCU key.
+$uninst = $null
+foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($f.Name -eq 'Invoke-UninstallPhase') { $uninst = $f }
+}
+if (-not $uninst) { Write-Host 'FAIL: Invoke-UninstallPhase not found' -ForegroundColor Red; exit 1 }
+$rvLoop = @($uninst.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.ForEachStatementAst] -and
+    $n.Variable.VariablePath.UserPath -eq 'rv' }, $true))
+if ($rvLoop.Count -ne 1) { Write-Host "FAIL: expected one foreach (`$rv), found $($rvLoop.Count)" -ForegroundColor Red; exit 1 }
+
+function Ok($m)   { }
+function Warn($m) { }
+function Dry($m)  { }
+$DryRun = $false
+$Restore4b = [scriptblock]::Create(@"
+param(`$man)
+`$uninstallFailures = 0
+$($rvLoop[0].Extent.Text)
+return `$uninstallFailures
+"@)
+
+$root  = 'HKCU:\Software\AlleavesAutoTest'
+$live  = "$root\Live"
+$gone  = "$root\Retired"          # never created: the retired device key
+Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -Path $live -Force | Out-Null
+New-ItemProperty -Path $live -Name 'DeviceName' -Value 'POS01_Printer' -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $live -Name 'PortName'   -Value 'OURS'          -PropertyType String -Force | Out-Null
+try {
+    $fails = & $Restore4b ([pscustomobject]@{ regValuesSet = @(
+        # stale delete rows - the key is gone, so is the goal
+        [pscustomobject]@{ path=$gone; name='DeviceName'; prevAbsent=$true                       },
+        [pscustomobject]@{ path=$gone; name='(default)';  prevAbsent=$true                       },
+        # stale RESTORE row - must not re-create the retired key
+        [pscustomobject]@{ path=$gone; name='PortName';   prevAbsent=$false; prev='X'; type='String' },
+        # the real work still has to happen
+        [pscustomobject]@{ path=$live; name='DeviceName'; prevAbsent=$true                       },
+        [pscustomobject]@{ path=$live; name='PortName';   prevAbsent=$false; prev='THEIRS'; type='String' }
+    ) })
+    Assert-Eq 0        $fails                            'stale rows count as ZERO reversal failures'
+    Assert-Eq $false   (Test-Path -LiteralPath $gone)    'the retired device key is NOT resurrected by the restore arm'
+    Assert-Eq $null    (Get-ItemProperty -Path $live -Name 'DeviceName' -ErrorAction SilentlyContinue) 'a value that IS there is still deleted'
+    Assert-Eq 'THEIRS' (Get-ItemProperty -Path $live -Name 'PortName').PortName 'a value we overwrote is still restored'
+} finally {
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ''
 if ($script:Failures) { Write-Host "$($script:Failures) FAILED" -ForegroundColor Red; exit 1 }

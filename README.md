@@ -136,14 +136,18 @@ run — prompts for the computer name before proceeding; otherwise it runs unatt
 
 ### Exit codes
 
-`0` success · `1` install/uninstall failure · `2` mode ambiguity · `3` not elevated ·
+`0` success · `1` install/uninstall/finishing failure — finishing covers the master list copy, the
+Chrome bookmark policy, the computer rename, the per-user logon task, a **TeamViewer removal that
+failed** (the terminal still has third-party remote access on it) and a taskbar step that produced
+no pins at all · `2` mode ambiguity · `3` not elevated ·
 `4` scanner degraded (CoreScanner missing — re-run) · `5` working-dir creation failed ·
 `6` the USB-OPOS switch failed (re-run with the scanner attached) — during a full install this
 means a scanner was connected and could not be switched; under `-ScannerConfigOnly` it also covers
 a run that switched nothing at all ·
 `7` OPOS receipt-printer registration failed (re-run, or use `-PrinterConfigOnly`) — also
 returned when the chosen brand's OPOS values have not been captured yet, which is currently the
-case for `StarTSP100` ·
+case for `StarTSP100`, and when an entry left under a **previous computer name** could not be
+removed (the terminal would otherwise advertise two OPOS printers, one of them dead) ·
 `8` account precheck failed **and was not overridden** — the terminal is not signed into a local
 administrator account (Microsoft account, domain/Entra account, standard user, no interactive user,
 or an account whose type could not be determined), and neither `-IgnoreAccountCheck` nor the
@@ -170,6 +174,7 @@ On a block, an **interactive** run offers to fix it rather than just printing in
 | --- | --- |
 | Local account, not an administrator | Promote it in place, then reboot. You sign back in normally — no password is handled or stored. |
 | Microsoft / domain / Entra / undetermined | Create a new local admin (it prompts for a name and password), arm a **one-shot** auto sign-in, then reboot straight into it. |
+| Run as SYSTEM / a service identity (no console session) | **No offer.** Nothing is wrong with the account — relaunch the `.bat` from a signed-in console session. You still get the *continue anyway* prompt. |
 
 Either way the installer registers a logon task that re-runs itself with the same arguments, so the
 install resumes by itself and you answer the computer-name and printer-brand prompts there. It

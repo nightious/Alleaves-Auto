@@ -31,7 +31,7 @@ $errs = $null
 $ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
 if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
 
-$wanted = @('Get-MicrosoftAccountId','Get-MsaLinkedEmail','Test-InstallAccount',
+$wanted = @('Get-MicrosoftAccountId','Get-MsaLinkedEmail','Get-IdentityStoreEmail','Test-InstallAccount',
             'ConvertTo-ResumeArgs','Confirm-Swap','Read-SwapAnswer','Restore-AutoLogon',
             'Set-AccountCheckOverride','Clear-AccountSwapState')
 $found = @{}
@@ -195,12 +195,16 @@ function Dry($m) {}
 function Test-Path { param($Path, $LiteralPath, $ErrorAction) $true }
 function Get-Content { param($Path, [switch]$Raw, $EA, $ErrorAction) if ($null -eq $script:MarkerBody) { throw 'truncated' }; $script:MarkerBody }
 function Unregister-ScheduledTask { param($TaskName, [switch]$Confirm, $EA, $ErrorAction) $script:Unregistered++ }
+# The unregister is VERIFIED, not assumed - this stub is what lets case 4 below exist.
+function Get-ScheduledTask { param($TaskName, $EA, $ErrorAction)
+                             if ($script:TaskSurvives) { [pscustomobject]@{ TaskName = $TaskName } } }
 function Restore-AutoLogon($prior) { $script:Restored++ }
 function Remove-Item { param($Path, [switch]$Recurse, [switch]$Force, $EA, $ErrorAction)
                        if ("$Path" -eq $AccountSwapMarker) { $script:MarkerDeleted++ } else { $script:ResumeDirDeleted++ } }
 
 function Reset-SwapStubs { $script:Unregistered=0; $script:MarkerDeleted=0; $script:Restored=0; $script:ResumeDirDeleted=0
-                           $script:AccountSwapAttempted=$false; $script:AccountSwapDone=$null }
+                           $script:AccountSwapAttempted=$false; $script:AccountSwapDone=$null
+                           $script:TaskSurvives=$false }
 
 # 1. -DryRun must touch NOTHING. A tech who armed a swap and then ran -DryRun to re-check
 #    the verdict had the (elevated) dry run silently disarm it, and the box rebooted into
@@ -232,6 +236,17 @@ Assert-Eq 1        $script:Unregistered            'resume: task unregistered'
 Assert-Eq 1        $script:Restored                'resume: autologon restored'
 Assert-Eq 1        $script:MarkerDeleted           'resume: marker deleted'
 Assert-Eq 'POS01\till' $script:AccountSwapDone.name 'resume: the account reaches the manifest seed'
+
+# 4. A resume task that SURVIVED the unregister must keep the marker. Deleting it there
+#    was the worst state available: the task relaunches a script this function just
+#    deleted, at every logon, forever, and the marker that brings this function back is
+#    gone - with the warning printed before Start-Transcript, so in no log either.
+Reset-SwapStubs; $script:TaskSurvives = $true
+$script:MarkerBody = '{"account":"POS01\\till","sid":"S-1-5-21-1-2-3-1001","created":true,"winlogonPrior":{}}'
+Clear-AccountSwapState
+Assert-Eq 0 $script:MarkerDeleted    'surviving resume task: the marker is KEPT so the next run retries'
+Assert-Eq 0 $script:ResumeDirDeleted 'surviving resume task: the staged script it launches is kept too'
+Assert-Eq 1 $script:Restored         'surviving resume task: autologon is STILL restored (never left armed)'
 
 Write-Host "`nSet-AccountCheckOverride records the waiver" -ForegroundColor Cyan
 # The precheck prints BEFORE Start-Transcript, so this hashtable is the only

@@ -14,8 +14,10 @@
       caps at ~8191 chars and would silently truncate the ~40 KB blob), decodes
       it with 64-bit PowerShell (Sysnative), runs the .ps1 synchronously in the
       elevated console, and propagates the exit code.
-    - Self-verifies: decodes the embedded base64 back and confirms byte-length
-      AND SHA256 identity to the source.
+    - Self-verifies by re-reading the .bat IT JUST WROTE: pulls the base64 back
+      out of the emitted echo lines, decodes it, and confirms byte-length AND
+      SHA256 identity to the source. Verifying the in-memory chunks instead
+      would be circular and could never catch a transport-emission defect.
 #>
 
 [CmdletBinding()]
@@ -78,8 +80,17 @@ $L.Add('if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" 
 $L.Add('')
 $L.Add("REM --- Transport base64 via a TEMP FILE (cmd env vars truncate at ~8191).")
 $L.Add("if exist `"%TEMP%\$b64File`" del /f /q `"%TEMP%\$b64File`"")
+# Redirection FIRST, command second: ">>file echo <chunk>" rather than
+# "echo <chunk>>>file". cmd reads a digit sitting just before a redirection
+# operator as a HANDLE (the classic "echo done 2>log" trap), and 11 of the ~102
+# base64 chunks currently end in 0-9. Measured on Win11 26200 the glued form is
+# in fact safe - cmd only takes the digit as a handle when a delimiter precedes
+# it, and the base64 alphabet (A-Za-z0-9+/=) never puts a space before that last
+# character - so this is belt-and-braces, not a live bug. It costs nothing, it
+# removes the need for the next reader to re-derive that parsing subtlety, and
+# nothing else in the alphabet is a cmd metacharacter (+ / = are all inert here).
 foreach ($c in $chunks) {
-    $L.Add("echo $c>>`"%TEMP%\$b64File`"")
+    $L.Add(">>`"%TEMP%\$b64File`" echo $c")
 }
 $L.Add('')
 $L.Add('REM --- Decode the base64 file back to the original .ps1 bytes.')
@@ -115,8 +126,25 @@ $content = ($L -join "`r`n") + "`r`n"
 [IO.File]::WriteAllText($OutBat, $content, (New-Object System.Text.ASCIIEncoding))
 Write-Host "Wrote:   $OutBat ($((Get-Item $OutBat).Length) bytes)"
 
-# --- Self-verify: decode the embedded base64 back and compare to source ----
-$decoded = [Convert]::FromBase64String(($chunks -join ''))
+# --- Self-verify: decode the base64 back OUT OF THE WRITTEN .bat -----------
+# Deliberately NOT $chunks: that variable IS the source by construction, so
+# comparing it to the source can only ever pass. It cannot see a defect
+# introduced while emitting the transport (a mangled echo line, a character the
+# cmd parser eats, a dropped or reordered line) - which is the only kind of
+# corruption this build step can actually cause. So re-read the file we just
+# wrote and decode what the client's cmd will really append.
+# [Convert]::FromBase64String ignores whitespace, which is what lets this join
+# the lines back with no separator handling - and is also why the client's
+# ReadAllText of the CRLF-separated temp file decodes cleanly.
+$prefix  = ">>`"%TEMP%\$b64File`" echo "
+$emitted = [IO.File]::ReadAllLines($OutBat) |
+           Where-Object   { $_.StartsWith($prefix, [StringComparison]::Ordinal) } |
+           ForEach-Object { $_.Substring($prefix.Length) }
+$decoded = [byte[]]@()
+# Corrupt base64 THROWS; catch it so a bad build still reports through the
+# RESULT line / exit 1 contract below instead of dying with a stack trace.
+try   { $decoded = [Convert]::FromBase64String(($emitted -join '')) }
+catch { Write-Host "  decode of emitted lines FAILED: $($_.Exception.Message)" -ForegroundColor Red }
 $srcHash = (Get-FileHash -Path $Source -Algorithm SHA256).Hash
 $tmp = [IO.Path]::GetTempFileName()
 [IO.File]::WriteAllBytes($tmp, $decoded)

@@ -17,8 +17,11 @@ plus the printer OPOS field-results table; `scanner/` holds the no-PC barcode fa
 ## Build & run
 
 - **Build:** `.\build-bat.ps1` packs `alleaves_setup.ps1` → `Install-Alleaves.bat` and
-  self-verifies (SHA256). **Always rebuild the `.bat` after editing the `.ps1`** — it won't pick
-  up edits otherwise. Never hand-edit the `.bat`.
+  self-verifies (SHA256) by decoding the base64 back **out of the `.bat` it just wrote**, not out
+  of the in-memory `$chunks` — `$chunks` *is* the source by construction, so that comparison could
+  only ever pass and could never see the one corruption this step can actually cause (a mangled,
+  dropped or reordered echo line). **Always rebuild the `.bat` after editing the `.ps1`** — it
+  won't pick up edits otherwise. Never hand-edit the `.bat`.
 - **Run (target terminal):** `Install-Alleaves.bat` (self-elevates once). The `.ps1` `param()`
   block / README's table is the authoritative option set — notably `-Uninstall`, `-DryRun` (no
   admin), `-ForceReinstall`, `-ComputerName`, the `-Skip*` flags, and `-ScannerConfigOnly` (run
@@ -67,21 +70,42 @@ Major function groups in `alleaves_setup.ps1`:
 - Naming: `Verb-Noun` PascalCase functions (`Invoke-*`, `Get-*`), PascalCase globals (`$LogDir`,
   `$Installers`), camelCase manifest keys (`filesPlaced`, `exitCode`, `scannerConfigured`).
 - Idempotency: registry lookup before install/uninstall; manifest **merge** (never drop prior
-  items); cached extracted MSIs skip future wrapper runs. Guard state changes behind `-DryRun`.
+  items); cached extracted MSIs skip future wrapper runs. Guard state changes behind `-DryRun`,
+  **flags included** — every check in `Copy-MasterList` sits below its dry-run return, because a
+  mode that writes nothing must not raise `$FinishFailed` and produce a phantom exit 1.
+- Anything that **records** a command line redacts `LICENSECODE=` (`$safeArgs`: the manifest's
+  `args`, the console, so the transcript); `$ArgList` reaches the installer untouched. The manifest
+  survives `-Uninstall` under world-readable `%ProgramData%`, so the key outlived the install.
 - TLS 1.2 forced before any network call (stock Win10 defaults too low for the CDNs).
+- `Set-TrackedRegValue`'s `ValidateSet` is **`'String','DWord'` only** — the two every caller uses.
+  The Binary / QWord / MultiString / ExpandString arms were dead and each carried a latent restore
+  bug (a MultiString prev stringifies to a space-joined scalar; an ExpandString prev comes back
+  already expanded; `type` recorded what we *wrote*, not the prior kind). Add one back — capturing
+  the prior type via `GetValueKind()` — only when a caller genuinely needs it.
 - **Exit codes** are an RMM contract set in the `$exitCode` dispatch tail (verify there): `0` ok ·
   `1` install/uninstall/download/**finishing** fail (`$script:FinishFailed` — the master-list
   copy, the Chrome bookmark policy, the logon-task staging/registration, a failed **computer
-  rename**, and a failed `Disable-TrackedTask` write no `$Manifest.installed` row, so the tally
-  could not see them and they exited 0; a failed rename also silently poisons the OPOS device
+  rename**, a failed `Disable-TrackedTask`, a failed **TeamViewer removal** (third-party remote
+  access left on the box is a security outcome, not a cosmetic one), and **either** total-taskbar
+  arm in `Invoke-ChromeTaskbar` — neither product installed, or no per-user layout written — all
+  write no `$Manifest.installed` row, so the tally could not see them and they exited 0; a failed
+  rename also silently poisons the OPOS device
   names, since `Get-PosNamePrefix` correctly falls back to the *current* name. A manifest that
   could not be written is its own flag, `$script:ManifestWriteFailed`, read **after**
   `Save-Manifest` — the tally itself is still snapshotted before it) · `2` mode
   ambiguity · `3` not elevated · `4` scanner
-  degraded (CoreScanner missing) · `5` working-dir failed · `6` scanner present but switch failed ·
-  `7` OPOS receipt-printer registration failed · `8` account precheck failed and was not
+  degraded (CoreScanner missing; its printed "re-run the installer" only became real once
+  `Test-PriorInstallFailed` started rejecting a `note='msi-fallback'` row — see that bullet) ·
+  `5` working-dir failed · `6` scanner present but switch failed ·
+  `7` OPOS receipt-printer registration failed — including a **stale device that could not be
+  retired** (the two-OPOS-printers state the retirement exists to prevent, `SubKeyCount` refusal
+  included), a brand-switch key that could not be cleared, and a brand with **zero** devices ·
+  `8` account precheck failed and was not
   overridden (not signed into a local admin account) · `9` account swap armed, rebooting to resume. `4`/`6`/`7` are non-fatal
-  "re-run" codes that only set when nothing else failed — never masking `1`. `2`/`3`/`5`/`8`/`9`
+  "re-run" codes that only set when nothing else failed — never masking `1`, and they live in
+  **one** copy after the branch `if/elseif/else` (gated `-not $Uninstall`), printing after
+  `Step 'Done'`: the config-only and install branches each used to carry their own and the wording
+  had already drifted. `2`/`3`/`5`/`8`/`9`
   are pre-dispatch `exit`s, before the try/`$exitCode` machinery and before `Start-Transcript` —
   console-only, nothing logged to file. `9` is distinct from `8` on purpose: `8` means blocked and
   nothing was done, `9` means the box is coming back to finish itself, so an RMM must not dispatch.
@@ -109,7 +133,11 @@ Major function groups in `alleaves_setup.ps1`:
   (its `TODO[rig]` says neither probe was ever confirmed on a real MSA box) was also the only one
   failing *open*. `PrincipalSource` is asked first and believed both ways; the IdentityStore cache
   is the fallback, and its *absence* can't tell "local" from "this build doesn't populate it" — so
-  that path is `'unknown'`, not a pass. An Entra SID (`S-1-12-1-*`) with no `DOMAIN\` prefix gets
+  that path is `'unknown'`, not a pass. That cache probe is **one** function, `Get-IdentityStoreEmail`,
+  shared with `Get-MsaLinkedEmail`: it returns the email or `$null` and decides nothing, because it
+  is the probe most likely to change and two byte-identical copies drift. Each caller maps "no
+  answer" itself — `'unknown'` (block) for the verdict, a display string for the message.
+  An Entra SID (`S-1-12-1-*`) with no `DOMAIN\` prefix gets
   its own arm: same verdict as before, but it used to report "no interactive user".
   `tests\Test-AccountPrecheck.ps1` lifts these functions out with the AST and stubs the probes, so
   every arm is checkable without a matching real account — the `-DryRun` print can only ever
@@ -120,7 +148,12 @@ Major function groups in `alleaves_setup.ps1`:
   verdict is overridable, including `microsoft-account`. Traps:
   - **`-IgnoreAccountCheck` is tested FIRST**, before `-DryRun` and before the offer: an RMM run
     must never reach a `Read-Host`, and `-DryRun -IgnoreAccountCheck` should report what the real
-    run would *do* (continue), not an offer it would never make.
+    run would *do* (continue), not an offer it would never make. Same reason **`$wouldOffer` is one
+    expression** read by both the preview and the real dispatch: the two used to disagree, so the
+    dry run promised an offer the real run refuses. It excludes the loop guard, and it excludes
+    **`service-account`** — nothing about the *account* is wrong there, so having the tech type a
+    new admin password "fixes" a run whose only fault was having no console session (that verdict
+    is excluded from the printed remediation for the same reason).
   - **The prompt reuses `Confirm-Swap`** — it already defaults to NO and its `Read-SwapAnswer` is
     try/catch'd, so a headless host reads as "no" and still exits 8. Don't add a second prompt
     helper, and don't give it a default of yes.
@@ -168,13 +201,36 @@ Major function groups in `alleaves_setup.ps1`:
     the `if ($m)`**: the task name is a constant and never needed the marker, but while it lived
     inside, an unreadable marker (power-off mid-write) skipped the unregister while the marker
     was deleted anyway — the resume task then relaunched the installer at every logon, forever,
-    with the only record of it gone.
+    with the only record of it gone. **The unregister is VERIFIED, not assumed** (`Get-ScheduledTask`
+    after it): everything past that point destroys the ability to retry — the marker is the only
+    thing that brings this function back and the staged copy is the script the task launches — so
+    a task that survived keeps both, and only autologon is restored unconditionally, because
+    *that* is the piece that must never stay armed.
   - `Confirm-Swap` defaults to **NO** and `Read-SwapAnswer` catches (F14): consent to create an
     account and reboot must never be inferred from a headless host's empty read.
+  - **The resume staging is the `$rollback`'s first customer, so it is defined below it.** Staged
+    *above* it, with nothing to call, a failed `Copy-Item` landed on exit 8 leaving directories
+    under `%ProgramData%` on a box the precheck had just refused — the one thing the ordering
+    exists to prevent. The rollback removes those parents **only while empty**, non-recursively:
+    on a re-run they are the working root.
+  - **"Already a member" is matched on `FullyQualifiedErrorId`, never the message text** — the
+    message is localized, so on a non-English Windows `-notmatch 'already a member'` fired on a
+    promotion that had *succeeded* and rolled the whole swap back. `Test-LocalAdminSid` dodges the
+    same trap by resolving the group from `S-1-5-32-544`.
   - `accountCreated` is `removable=$false`, like the rename / TeamViewer removal. `-Uninstall` must
     never delete it — the terminal is signed into it and its Documents holds the `.nlbl`.
 - The master list is a `.nlbl` — copy **as-is, never unzip** (the "encryption" is NiceLabel's
   internal format); copied into every real user profile's Documents (`Get-TargetUserProfiles`).
+  That enumeration means "a human who will use this terminal", not "a domain-shaped SID": **RID ≥
+  1000**, and no `.bak` keys. `S-1-5-21-*` alone also matches Guest (501), `DefaultAccount` (503),
+  `WDAGUtilityAccount` (504) and OEM `defaultuser0` — each was collecting a taskbar layout *and* a
+  copy of the master list — and Windows renames a broken profile's key to `<sid>.bak` while
+  creating a fresh one pointing at the **same** directory, so accepting both writes everything twice.
+- NiceLabel's uninstall verdict includes its **services**: `sc.exe delete`'s exit code is the only
+  answer available (it writes failures to *stdout*, so the old `2>$null` suppressed nothing and the
+  green "removed NiceLabel service" line printed over 1072 `MARKED_FOR_DELETE` and 5 alike), and
+  nothing downstream re-checks services — a survivor fails the pass here or `-Uninstall` exits 0
+  with NiceLabel still registered.
 - NiceLabel gets an explicit service / registry / ProgramData sweep on uninstall, and must **never
   be pre-cleaned on reinstall**: the raw suite installer reinstalls cleanly over itself, but
   pre-cleaning strips its MSI while bootstrapper state lingers, so the reinstall becomes a *repair*
@@ -199,13 +255,34 @@ Major function groups in `alleaves_setup.ps1`:
     status **112**); `Confirm-ScannerServicesReady` starts the Zebra services and
     `Invoke-ScannerHostSwitchResilient` retries 112 to *attempt* the switch in-session before the
     reboot. On terminal failure `Show-ScannerBarcodeFallback` prints the one-scan fallback (exit 6,
-    non-fatal); no scanner attached = benign Warn, exit 0.
+    non-fatal); no scanner attached = benign Warn, exit 0. **`Confirm-ScannerServicesReady`'s
+    verdict is used, never discarded**, at both call sites: a CoreScanner that is not Running is
+    the one condition the 112 retries cannot fix (all they do is re-run that same check), so it
+    bails with `result='rsm-unavailable'` + exit 6 instead of spending the retry budget and a 40 s
+    re-enumeration ceiling per hop. Hop 2 carries hop 1's 112 short-circuit and status `Warn` too —
+    without them a hop-2 112 returned `fail` having printed nothing about `$st2`.
+  - **Every bail records a `scannerConfigured` row, the outer catch included** (`result="error: …"`,
+    exit 6): a blocked Interop DLL, an unregistered COM class or an `Open()` against a dead service
+    all throw before the device loop, and an empty `scannerConfigured` is indistinguishable from a
+    step that never ran. `Open()` is paired with `Close()` in the `finally` — `ReleaseComObject`
+    drops our RCW but leaves the application session registered with the service.
+  - **An enumeration *failure* must not look like an empty terminal.** `Get-CoreScannerInventory`
+    sets a distinct NEGATIVE `$script:ScannerInventoryStatus` for a malformed `OutXML` (`-2`) and
+    for "GetScanners reported N but nothing parsed" (`-3`, the `[ref] $count` that was never read);
+    each node parses under its own try, so one node missing a `<scannerID>` no longer discards the
+    scanners already parsed. An empty list with status **0** takes the benign `no-scanner` arm — no
+    flag, exit 0 — with a scanner physically attached in HID-KB.
   - Per-mode PIDs, hop/settle timing, retry counts, and post-switch verification are rig-dependent
     (`RIG-DEPENDENT` / `TODO[rig]` in `Set-ScannerOpos`; `Get-ScannerHostMode` / `$ScannerServiceNames`
     hold current values — read those, don't copy them here). Confirmed on DS2208; other models and a
     real in-session 112→recovery run still pending — capture with `-ScannerConfigOnly
     -ForceFingerprint` (forces the `Write-NewScannerFingerprint` dump for an already-known model;
     lands in `logs\`), log to `docs/` (running table in `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md`).
+    The dump also fires on a **blank** model, under an `unknown-model` placeholder: a HID-KB start
+    reports blank until a hop re-enumerates the unit, so gating it on a non-empty model wrote
+    nothing in exactly the documented rig case — an unvalidated family in factory HID-KB whose hop 1
+    fails — and `-ForceFingerprint` was silently ignored there. The `newModel` **flag** still needs
+    a reported model that misses the regex; a blank one proves nothing.
   - `$ScannerKnownModels` (which models skip the new-model fingerprint dump) is a **family regex**,
     not a list: CoreScanner's `<modelnumber>` is the full kit/config SKU (`DS2208-SR7U2100SGW`),
     never the bare family name, so it's matched with `-notmatch` on the prefix. Add families with
@@ -247,6 +324,12 @@ Major function groups in `alleaves_setup.ps1`:
     readback loops verify nothing, and the step reports `ok` after creating an **empty device
     key** — a phantom device plus a false success. Never "stub" those tables with plausible
     values; that guard is the only thing standing between a stubbed build and a silent lie.
+    A brand with **no devices at all** needs its own test beside it (`$noDevices`): an empty
+    pipeline yields no matches, so it slipped past `$uncaptured`, the device loop iterated zero
+    times, `$allOk` stayed `$true`, and a full install landed on the trailing "nothing registered"
+    `Warn` and exited **0** under a green banner having registered nothing. Count it **filtered** —
+    `@($null)` is an array of one `$null`, so a missing `Devices` key counts as one device — and
+    that trailing `else` now sets `$script:PrinterConfigFailed` unconditionally.
   - **The device values are CAPTURED, never authored.** They came from diffing a real
     `SetupPOS.exe` run (28 printer values). Deriving them from `Thermal.inf` gives a subtly
     wrong key — `Description` and `PortShare` are in neither section of it. If the package
@@ -262,6 +345,25 @@ Major function groups in `alleaves_setup.ps1`:
     (never a device another vendor created). That test is an **exact match against this run's
     LDNs**, not a prefix match: a prefix match cannot retire a device dropped from the table,
     which is how the removed `<POSname>_Drawer` reaches already-deployed terminals.
+    A retired device's `printerConfigured` / `regValuesSet` / `regKeysCreated` rows are
+    deliberately **left to merge forward** — but that is only tolerable *because* uninstall step
+    4b now skips a value that is already gone and refuses to `New-Item` a key back just to restore
+    into it. It was never automatic: `Test-Path` covered `regKeysCreated`, while
+    `Remove-ItemProperty` on a retired device's path **throws**, `-ErrorAction Stop` fed it to the
+    counting catch, and ~27 phantom "reversal failures" made every decommission after a rename
+    exit 1 forever — while a `prevAbsent=$false` row's restore arm *recreated* the retired key,
+    resurrecting the phantom device the uninstall exists to remove.
+  - **POS-X and Star share both `Class` (`POSPrinter`) and `Suffix` (`_Printer`)**, so on a brand
+    switch the key path is byte-identical and nothing else notices: `Remove-StalePrinterOpos` reads
+    the same LDN as "this run's own name", and the write and readback loops only ever touch the
+    *new* brand's value names, so neither looks for values that shouldn't be there. The step printed
+    `ok` on a key that was half POS-X and half Star (stale `ADKConfig` / `DrawerOpen` / `PortShare`).
+    `Set-PrinterOpos` therefore clears the key first when the **prior manifest** records a different
+    `brand` for that logical name — gated on that record rather than deleting unconditionally, which
+    would throw away the `prev` state captured for a key a manual `SetupPOS` run created. Same
+    `SubKeyCount` guard as the stale-device removal; a failed clear still writes the new values (a
+    mixed key beats no key) but sets `$script:PrinterConfigFailed`, since exit 7 is the only thing
+    that tells the tech to look.
   - **The driver must be present before the entry is written** (`Find-InstalledProducts
     -Pattern $brandDef.ArpPattern`, skipped under a **full-install** `-DryRun` only — under
     `-DryRun -PrinterConfigOnly` the check still runs, because nothing installs anything in
@@ -305,7 +407,12 @@ Major function groups in `alleaves_setup.ps1`:
     that just failed to be replaced. If any device fails, skip the call entirely. It also
     applies the uninstall path's `SubKeyCount` guard: a non-recursive `Remove-Item` on a key
     with children raises `ShouldContinue`, which prompts on an interactive host and *throws* on
-    an RMM one, silently defeating the removal.
+    an RMM one, silently defeating the removal — and that refusal is **counted, not silent**:
+    the function returns the number of stale devices still standing and the call site turns a
+    non-zero count into `$script:PrinterConfigFailed` → exit 7. A survivor *is* the
+    two-OPOS-printers state (Alleaves can open the dead `<OLDNAME>_Printer`), so reporting exit 0
+    would tell the RMM the advertised rename fix landed when it did not — and exit 7's own
+    remediation, re-run with `-PrinterConfigOnly`, is exactly the retry that fixes it.
   - **Each device gets its OWN try/catch, and each catch sets `$script:PrinterConfigFailed`.**
     A shared catch means the printer's failure skips the drawer entirely. And that flag — *not*
     the config-only branch's `$changed` floor — is what produces exit 7 on a **partial** failure:
@@ -343,6 +450,10 @@ Major function groups in `alleaves_setup.ps1`:
     down 471 MB of Star payload, and vice versa. `None` is not a key, so it skips them all and
     the old behaviour falls out for free; `Set-PrinterOpos` then returns `result='skipped'`,
     returning *before* `Remove-StalePrinterOpos` — None is a skip, not a retro-uninstall.
+    **Every bail records a `printerConfigured` row**, `-SkipPrinterConfig` included
+    (`result='skipped:flag'`; `brand` is `-PrinterBrand` *as given*, empty when it wasn't, since
+    the flag suppresses the prompt) — a missing row could not tell "the tech suppressed it" from
+    "the run died before step 5b".
     ⚠️ **`-SkipPrinterConfig` with no `-PrinterBrand` falls back to `'POS-X'`, not empty.**
     That flag only means "don't write the OPOS entry" and it deliberately suppresses the
     prompt, so there is no answer to read. Leaving the brand empty made the loop skip *every*
@@ -397,15 +508,49 @@ Major function groups in `alleaves_setup.ps1`:
   recoverable by uninstall/reinstall). A deployed box holds the old DWORD `1`, which never
   equals a stamp, so it re-applies once and settles; compare as strings and write with
   `New-ItemProperty -Force -PropertyType String` (`Set-ItemProperty` would try to coerce
-  the string into the existing DWORD). `$script:FinishTaskbar` is set **only if at least one
+  the string into the existing DWORD). A generation that could **not** be persisted must not be
+  used: `$gen` still holds the timestamp minted a line earlier, and building the stamp from a value
+  that reached no disk means the next run mints a different one — inverting the generation's whole
+  job (stay stable across plain re-runs) into "clear the cashier's `Taskband` and restart Explorer
+  at every logon after every run". Reuse the prior manifest's recorded generation instead, and with
+  none to reuse say that consequence out loud. `$script:FinishTaskbar` is set **only if at least one
   per-user XML actually landed** — arming the task with no layout on disk is pure
   destruction (it deletes the cashier's pins and ours never appear).
+  **No path in this area is hardcoded to `C:\`.** `$StartMenuAll` comes from `%ALLUSERSPROFILE%`
+  (its twin already did, and the pair drifting from the *machine* puts the `.lnk` at one path while
+  the XML pins another) and the Default-profile XML from `ProfileList\Default`. `Write-XmlFile`
+  creates the whole directory chain, so on a relocated-profiles or non-`C:` box a hardcoded path
+  *manufactures* a junk tree, prints `[OK]`, adds it to `filesPlaced` — and every brand-new cashier
+  profile still gets no layout.
   **A pinned `.lnk` lives in TWO places.** Applying the layout makes Explorer *copy* the shortcut
   into each user's `…\Quick Launch\User Pinned\TaskBar`, so `filesPlaced` — which only knows the
   all-users source — leaves a pin pointing at a deleted exe (measured: survived a full
   `-Uninstall`). Uninstall step **4e** deletes `$TaskbarPinNames` from every profile's pinned
   folder; that list exists so install and uninstall can't drift, and it is an **exact** name match
   so another vendor's pin is never removed.
+- **The per-user finish logon task** (`Register-FinishLogonTask` + the generated finish script):
+  - `Register-ScheduledTask` needs **`-ErrorAction Stop`**, like every other task cmdlet here. It
+    is a CIM cmdlet, so under `'Continue'` a refused registration (policy, a locked Task Scheduler
+    store) skipped the catch, printed "registered", wrote a `scheduledTasksCreated` row for a task
+    that doesn't exist, left `$FinishFailed` clear and exited 0 — and a later `-Uninstall` then
+    failed to unregister the phantom and exited 1.
+  - The finish script is written **with a BOM**, unlike `Write-XmlFile`'s XML (which declares its
+    own encoding). PS 5.1 decodes a BOM-less `.ps1` as ANSI, and two machine values are baked into
+    the body — the install user and the taskbar stamp — so a non-ASCII tech account name mojibakes
+    both: the `$env:USERNAME -eq $installUser` test fails (the finish runs *for the tech*) and the
+    stamp never matches its marker, re-clearing the cashier's pins at every logon, forever.
+  - `Disable-TrackedTask` looks the task up with **`SilentlyContinue` + an explicit absence test**,
+    never `-Stop`: the caller gates on the UCPD *service* key while what is disabled is the UCPD
+    velocity *task* — separate objects that merely shipped together — so on a box where the task was
+    pruned (debloat script, custom image) `-Stop` made "does not exist" terminating, it landed in
+    the same catch as a refusal, and a healthy install exited 1. Only the `Disable` is a failure.
+  - **Chrome's ProgId is resolved at logon from HKCU**, with the install-time HKLM value only as a
+    fallback: a per-user Chrome registers a *suffixed* ProgId (`ChromeHTML.XXXXXXXX`) the
+    installer's machine-wide probe can't see, and a well-formed UserChoice for a ProgId that
+    doesn't exist still verifies `OK` while links keep opening Edge. Same self-confirming readback
+    as the **minute roll**: Windows validates the hash against the key's `LastWriteTime` truncated
+    to the minute, and four registry ops run between building it and the last `SetValue` — so
+    re-check the clock and rebuild rather than confirm a hash Windows will silently reject.
 - The four `Invoke-IssSilent` overrides (`ArgFormat`, `WaitNames`, `ReapNames`,
   `RegistryShortCircuit`) all **default to the original Zebra behaviour** — only a row that opts
   in changes anything, which is what keeps the validated Zebra path byte-identical. `ArgFormat`
@@ -423,7 +568,11 @@ Major function groups in `alleaves_setup.ps1`:
   $RegistryShortCircuit)`, so a `$false` family must show `ResultCode=0` in the response log
   (reachable — `/f2` forwarding is proven). Without that, a half-copied install was
   recorded `ok` and `Set-PrinterOpos`'s ARP driver guard then passed too, registering a device
-  aimed at a DLL that was never copied.
+  aimed at a DLL that was never copied. **Only a log THIS launch produced counts** — its
+  `LastWriteTime` is compared to `$launchTime`. The pre-run delete is best-effort by necessity
+  (`SilentlyContinue`), so a log held open by a crashed helper or an AV scanner survives it, and
+  reading the survivor served up the *previous* run's `ResultCode=0` — the entire verdict for a
+  `$false` family, handed to a PFTW stub that access-violated and wrote nothing.
 - **Star TSP100 futurePRNT is a RAW-EXE row, not an `Iss` one.** The package is InstallShield
   **Basic MSI** (`extract_all` / `IsConfig.ini` / `MsiExec` in its strings), a different animal
   from the POS-X PFTW/IS5 InstallScript stub, so **none** of the `Iss*` override machinery
@@ -456,14 +605,19 @@ Major function groups in `alleaves_setup.ps1`:
   virus-scan interstitial, **no `uuid` parameter needed** — and `Get-RemoteLength`'s
   `Content-Range` branch reads the total, so the truncation guard works too. The 566 MB
   `Zebra 123 Scan.exe` already proves the transport at this scale. A prior plan proposed
-  swapping in `curl.exe` plus a uuid scrape on a false premise; it was dropped.
+  swapping in `curl.exe` plus a uuid scrape on a false premise; it was dropped. `Test-RealBinary`'s
+  floor is **8 bytes, not 2**: the magic tests read `$buf[0..3]`, and when `Get-RemoteLength` can't
+  answer (`$expected = -1`) the Content-Length check is skipped entirely and this sniff is the last
+  truncation guard — a 2-byte `MZ` fragment was recorded `ok`, wrote its truncated size into the
+  `.len` sidecar and passed `Test-CachedFileValid` forever after: a permanent 1603.
 - **"Already installed" means SUCCESSFULLY installed.** Both idempotency guards in
   `Invoke-InstallLoop` consult `Test-PriorInstallFailed` (which reads the prior manifest via
   `Get-PriorManifest`) before letting ARP presence skip a product — an install that failed leaves
   exactly the registry state a later run reads as "done", so without this a broken product is never
   repaired and every re-run reports success. A product with **no** prior row still skips on ARP
-  alone (installed by hand or by an older build). Consequence to expect: a genuinely failing
-  product retries every run until it succeeds.
+  alone (installed by hand or by an older build), and an `ok` row carrying `note='msi-fallback'`
+  counts as **not** successfully installed (see the fallback bullet). Consequence to expect: a
+  genuinely failing product retries every run until it succeeds.
 - **The exit-code tally is snapshotted BEFORE `Save-Manifest`.** The merge carries prior-run rows
   forward for every product this run didn't touch (`-SkipPrograms`, `-PrinterBrand None`), so
   tallying after it counts an OLD failure as a new one — exit 1 forever, which then also suppresses
@@ -481,7 +635,17 @@ Major function groups in `alleaves_setup.ps1`:
   Four more were still uncounted until 2026-09-09: the step-1 file delete, the step-1b file
   restore, the step-4c UCPD task **re-enable**, and — worst — step 4b's `(default)` deletion,
   whose *inner* try/catch intercepted before the outer `$uninstallFailures++`; that is the value
-  whose survival leaves the phantom OPOS device, so it was the wrong one to swallow. The summary
+  whose survival leaves the phantom OPOS device, so it was the wrong one to swallow. Three more
+  after that: step 4d's **`Taskband` restore** catch (not the benign "hive not loaded" skip above
+  it — reaching the catch means the hive *is* loaded and the write was refused, so the cashier's
+  taskbar keeps our pins aimed at exes step 2 just uninstalled), step 1b's **"backup is gone"**
+  branch (unlike step 1's "already gone", here gone means the OEM layout is *unrecoverable* — the
+  same consequence as the catch two lines below it, which was counted), and
+  `Remove-InstallShieldOrphans`, which had no way to reach the counter at all and now **returns a
+  failure count** (the uninstall caller adds it; the install-side pre-clean caller `Out-Null`s it,
+  since there a leftover orphan already shows up as the `.iss` dropping into maintenance mode).
+  Step 1 also uses **`-LiteralPath`**, like 1b: `-Path` treats `[ ]` as wildcards, so a bracketed
+  path reported "already gone" and was skipped uncounted. The summary
   line says "reversal(s)", not "product(s)", because it has counted more than products for a while.
   The load-bearing case: `AlleavesAuto-FinishUser` surviving keeps clearing `Taskband` and
   re-applying our pins at every logon. Relatedly, the non-`(default)` value deletion is
@@ -492,15 +656,48 @@ Major function groups in `alleaves_setup.ps1`:
   `Merge-PriorList` only dedupes prior-vs-current, so both persisted. A run where the fallback
   *succeeded* therefore exited 1, and `Test-PriorInstallFailed` (any non-`ok` row) then returned
   `$true` forever — the 446 MB Zebra install replayed every run and could never short-circuit.
+  Three more things ride on that surviving row:
+  - It is stamped **`note='msi-fallback'`** (`result` stays `ok` — the exit tally must not count a
+    fallback that worked as a failure; this is about idempotency). Neither fallback MSI carries
+    the shared CoreScanner driver the `.iss` install does, so the product lands in ARP, the guard
+    skips it on every future run, CoreScanner stays absent and the run exits **4 forever** — with
+    its only advertised remediation, "re-run the installer", doing nothing. `Test-PriorInstallFailed`
+    treats the stamp as not-successfully-installed so the `.iss` path is re-attempted.
+  - Both fallbacks record the **broad `$uMatch`**, not `$i.Match`. The narrow pattern is right for
+    this item's own install-side checks and wrong for the manifest, which `-Uninstall` replays:
+    under `Zebra Scanner SDK` alone the shared `Zebra CoreScanner Driver (64bit)` was never
+    removed. For the same reason the uninstall orphan sweep gates on
+    `method -eq 'iss-silent' -or note -eq 'msi-fallback'` — the `.iss` row is *gone* by then, so a
+    method-only test skipped the sweep for exactly the products whose `.iss` attempt made the orphans.
+  - `Invoke-WrappedMsi` caches the extracted MSI **only after msiexec proves it installed**, under
+    the row's `CachedMsi` constant (`-CacheAs`), copied from the staged file msiexec actually ran.
+    Size-stabilization + the OLE sniff both pass a fragment left by a writer killed mid-extract,
+    and the copy is permanent and `Test-Path`-guarded, so that fragment 1603'd every future run
+    (`-ForceReinstall` included) until someone deleted it by hand; caching under the vendor's own
+    leaf name silently disabled the cache on any filename bump, since the fallback looks it up
+    under the constant. Its orphan reap uses the **exact** `$launchTime`, no minute of slack:
+    slack is safe in a *wait* filter, but here it decides what to force-kill and the two Zebra
+    rows run back to back.
+- **`Install-VcRedist` re-confirms presence, not just the exit code** — it is the one installer
+  routed around `Invoke-Installer`, so it never got `-ConfirmRegistry`, and it is also the one that
+  accepts **1638** ("a newer build is present"), which `Test-VcRedistPresent` had *disproved* a few
+  lines earlier. A child MSI blocked by policy or AV exits 1638 (or 0) having installed nothing:
+  recorded `ok`, CoreScanner then forces exactly the mid-install reboot this bootstrap exists to
+  prevent, and the run still exits 0.
 - **`$DriveFiles` `Label` must equal the matching `$Installers` `Name`** — not just for the
   printer rows. `Test-SkipMatch` tests `Label`/`File` for downloads but `Name`/`File` for
   installs, so a drifted Label makes one `-SkipPrograms` fragment hit only one phase
   (`-SkipPrograms NiceLabel` downloaded the whole suite and never installed it).
 - **`tests\`** holds the runnable self-checks, both AST-lifting functions out of the `.ps1` rather
   than loading it: `Test-AccountPrecheck.ps1` (verdict arms, `ConvertTo-ResumeArgs` **round-trip**
-  — not just its string shape, `Clear-AccountSwapState`'s dry-run/unreadable-marker arms) and
+  — not just its string shape, `Clear-AccountSwapState`'s dry-run/unreadable-marker arms plus the
+  **surviving resume task** case: marker and staged copy kept, autologon still restored) and
   `Test-ManifestMerge.ps1` (`Merge-PriorList` direction per list, the `serialFinal` key, the
-  `.iss` fallback row-drop). Both exit 0/1, no framework. Stub order matters in the first one —
+  `.iss` fallback row-drop, `Test-PriorInstallFailed`'s arms — notably that `note='msi-fallback'`
+  forces a replay while `note='already-installed'` does not — and uninstall step 4b's stale
+  `regValuesSet` rows, whose loop body is lifted whole and run against a scratch `HKCU` key so the
+  "counts zero failures / does not resurrect the retired device key" claim is actually executed).
+  Both exit 0/1, no framework. Stub order matters in the first one —
   the `Clear-AccountSwapState` section shadows `Restore-AutoLogon`/`Test-Path`/`Get-Content`/
   `Remove-Item`, so it must stay **last**.
 - Single elevation owner is `Install-Alleaves.bat`; the `.ps1` never self-relaunches — aborts if
