@@ -1,136 +1,185 @@
 # Alleaves-Auto
 
-Single-file, double-clickable bootstrap for deploying an **Alleaves POS** terminal
-onto a stock Windows 10/11 machine. No Python, no `gdown`, no shipped install folder —
-everything downloads and installs from one `.bat`.
+Single-file, double-clickable bootstrap for an **Alleaves POS** terminal on stock
+Windows 10/11. Everything downloads and installs from one `.bat`.
 
 ## Prerequisites
 
-- **Stock Windows 10 or 11** — no prior preparation needed.
-- **Local administrator rights** — the `.bat` self-elevates once via UAC on double-click.
-- **An active internet connection** reaching Google Drive and the vendor CDNs — every product is
-  downloaded at runtime, so there is no offline/bundled installer.
+- Stock Windows 10/11, internet access to Google Drive and the vendor CDNs (nothing is bundled).
+- **The terminal must be signed into a plain local administrator account** — not a Microsoft,
+  domain or Entra account. Typing a *different* admin's credentials at UAC does not satisfy it:
+  the signed-in profile is the one that will run the POS. Otherwise exit `8` — see
+  [Account precheck](#account-precheck-and-automatic-fix).
 
 ## What it installs
 
-In order:
+In order: Chrome → Alleaves Terminal → Zebra 123 Scan → Zebra Scanner SDK → POS for .NET →
+NiceLabel → the receipt-printer driver for the brand you pick (POS-X `OLE POS Setup`, or Star
+TSP100 futurePRNT). **Only the chosen brand is downloaded.** The VC++ 2015–2022 x64
+redistributable is bootstrapped first if missing (a Zebra CoreScanner prerequisite; left in
+place on `-Uninstall`).
 
-1. Google Chrome
-2. Alleaves Terminal
-3. Zebra 123 Scan
-4. Zebra Scanner SDK
-5. Microsoft POS for .NET
-6. NiceLabel
+Plus: the NiceLabel master list (`.nlbl`) copied into each user's Documents, a Splashtop SOS
+download (staged, never installed), and removal of any existing **TeamViewer**
+(`-SkipUninstallTeamViewer` keeps it).
 
-Before the Zebra installers it also bootstraps the **Microsoft Visual C++ 2015–2022 x64
-Redistributable** (a prerequisite for the Zebra CoreScanner driver), but only when it is missing.
-As a shared Microsoft runtime it is intentionally left in place on `-Uninstall`.
-
-Plus the NiceLabel master-list (`.nlbl`) copy and a Splashtop SOS download. Any existing
-**TeamViewer** install is removed by default (Splashtop SOS is the remote-access tool for these
-terminals) — pass `-SkipUninstallTeamViewer` to keep it.
-
-As the **final step**, any connected Zebra scanner is automatically switched to **USB-OPOS**
-so the Alleaves POS can read it — no more opening 123Scan to "Load to scanner" by hand. This
-uses the already-installed Zebra CoreScanner driver and is model-agnostic (DS2208, DS4608,
-DS8108, LI2208, MP7000, …). From the factory **USB HID-Keyboard** default it walks the scanner
-through the required **HID-Keyboard → IBM Hand-held → USB-OPOS** sequence; the change is permanent
-(survives power cycles). **If no scanner is plugged in during the run, that's fine** — the install
-still succeeds; just re-run `Install-Alleaves.bat` later with the scanner attached, or use the
-barcode fallback below (`scanner/Scanner_OPOS_barcode.pdf`).
+**Final step:** any connected Zebra scanner is switched to **USB-OPOS** via the CoreScanner
+driver — HID-Keyboard → IBM Hand-held → USB-OPOS, permanent across power cycles, model-agnostic.
+No scanner attached is fine: the install still succeeds; re-run later with
+`-ScannerConfigOnly`, or scan `scanner/Scanner_OPOS_barcode.pdf`.
 
 ## Per-terminal finishing
 
-Every install also applies a few per-terminal changes so the terminal is floor-ready:
+- **Computer rename** — interactive runs prompt early (Enter skips); unattended runs need
+  `-ComputerName "POS-1"`. Takes effect on the next reboot.
+- **Taskbar pins / Edge removal** — pins **Alleaves Terminal** and **Alleaves POS** (Chrome on
+  `https://app.alleaves.com`), replacing a plain Chrome pin, and removes Edge. The installer
+  creates both Start Menu shortcuts itself.
+- **Default browser** — Chrome.
+- **Alleaves bookmark** — a read-only bookmarks-bar folder applied machine-wide through Chrome's
+  enterprise policy, so Chrome reports "managed by your organization" (expected; the cashier
+  can't delete it).
 
-- **Computer rename** — on an interactive (double-clicked) run the installer pauses **early** to
-  prompt for the terminal's computer name (POS name/number); press **Enter** to skip. Preset it
-  non-interactively with `-ComputerName "POS-1"`, or disable the step with `-SkipRename`. The new
-  name takes effect on the next reboot. On an unattended/RMM run there is no prompt, so the terminal
-  is named **only** if you pass `-ComputerName`.
-- **Chrome taskbar pin / Edge removal** — pins Google Chrome to the taskbar and removes Microsoft
-  Edge from it. Skip with `-SkipChromeTaskbar`.
-- **Default browser** — sets Chrome as the default browser. Skip with `-SkipDefaultBrowser`.
+> The start page is a taskbar shortcut, not a policy: Chrome blocks `RestoreOnStartup` /
+> `HomepageLocation` on a machine that isn't AD/Entra-joined or CBCM-enrolled. Bookmark policies
+> aren't blocked, so the bookmark is a real policy.
 
-The taskbar pin and default-browser change are applied automatically at the next logon (via the
-`AlleavesAuto-FinishUser` task), so they take effect after the reboot below.
+Pins and the default browser apply at the next logon via the `AlleavesAuto-FinishUser` task;
+the bookmark applies the next time Chrome starts.
 
 ## After install — reboot
 
-The installer never auto-reboots (it uses `/norestart` throughout). **Reboot the terminal once** to
-finalize the Zebra CoreScanner driver and apply the computer rename, then **sign back in** so the
-`AlleavesAuto-FinishUser` logon task applies the Chrome taskbar pin and default-browser change. When
-a pending reboot is detected (e.g. the VC++ redistributable requested one), the run prints an
-emphatic `*** REBOOT REQUIRED ***` at the end.
+Nothing auto-reboots (`/norestart` throughout). **Reboot once**, then **sign back in** so the
+logon task runs. A pending reboot prints `*** REBOOT REQUIRED ***` at the end.
 
-Working root is `%ProgramData%\AlleavesAuto` — a `downloads\` folder and a `logs\` folder (the
-latter holds the per-run transcript **and** the install manifest) — so state survives a later
-`-Uninstall`.
+Working root `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`) survives `-Uninstall`.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `alleaves_setup.ps1` | The actual installer — native-PowerShell Google Drive download, silent install, manifest-driven uninstall. |
-| `build-bat.ps1` | Base64-packs `alleaves_setup.ps1` into the single deliverable `Install-Alleaves.bat` (self-verifies SHA256 byte-identity). |
-| `Install-Alleaves.bat` | **The deliverable.** Generated — do not hand-edit. Elevates once, decodes the embedded script, runs it. |
-| `scanner/Scanner_OPOS_barcode.pdf` | One-page printable **USB-OPOS programming barcode** — the DS2208 PRG "OPOS (IBM Hand-Held with Full Disable)" host-type barcode. Scan it once to set OPOS with zero PC software when no scanner was attached during the run; a single scan from the factory HID-Keyboard default, and the same barcode works across Zebra USB families. |
-| `scanner/Collect-ScannerFingerprint.ps1` | Standalone rig tool. **By default it walks the scanner** HID-KB → IBM Hand-held → USB-OPOS (the same two-hop the installer does) while capturing its host mode, USB PID, serial, and model to help finalize the rig-dependent `Set-ScannerOpos` constants; pass `-SnapshotOnly` to read the current state without changing anything. Not part of the install flow. |
-| `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Hardware-validation follow-on for the scanner USB-OPOS step (the design lives in the `Set-ScannerOpos` header comment in `alleaves_setup.ps1`). |
+| `alleaves_setup.ps1` | The installer — download, silent install, manifest-driven uninstall. |
+| `build-bat.ps1` | Base64-packs the `.ps1` into `Install-Alleaves.bat` (SHA256 self-verified). |
+| `Install-Alleaves.bat` | **The deliverable.** Generated — never hand-edit. |
+| `scanner/Scanner_OPOS_barcode.pdf` | One-scan USB-OPOS programming barcode; no PC software needed. |
+| `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Scanner hardware-validation notes (design lives in the `Set-ScannerOpos` header). |
+| `printer/Collect-PrinterFingerprint.ps1` | Field diagnostic: dumps OPOS entries, ProgID→CLSID→DLL chain, USB IDs, then prints a test receipt (`-SnapshotOnly` reads only). Also the Star capture tool. |
+| `docs/PRINTER_OPOS_FIELD_RESULTS.md` | Printer OPOS design, captured registry values, field results. |
 
 ## Usage
 
-Double-click `Install-Alleaves.bat` to install. It elevates once (UAC), then — on an interactive
-run — prompts for the computer name before proceeding; otherwise it runs unattended.
+Double-click `Install-Alleaves.bat`. It elevates once (UAC), then prompts for the computer name
+and printer brand on an interactive run; otherwise it runs unattended.
 
 | Argument | Effect |
 | --- | --- |
-| _(none)_ | Install (products + per-terminal finishing). |
-| `-ComputerName "POS-1"` | Preset the terminal's computer (POS) name and skip the interactive rename prompt. On an unattended/RMM run this is the **only** way to name the terminal. |
-| `-DryRun` | Simulate everything; make no system changes (no admin required). |
-| `-Uninstall` | Reverse a prior install using the persisted manifest. Does **not** revert the computer rename or the scanner's USB-OPOS mode, and leaves shared runtimes (the VC++ redistributable) in place. To revert the scanner, scan the "USB HID Keyboard" / "Set Defaults" barcode or re-run 123Scan. Mutually exclusive with `-ScannerConfigOnly`. |
-| `-ForceReinstall` | Re-download even if a valid cached file exists, and pre-clean/reinstall products already present (a normal re-run skips anything already installed). |
-| `-SkipMasterList` | Don't copy the NiceLabel master list (`.nlbl`) into the admin/cashier Documents folders. |
-| `-SkipUninstallTeamViewer` | Keep any existing TeamViewer install (removed by default). |
-| `-SkipRename` | Don't prompt for / apply the computer rename. |
-| `-SkipChromeTaskbar` | Don't pin Chrome / remove Edge from the taskbar. |
-| `-SkipDefaultBrowser` | Don't make Chrome the default browser. |
-| `-SkipScannerConfig` | Don't flip the connected Zebra scanner(s) to USB-OPOS (leave the scanner's host mode untouched). |
-| `-SkipPrograms <regex...>` | Skip specific products in **both** the download and install phases — any product whose name matches one of the given regex fragments is dropped (e.g. `-SkipPrograms Zebra` skips both Zebra products). Quote a fragment that contains cmd metacharacters, e.g. `-SkipPrograms "Chrome\|NiceLabel"`. |
-| `-ScannerConfigOnly` | Run **only** the USB-OPOS scanner step — skip all downloads, installs, and finishing. Use it to configure a scanner that wasn't attached during the main install (just plug it in and run this), or to re-apply OPOS. Mutually exclusive with `-Uninstall`. |
+| _(none)_ | Install (products + finishing). |
+| `-ComputerName "POS-1"` | Preset the POS name; the only way to name an unattended run. |
+| `-DryRun` | Simulate; change nothing (no admin needed). |
+| `-Uninstall` | Reverse a prior install from the manifest, including the bookmark policy and both pins (sign out/in to see it). A user's original pins only come back if that user was signed in during the install. Does **not** revert the rename, the scanner's OPOS mode, or shared runtimes. Excludes `-ScannerConfigOnly` / `-PrinterConfigOnly`. |
+| `-ForceReinstall` | Re-download and reinstall even if cached / already present. |
+| `-SkipPrograms <regex...>` | Drop matching products from **both** phases (e.g. `-SkipPrograms Zebra`). Quote cmd metacharacters: `"Chrome\|NiceLabel"`. An invalid regex exits `2`. |
+| `-SkipMasterList` | Don't copy the `.nlbl`. |
+| `-SkipUninstallTeamViewer` | Keep TeamViewer. |
+| `-SkipRename` / `-SkipChromeTaskbar` / `-SkipDefaultBrowser` / `-SkipChromeBookmark` | Skip that finishing step. |
+| `-PrinterBrand <name>` | `POS-X`, `StarTSP100` or `None` — skips the brand prompt. `None` = no printer driver and no OPOS registration. |
+| `-SkipPrinterConfig` | Install the driver but don't register the OPOS entry. |
+| `-SkipScannerConfig` | Leave the scanner's host mode alone. |
+| `-ScannerConfigOnly` | Run **only** the USB-OPOS scanner step. A run that switches nothing exits `6`, not `0`. Excludes `-Uninstall` / `-SkipScannerConfig`. |
+| `-PrinterConfigOnly` | Run **only** the OPOS printer registration — use after a rename (entries under the old name are retired). The driver must already be installed. Excludes `-Uninstall`, `-ScannerConfigOnly`, `-SkipPrinterConfig`, `-PrinterBrand None`. |
+| `-ForceFingerprint` | Write the per-hop scanner fingerprint even for a known model (lands in `logs\`). Still attempts the switch. |
+| `-NiceLabelLicense <id>` | Activation ID for NiceLabel (a working default is baked in). |
+| `-SkipNiceLabelActivation` | Install NiceLabel unlicensed, for manual key entry. |
+| `-IgnoreAccountCheck` | Report the precheck verdict but don't block on it (the unattended half of the override). Recorded in the manifest. |
 
 ### Exit codes
 
-`0` success · `1` install/uninstall failure · `2` mode ambiguity · `3` not elevated ·
-`4` scanner degraded (CoreScanner missing — re-run) · `5` working-dir creation failed ·
-`6` a scanner was connected but the USB-OPOS switch failed (re-run with the scanner attached).
-Codes `4` and `6` are non-fatal "re-run" signals and never mask a hard failure (`1`).
+`0` ok · `1` install / uninstall / download / finishing failure · `2` mode ambiguity or a bad
+argument · `3` not elevated · `4` scanner degraded, CoreScanner missing (re-run) · `5`
+working-dir failed · `6` USB-OPOS switch failed (re-run with the scanner attached) · `7` OPOS
+printer registration failed — also when the brand's values aren't captured yet (`StarTSP100`)
+or an entry under a previous computer name couldn't be retired · `8` account precheck failed
+and was not overridden (nothing downloaded or written; `-Uninstall` skips the check, `-DryRun`
+reports and continues) · `9` account swap armed, rebooting to resume — do not dispatch a tech.
+
+`4`, `6` and `7` are non-fatal "re-run" signals and never mask `1`.
+
+### Account precheck and automatic fix
+
+The install refuses to run unless the **signed-in** account is a plain local admin. An
+undetermined account type blocks too. A Microsoft account is refused because OneDrive can
+redirect `Documents` — exactly where the master list goes.
+
+On a block, an **interactive** run offers a fix:
+
+| Situation | Offer |
+| --- | --- |
+| Local account, not an admin | Promote in place, then reboot. No password handled. |
+| Microsoft / domain / Entra / undetermined | Create a local admin (prompts for name + password), arm a one-shot auto sign-in, reboot into it. |
+| SYSTEM / service identity (no console) | **No offer** — relaunch from a signed-in console session. |
+
+Either way a logon task re-runs the installer with the same arguments so the install resumes
+itself; it exits `9` once armed. Never offered twice in one cycle. `-DryRun` reports the offer
+it would make and arms nothing.
+
+**Overriding the block.** Interactive: decline the offer and answer `y` to
+`Continue the install anyway on this account (NOT recommended)? [y/N]`. Unattended: pass
+`-IgnoreAccountCheck`. Both prompts default to **No** and a headless host reads as No, so an
+unattended run with no switch still exits `8`. Every override is written to the manifest as
+`accountCheckOverride` — the only durable record, since the precheck runs before the transcript
+starts. The reasons don't go away when you override: override when you know the box.
+
+> **One-shot auto sign-in** (create path only): Winlogon's `AutoLogonCount`, so the password
+> sits in the registry in plaintext until that single sign-in clears it — reboot promptly. The
+> resumed run restores the previous autologon settings. The created account is **never removed
+> by `-Uninstall`**: the terminal is signed into it and its Documents holds the master list.
+
+### Receipt printer (OPOS)
+
+| Brand | Driver | Device | Logical name | Service object |
+| --- | --- | --- | --- | --- |
+| `POS-X` | `OLE POS Setup 2.84` | Printer | `<POSname>_Printer` | `RecPrinter.POSPrinter.SOU` |
+| `StarTSP100` | `TSP100 Setup Version 7.6.0` | Printer | `<POSname>_Printer` | *(pending capture)* |
+| `StarTSP100` | ″ | Cash drawer | `<POSname>_Drawer` | *(pending capture)* |
+
+`<POSname>` is the computer name from this run. **Alleaves must be configured to open these
+exact names**, so a later rename means re-running with `-PrinterConfigOnly`. The path is OPOS
+end-to-end — nothing appears under Printers & Scanners, which is expected. Pure registry: fully
+tracked and removed by `-Uninstall`.
+
+> **Star is not finished.** The driver installs, is detected and uninstalls cleanly, but Star
+> ships no OPOS automation and its registry values must be captured on a bench (see
+> `docs/PRINTER_OPOS_FIELD_RESULTS.md`). Until then `-PrinterBrand StarTSP100` installs the
+> driver and exits **7** (`not-captured`) rather than registering an empty device. POS-X is
+> unaffected.
+
+**Cash drawer, by brand.** POS-X: no device of its own — it hangs off the printer's RJ-11 and
+follows it via the printer key's `DrawerOpen=1`. (A terminal set up before 2026-08-12 has a
+stale `<POSname>_Drawer`; re-running removes it.) Star: a genuine second OPOS device, hence the
+second row.
+
+The Star download is the vendor's 471 MB CD image, so expect ~600 MB left in `downloads\`.
 
 ### Scanner USB-OPOS — barcode fallback
 
-The installer sets OPOS automatically (software path). For a terminal that has no scanner attached
-during the run, or a no-PC situation, scan the single **USB-OPOS** programming barcode in
-`scanner/Scanner_OPOS_barcode.pdf` — same end result, no software required. It sets OPOS in one scan
-straight from the factory HID-Keyboard default (the HID-KB → IBM Hand-held → OPOS two-hop is only
-needed by the software/CoreScanner path, not by scanning the barcode).
+No scanner during the run, or no PC at all: scan the single USB-OPOS barcode in
+`scanner/Scanner_OPOS_barcode.pdf`. One scan from the factory HID-Keyboard default — the
+two-hop sequence is only the software path's constraint.
 
 ## Troubleshooting / logs
 
-If a run fails, look under `%ProgramData%\AlleavesAuto\logs\` (both paths are also echoed at the end
-of every run):
+Under `%ProgramData%\AlleavesAuto\logs\` (both paths are echoed at the end of every run):
 
-- `install_YYYYMMDD_HHMMSS.log` (or `uninstall_…` / `scannercfg_…` for those modes) — the full
+- `install_YYYYMMDD_HHMMSS.log` (or `uninstall_…` / `scannercfg_…` / `printercfg_…`) — the
   per-run transcript.
-- `install_manifest.json` — the JSON record of everything installed, placed, and changed;
-  `-Uninstall` replays it in reverse.
+- `install_manifest.json` — everything installed, placed and changed; `-Uninstall` replays it
+  in reverse.
+- `scanner_new_model_<model>_<timestamp>.txt` — per-hop scanner fingerprint, written for an
+  unrecognized model or with `-ForceFingerprint`. Send that file back.
 
 ## Rebuilding the deliverable
 
-Edit `alleaves_setup.ps1`, then regenerate the `.bat`:
-
-```powershell
-.\build-bat.ps1
-```
-
-Never edit `Install-Alleaves.bat` by hand — it is a generated, SHA256-verified
-base64 pack of the `.ps1`.
+Edit `alleaves_setup.ps1`, then `.\build-bat.ps1`. Never edit `Install-Alleaves.bat` by hand —
+it is a generated, SHA256-verified base64 pack of the `.ps1`. A failed self-verify renames the
+output to `.bat.corrupt`. Self-checks: `tests\Test-AccountPrecheck.ps1`,
+`tests\Test-ManifestMerge.ps1` (exit 0/1, no framework).

@@ -9,13 +9,16 @@
       on the client, regardless of BOM / line endings).
     - Base64-encodes and chunks into <=4000-char lines (under cmd's ~8191 line
       limit).
-    - Emits a .bat that: elevates ONCE (whoami high-integrity SID probe),
+    - Emits a .bat that: elevates ONCE (whoami elevated-integrity SID probe -
+      High OR SYSTEM),
       transports the base64 via a TEMP FILE (not an env var - a single cmd var
       caps at ~8191 chars and would silently truncate the ~40 KB blob), decodes
       it with 64-bit PowerShell (Sysnative), runs the .ps1 synchronously in the
       elevated console, and propagates the exit code.
-    - Self-verifies: decodes the embedded base64 back and confirms byte-length
-      AND SHA256 identity to the source.
+    - Self-verifies by re-reading the .bat IT JUST WROTE: pulls the base64 back
+      out of the emitted echo lines, decodes it, and confirms byte-length AND
+      SHA256 identity to the source. Verifying the in-memory chunks instead
+      would be circular and could never catch a transport-emission defect.
 #>
 
 [CmdletBinding()]
@@ -28,7 +31,9 @@ $ScriptDir = $PSScriptRoot
 if (-not $Source) { $Source = Join-Path $ScriptDir 'alleaves_setup.ps1' }
 if (-not $OutBat) { $OutBat = Join-Path $ScriptDir 'Install-Alleaves.bat' }
 
-if (-not (Test-Path $Source)) { throw "Source not found: $Source" }
+# -LiteralPath on both this and the Get-FileHash below: -Path treats [ ] as wildcards, so a
+# checkout under a bracketed directory throws "Source not found" on a file that is right there.
+if (-not (Test-Path -LiteralPath $Source)) { throw "Source not found: $Source" }
 
 $srcBytes = [IO.File]::ReadAllBytes($Source)
 $b64      = [Convert]::ToBase64String($srcBytes)
@@ -49,8 +54,14 @@ $L.Add('REM  hand; edit alleaves_setup.ps1 and rebuild.')
 $L.Add('REM  Double-click = install.  "-Uninstall" = reverse.  "-DryRun" = test.')
 $L.Add('REM ===================================================================')
 $L.Add('')
-$L.Add('REM --- Single elevation owner: probe high-integrity SID, relaunch once.')
-$L.Add('whoami /groups | find "S-1-16-12288" >nul 2>&1')
+$L.Add('REM --- Single elevation owner: probe elevated-integrity SID, relaunch once.')
+$L.Add('REM  BOTH SIDs: 12288 is High, 16384 is SYSTEM - strictly higher, and the exact RMM')
+$L.Add('REM  case the .ps1 anticipates with its "service-account" precheck verdict. Matching')
+$L.Add('REM  High alone made a SYSTEM-dispatched run fail the probe and RunAs itself; SYSTEM''s')
+$L.Add('REM  token is already elevated so no UAC gate stops it, and the child failed the same')
+$L.Add('REM  probe and spawned another - an unbounded, mutually-waiting fork chain, with the')
+$L.Add('REM  exit-8 verdict for that account never reaching the operator.')
+$L.Add('whoami /groups | findstr /c:"S-1-16-12288" /c:"S-1-16-16384" >nul 2>&1')
 $L.Add('if not errorlevel 1 goto :elevated')
 $L.Add('echo Requesting administrator elevation...')
 $L.Add('REM F21: -Wait -PassThru so the non-elevated launcher waits for the elevated child')
@@ -78,8 +89,22 @@ $L.Add('if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" 
 $L.Add('')
 $L.Add("REM --- Transport base64 via a TEMP FILE (cmd env vars truncate at ~8191).")
 $L.Add("if exist `"%TEMP%\$b64File`" del /f /q `"%TEMP%\$b64File`"")
+# Pre-delete the DECODED script too. The decode's exit code is never checked and the only
+# guard below is "if not exist", so a run killed between the decode and the trailing del
+# leaves the PREVIOUS build's .ps1 in %TEMP% - and a later run whose decode fails then runs
+# THAT against a terminal, with its exit code attributed to the new build.
+$L.Add("if exist `"%TEMP%\$psFile`" del /f /q `"%TEMP%\$psFile`"")
+# Redirection FIRST, command second: ">>file echo <chunk>" rather than
+# "echo <chunk>>>file". cmd reads a digit sitting just before a redirection
+# operator as a HANDLE (the classic "echo done 2>log" trap), and 11 of the ~102
+# base64 chunks currently end in 0-9. Measured on Win11 26200 the glued form is
+# in fact safe - cmd only takes the digit as a handle when a delimiter precedes
+# it, and the base64 alphabet (A-Za-z0-9+/=) never puts a space before that last
+# character - so this is belt-and-braces, not a live bug. It costs nothing, it
+# removes the need for the next reader to re-derive that parsing subtlety, and
+# nothing else in the alphabet is a cmd metacharacter (+ / = are all inert here).
 foreach ($c in $chunks) {
-    $L.Add("echo $c>>`"%TEMP%\$b64File`"")
+    $L.Add(">>`"%TEMP%\$b64File`" echo $c")
 }
 $L.Add('')
 $L.Add('REM --- Decode the base64 file back to the original .ps1 bytes.')
@@ -115,9 +140,26 @@ $content = ($L -join "`r`n") + "`r`n"
 [IO.File]::WriteAllText($OutBat, $content, (New-Object System.Text.ASCIIEncoding))
 Write-Host "Wrote:   $OutBat ($((Get-Item $OutBat).Length) bytes)"
 
-# --- Self-verify: decode the embedded base64 back and compare to source ----
-$decoded = [Convert]::FromBase64String(($chunks -join ''))
-$srcHash = (Get-FileHash -Path $Source -Algorithm SHA256).Hash
+# --- Self-verify: decode the base64 back OUT OF THE WRITTEN .bat -----------
+# Deliberately NOT $chunks: that variable IS the source by construction, so
+# comparing it to the source can only ever pass. It cannot see a defect
+# introduced while emitting the transport (a mangled echo line, a character the
+# cmd parser eats, a dropped or reordered line) - which is the only kind of
+# corruption this build step can actually cause. So re-read the file we just
+# wrote and decode what the client's cmd will really append.
+# [Convert]::FromBase64String ignores whitespace, which is what lets this join
+# the lines back with no separator handling - and is also why the client's
+# ReadAllText of the CRLF-separated temp file decodes cleanly.
+$prefix  = ">>`"%TEMP%\$b64File`" echo "
+$emitted = [IO.File]::ReadAllLines($OutBat) |
+           Where-Object   { $_.StartsWith($prefix, [StringComparison]::Ordinal) } |
+           ForEach-Object { $_.Substring($prefix.Length) }
+$decoded = [byte[]]@()
+# Corrupt base64 THROWS; catch it so a bad build still reports through the
+# RESULT line / exit 1 contract below instead of dying with a stack trace.
+try   { $decoded = [Convert]::FromBase64String(($emitted -join '')) }
+catch { Write-Host "  decode of emitted lines FAILED: $($_.Exception.Message)" -ForegroundColor Red }
+$srcHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
 $tmp = [IO.Path]::GetTempFileName()
 [IO.File]::WriteAllBytes($tmp, $decoded)
 $decHash = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash
@@ -134,5 +176,10 @@ if ($decoded.Length -eq $srcBytes.Length -and $decHash -eq $srcHash) {
     exit 0
 } else {
     Write-Host "  RESULT: MISMATCH - build is corrupt" -ForegroundColor Red
+    # The .bat IS the whole deliverable, so a corrupt one must not keep the shipping name:
+    # exit 1 alone left a plausible, double-clickable Install-Alleaves.bat in the repo root,
+    # one `git add -A` from being shipped to a terminal.
+    Move-Item -LiteralPath $OutBat -Destination "$OutBat.corrupt" -Force
+    Write-Host "  moved aside: $OutBat.corrupt" -ForegroundColor Red
     exit 1
 }

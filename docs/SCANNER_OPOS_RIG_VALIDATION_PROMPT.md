@@ -53,7 +53,8 @@
 - **Fast iteration:** use **`-ScannerConfigOnly`** to run ONLY this step (no
   downloads/installs/finishing). `Install-Alleaves.bat -ScannerConfigOnly`, or non-elevated
   `PowerShell -File .\alleaves_setup.ps1 -ScannerConfigOnly -DryRun`. `Save-Manifest` merges
-  onto the prior manifest, so it only updates `scannerConfigured`.
+  onto the prior manifest, so it only updates `scannerConfigured`. Add **`-ForceFingerprint`**
+  to capture the per-hop dump on a model the installer already knows.
 - **Exit codes:** `4` = CoreScanner missing (degraded), `6` = scanner present but OPOS switch
   failed. Both are non-fatal "re-run" codes that never mask a hard `1`. Manifest key is
   `scannerConfigured` (`removable=$false`, record-only on uninstall).
@@ -82,9 +83,13 @@ Work in small loops using `-ScannerConfigOnly` so you don't re-run the whole ins
 2. **Confirm the `type` string for each host mode** (this is the crux — mode detection keys off
    `type=`, not PID). Record the `GetScanners` `<type>`, `<modelnumber>`, `<serialnumber>` (and
    `<PID>` for the record) while the scanner is in each mode: **HID-Keyboard** (factory default),
-   **IBM Hand-held**, and **OPOS**. The repo's **`scanner/Collect-ScannerFingerprint.ps1`** already
-   does exactly this — run it (default full walk, or `-SnapshotOnly`); it drives the same
-   `ExecCommand(6200, ...)` hops, dumps the parsed XML per mode, and measures the reconnect seconds.
+   **IBM Hand-held**, and **OPOS**. Run **`Install-Alleaves.bat -ScannerConfigOnly
+   -ForceFingerprint`**: `-ForceFingerprint` makes the installer's own `Write-NewScannerFingerprint`
+   dump fire even for a model already in `$ScannerKnownModels`, so one switch run records the
+   parsed XML per hop plus the measured reconnect seconds to
+   `%ProgramData%\AlleavesAuto\logs\scanner_new_model_<model>_<timestamp>.txt`. There is **no
+   read-only/snapshot mode** — a run always attempts the switch, so start the scanner in the mode
+   you want captured and let the two-hop walk it from there.
 
 3. **Finalize the constants** in `alleaves_setup.ps1` from the captured values: confirm the
    `$ScannerTypeHidKb` / `$ScannerTypeIbmSnapi` regexes match the strings you observed, and set
@@ -156,6 +161,25 @@ no hop status, no reconnect timing. The `RIG-DEPENDENT` / `TODO[rig]` constants
 (`$ScannerReenumMaxWaitSec`, `$ScannerServiceSettleSec`, `$ScannerSwitchMaxRetries`,
 `$ScannerRetryWaitSec`) and the in-session status-112 recovery remain **unvalidated**. Capturing
 them needs a scanner deliberately reset to HID-KB (step 4 above).
+
+**Changed 2026-09-09 (audit), still needs a HID-KB run to confirm on hardware:**
+
+- The terminal **status-112 verdict on hop 1 is now tested BEFORE `Wait-ScannerReenum`**, not
+  after. A 112 that never cleared means the RSM channel was unavailable, the command never
+  reached the scanner, and it therefore cannot have re-enumerated — so the old order spent the
+  full `$ScannerReenumMaxWaitSec` (40 s) polling for a device sitting untouched in HID-KB, to
+  reach a verdict that was already known. **What to capture:** on a real in-session 112 run,
+  confirm the step now fails within the retry budget alone (roughly
+  `$ScannerSwitchMaxRetries × ($ScannerServiceSettleSec + $ScannerRetryWaitSec)`) with no 40 s
+  tail, and that the hop log still carries an `after hop1 (IBM)` entry (it is now synthesised
+  with `s=$null; seconds=0` on that path).
+- `Set-OneScannerToOpos` **no longer returns `ok` for a post-switch mode of `unknown`** even
+  with a clean status. `USBOPOS` is per-*mode*, not per-model, so `unknown` means the unit came
+  back in some other mode. **What to capture:** the post-hop2 `type` string for any model that
+  is not a DS2208 — if a real OPOS unit ever reports something other than `USBOPOS`,
+  `$ScannerTypeOpos` needs widening rather than this arm coming back.
+- Each scanner in the loop now has its **own** try/catch, so one unit throwing no longer skips
+  the rest or loses its manifest row. Only observable with two scanners attached.
 
 ## Conventions + guardrails
 
