@@ -207,6 +207,43 @@ try {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "`nEvery printer brand RowName names a real download AND install row" -ForegroundColor Cyan
+# Step 0b feeds every brand's RowName EXCEPT the chosen one to $SkipPrograms, and
+# Test-SkipMatch matches that against $DriveFiles Label for the download phase and
+# $Installers Name for the install phase. A typo in either place matches nothing and fails
+# SILENTLY: a POS-X terminal downloads Star's 471 MB CD image and installs both drivers.
+# Same drift class the Label/Name rule already exists for, one level up.
+# Read as literals off the AST rather than evaluated: the three tables reference other
+# top-level variables ($NiceLabelArgs, $PosXPrinterStrings, ...) that dot-sourcing them
+# alone would leave $null.
+function Get-KeyLiterals($node, $key) {
+    $out = @()
+    foreach ($h in $node.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)) {
+        foreach ($kv in $h.KeyValuePairs) {
+            if (($kv.Item1.Extent.Text -replace '^[''"]|[''"]$') -ne $key) { continue }
+            if ($kv.Item2.Extent.Text -match "^\s*'(.*)'\s*$") { $out += $Matches[1] }
+        }
+    }
+    return $out
+}
+$assign = @{}
+foreach ($a in $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+    $assign[$a.Left.VariablePath.UserPath] = $a.Right
+}
+foreach ($v in @('DriveFiles','Installers','PrinterBrands')) {
+    if (-not $assign.ContainsKey($v)) { Write-Host "FAIL: `$$v not found in the installer" -ForegroundColor Red; exit 1 }
+}
+$labels = Get-KeyLiterals $assign['DriveFiles']    'Label'
+$names  = Get-KeyLiterals $assign['Installers']    'Name'
+$rows   = Get-KeyLiterals $assign['PrinterBrands'] 'RowName'
+Assert-Eq $true ($rows.Count -ge 2) 'the brand table still declares its RowNames as plain literals'
+foreach ($r in $rows) {
+    Assert-Eq $true ($labels -contains $r) "brand RowName '$r' is a `$DriveFiles Label (download phase)"
+    Assert-Eq $true ($names  -contains $r) "brand RowName '$r' is an `$Installers Name (install phase)"
+}
+
 Write-Host ''
 if ($script:Failures) { Write-Host "$($script:Failures) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'all passed' -ForegroundColor Green
