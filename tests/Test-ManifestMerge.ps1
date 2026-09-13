@@ -244,6 +244,47 @@ foreach ($r in $rows) {
     Assert-Eq $true ($names  -contains $r) "brand RowName '$r' is an `$Installers Name (install phase)"
 }
 
+Write-Host "`nTest-PrinterOposConfigured" -ForegroundColor Cyan
+# This decides whether a terminal whose OPOS device already exists is reported as a
+# SUCCESS or as a failure with exit 7. Getting it wrong in either direction is bad: too
+# loose and an empty phantom key (a device OPOS enumerates and then cannot open) reads
+# as configured and the real registration is skipped; too strict and a working terminal
+# is reported broken, which is the bug it was added for. Scratch HKCU key, same approach
+# as the step-4b section above - no admin, no HKLM.
+$fn = $null
+foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($f.Name -eq 'Test-PrinterOposConfigured') { $fn = $f }
+}
+if (-not $fn) { Write-Host 'FAIL: Test-PrinterOposConfigured not found' -ForegroundColor Red; exit 1 }
+. ([scriptblock]::Create($fn.Extent.Text))
+
+$PrinterOposRoot = 'HKCU:\Software\AlleavesAutoTest\ServiceOPOS'
+Remove-Item -LiteralPath 'HKCU:\Software\AlleavesAutoTest' -Recurse -Force -ErrorAction SilentlyContinue
+try {
+    # (a) no key at all - a fresh terminal
+    Assert-Eq $false (Test-PrinterOposConfigured -LogicalName 'POS01_Printer' -Class 'POSPrinter') `
+        'a device with no key is not configured'
+    # (b) key present but NO default value - the phantom-device state
+    New-Item -Path "$PrinterOposRoot\POSPrinter\POS01_Printer" -Force | Out-Null
+    New-ItemProperty -Path "$PrinterOposRoot\POSPrinter\POS01_Printer" -Name 'DeviceName' `
+        -Value 'Thermal' -PropertyType String -Force | Out-Null
+    Assert-Eq $false (Test-PrinterOposConfigured -LogicalName 'POS01_Printer' -Class 'POSPrinter') `
+        'a key with values but no ProgID (default) is NOT configured'
+    # (c) the real thing: a default value holding the ProgID
+    New-ItemProperty -Path "$PrinterOposRoot\POSPrinter\POS01_Printer" -Name '(default)' `
+        -Value 'RecPrinter.POSPrinter.SOU' -PropertyType String -Force | Out-Null
+    Assert-Eq $true (Test-PrinterOposConfigured -LogicalName 'POS01_Printer' -Class 'POSPrinter') `
+        'a key whose default holds the ProgID IS configured'
+    # (d) the name is exact - Alleaves opens one specific logical name, so a device
+    #     registered under a DIFFERENT name must not count as this one being configured
+    Assert-Eq $false (Test-PrinterOposConfigured -LogicalName 'POS02_Printer' -Class 'POSPrinter') `
+        'a device under another logical name does not count'
+    Assert-Eq $false (Test-PrinterOposConfigured -LogicalName 'POS01_Printer' -Class 'CashDrawer') `
+        'a device under another class does not count'
+} finally {
+    Remove-Item -LiteralPath 'HKCU:\Software\AlleavesAutoTest' -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host ''
 if ($script:Failures) { Write-Host "$($script:Failures) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'all passed' -ForegroundColor Green

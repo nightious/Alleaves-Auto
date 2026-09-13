@@ -31,6 +31,17 @@ plus the printer OPOS field-results table; `scanner/` holds the no-PC barcode fa
   for that account never reached the operator. It also **pre-deletes** the decoded
   `%TEMP%\alleaves_setup.ps1` (the decode's exit code is never checked and the only guard is
   `if not exist`, so a failed decode ran the *previous* build under this build's name).
+  It calls **`%SystemRoot%\System32\whoami.exe` by full path, never a bare `whoami`** — the bare
+  name resolves through `PATH`, and a git-bash / MSYS / Cygwin shell puts its own GNU `whoami`
+  first, which rejects `/groups` and exits 1. That reads as "not elevated", the RunAs child
+  inherits the same `PATH`, fails identically, and **forks unboundedly — one UAC prompt per
+  iteration, hundreds deep** (observed 2026-09-13). Same fork chain as the SYSTEM case above,
+  reached through a shadowed command name. Behind it sits the general guard: a **second probe for
+  any `S-1-16-*` mandatory label**, because a working `whoami` always prints one — no label means
+  the *probe* is broken, not that the token is unelevated, and relaunching on an unreadable probe
+  is precisely what forks. That case goes to `:probefail` → **exit 3**, never to RunAs. Any future
+  edit to the probe must keep both properties: absolute path, and abort-don't-relaunch when the
+  probe cannot answer.
 - **Run (target terminal):** `Install-Alleaves.bat` (self-elevates once). The `.ps1` `param()`
   block / README's table is the authoritative option set — notably `-Uninstall`, `-DryRun` (no
   admin), `-ForceReinstall`, `-ComputerName`, the `-Skip*` flags, and `-ScannerConfigOnly` (run
@@ -65,8 +76,13 @@ Major function groups in `alleaves_setup.ps1`:
 - **Silent uninstall** — registry lookup + per-family flags; registry polling is authoritative for
   completion, and a success exit code other than 3010/1641 is **re-checked against ARP** (an
   uninstaller that refused the silent switch or was blocked by policy/AV exits 0 having removed
-  nothing, and nothing downstream re-scans); a hung launcher is killed only past a ~60 s floor, so
-  a vendor that clears ARP *before* deleting files isn't killed on the first poll and recorded
+  nothing, and nothing downstream re-scans) — but that re-check **polls for 60 s, it doesn't
+  snapshot**: an NSIS uninstaller (TeamViewer's `uninstall.exe`) copies itself to `%TEMP%` and
+  relaunches **detached**, so the process we waited on exits 0 within a second while the removal
+  is still running, and the instantaneous test reported "still in registry after uninstaller exit
+  0 — not removed" on a removal that finished seconds later (a counted reversal failure, and on
+  the install side a `$FinishFailed` → exit 1). A hung launcher is killed only past a ~60 s floor,
+  so a vendor that clears ARP *before* deleting files isn't killed on the first poll and recorded
   removed.
 - **VC++ bootstrap** — before Zebra CoreScanner, to avoid a mid-install reboot.
 - **Post-reboot finishing** — computer rename, Alleaves Terminal + Alleaves POS taskbar pins /
@@ -84,7 +100,21 @@ Major function groups in `alleaves_setup.ps1`:
 
 ## Conventions (match these when editing)
 
-- Colored console helpers `Step` / `Ok` / `Warn` / `Fail` / `Dry`.
+- Colored console helpers `Step` (cyan header) / `Ok` (green) / `Warn` (yellow) / `Fail` (red) /
+  `Dry` (dark grey) / **`Info` (white = informational)**. A bare `Write-Host` renders in the host
+  default, which is grey and reads as `[DRY]` — use `Info`. `Info` adds **no indent**; the call
+  sites carry their own. **Yellow means "a human needs to look at this"**, so it is `Warn` plus
+  exactly four advisories: the DRY RUN banner, "Recommended: reboot once", the autologon-password
+  caveat, and the account-precheck remediation body. Post-install "next steps", path banners and
+  prompt headers are `Info`, not yellow — they were yellow and read as a wall of warnings.
+- **Every silent probe `catch` carries a `Write-Verbose`.** The script is `[CmdletBinding()]`, so
+  `Install-Alleaves.bat -Verbose` surfaces them and the transcript captures them; `$VerbosePreference`
+  defaults to `SilentlyContinue`, so a normal run is byte-identical. The swallow is still the
+  contract — these probes are *supposed* to fail (`Get-LocalUser` on a free name, a missing `.len`
+  sidecar) — `Write-Verbose` just stops the reason from being unrecoverable. Add one to any new
+  `catch {}`; never promote one to `Warn`, or a healthy install grows ~30 lines of noise. The
+  generated finish script has no console at all, so its catches use its own `L()` file logger
+  instead. `Invoke-Step` and the top-level catch both print `$_.InvocationInfo.ScriptLineNumber`.
 - `$ErrorActionPreference = 'Continue'`; per-function try/catch with a `Warn` fallback. Every
   result is recorded to the manifest so partial failures **don't** exit 0.
 - Naming: `Verb-Noun` PascalCase functions (`Invoke-*`, `Get-*`), PascalCase globals (`$LogDir`,
@@ -105,7 +135,9 @@ Major function groups in `alleaves_setup.ps1`:
   already expanded; `type` recorded what we *wrote*, not the prior kind). Add one back — capturing
   the prior type via `GetValueKind()` — only when a caller genuinely needs it.
 - **Exit codes** are an RMM contract set in the `$exitCode` dispatch tail (verify there): `0` ok ·
-  `1` install/uninstall/download/**finishing** fail (`$script:FinishFailed` — the master-list
+  `1` install/uninstall/download/**finishing**/**step** fail (`$script:StepFailed` — a step that
+  *threw* and was carried past by `Invoke-Step`; see the step-isolation bullet — plus
+  `$script:FinishFailed` — the master-list
   copy, the Chrome bookmark policy, the logon-task staging/registration, a failed **computer
   rename** (a preset `-ComputerName` equal to the current name is a no-op `Ok`, not a validation
   fail — an RMM that always passes `-ComputerName POS01` renamed on run 1 and exited 1 on every
@@ -149,6 +181,36 @@ Major function groups in `alleaves_setup.ps1`:
 
 - **Production bar for every install step: bootstrap + track (manifest) + reverse (uninstall).**
   Don't add a step that can't be cleanly uninstalled.
+- **Step isolation: a failing step stops the STEP, not the run.** The dispatch tail runs the
+  whole install branch inside one `try`, so a throw anywhere in it unwound to the single catch
+  and skipped every remaining step *plus* the exit tally, `Save-Manifest`, the `Done` banner and
+  the non-fatal 4/6/7 block — a terminal stopped at a red error with the later steps never
+  attempted, and only the `finally`'s manifest save ran. Every step call is therefore wrapped in
+  **`Invoke-Step`** (`Invoke-Step 'Taskbar pins' { Invoke-ChromeTaskbar }`), which records the
+  failure on `$script:StepFailed` → exit 1 and **continues**. Add new steps the same way; a bare
+  call reintroduces the whole bug, which is why `tests\Test-StepIsolation.ps1` AST-asserts that
+  no bare step call survives in the install branch. Traps:
+  - It is the guard for the six steps whose bodies are only **partially** try/catch'd
+    (`Copy-MasterList`, `Invoke-ChromeTaskbar`, `Invoke-ChromeDefaultBrowser`,
+    `Invoke-ChromeBookmark`, `Register-FinishLogonTask`, `Set-PrinterOpos`) — one guard at the
+    call site instead of patching six bodies. `Set-ScannerOpos` is the only step already fully
+    wrapped internally.
+  - **`Invoke-Step` yields nothing when the body throws**, so the one caller that reads a return
+    value — the step-0b brand resolve — needs `if (-not $brand0) { $brand0 = 'POS-X' }` after it.
+    An empty `$brand0` makes the brand loop skip **every** brand and no printer driver is
+    downloaded or installed at all (the same trap `-SkipPrinterConfig`'s fallback documents).
+  - The **install loop guards each ROW** and the **download phase each FILE**, for the same
+    reason one level down: one bad product must cost exactly one product. The loop's *known*
+    failure modes already record-and-`continue`; the row `try` is for the implicit terminating
+    exceptions (`tar.exe` absent from a stripped image, a registry read that throws, a vendor
+    uninstaller that blows up during pre-clean). Its catch records `result='fail-exception'`,
+    which is non-`ok`, so the tally, `Test-PriorInstallFailed` and `-Uninstall` all see it.
+    `$full` is only assigned partway through the body, so the catch rebuilds the path from the
+    row rather than reporting the **previous** row's file.
+  - The config-only branch's single step is wrapped too: a throw there skipped that mode's own
+    "did nothing" check and its `Save-Manifest`, so the one step the mode exists to run reported
+    nothing at all. Carrying past it lets that check set the 6/7 flag, which is the right verdict.
+  - The top-level `catch` stays as the last-resort net; it is no longer the normal path.
 - **Account precheck (`Test-InstallAccount`, exit 8)** — sits right after the elevation abort and
   *before* `$WorkDir` is created, so a rejected box gets nothing written. It reads the **signed-in**
   user (`Win32_ComputerSystem.UserName`), never the process token: a standard user can launch the
@@ -408,6 +470,23 @@ Major function groups in `alleaves_setup.ps1`:
     `Warn` and exited **0** under a green banner having registered nothing. Count it **filtered** —
     `@($null)` is an array of one `$null`, so a missing `Devices` key counts as one device — and
     that trailing `else` now sets `$script:PrinterConfigFailed` unconditionally.
+  - **ALREADY CONFIGURED is a success, and it is checked BEFORE the uncaptured bail.** That bail
+    is right on a fresh terminal and wrong on one whose OPOS device the vendor utility (or an
+    earlier deployment) already created under the exact name Alleaves opens: the tech got a red
+    failure and exit 7 on a box that works, with a remediation (run the bench capture) that
+    changes nothing about it. `Test-PrinterOposConfigured` tests the key's **`(default)` value,
+    not mere existence** — the default *is* the ProgID, the one value OPOS mandates, and a key
+    without it is exactly the phantom-device state the rest of the step avoids. **Every** device
+    must be present (a half-configured brand still needs the capture, and reporting success would
+    hide a missing cash drawer); the partial case warns "N of M" and then falls through to the
+    normal bail. The rows are `result='already-configured'`, **`removable=$false`** — we did not
+    create those keys, so `-Uninstall` must not remove them — and the arm returns **before**
+    `Remove-StalePrinterOpos`, like `no-driver`: this run registered nothing of its own, so there
+    is no replacement to retire an older name in favour of. The config-only branch's "did
+    nothing" floor counts `already-configured` alongside `ok`, for the same reason the scanner's
+    counts `already-opos`. `$prefix = Get-PosNamePrefix` is hoisted **above** the bail because the
+    check needs it to build the device key names. Note the match is on the **exact** logical name:
+    a device the vendor utility registered under some *other* name correctly does **not** count.
   - **The device values are CAPTURED, never authored.** They came from diffing a real
     `SetupPOS.exe` run (28 printer values). Deriving them from `Thermal.inf` gives a subtly
     wrong key — `Description` and `PortShare` are in neither section of it. If the package
@@ -578,7 +657,16 @@ Major function groups in `alleaves_setup.ps1`:
   Neither pin target ships a `.lnk` — the Alleaves MSI installs **no shortcut at all** (two files,
   measured) and `Alleaves POS` is ours — so `New-TrackedShortcut` creates both all-users Start
   Menu shortcuts that `DesktopApplicationLinkPath` needs, tracked via `filesPlaced`. Targets come
-  from `Get-AlleavesLauncherPath` (ARP `InstallLocation`) and `Get-ChromeExePath` (`App Paths`).
+  from `Get-AlleavesLauncherPath` and `Get-ChromeExePath` (`App Paths`).
+  **`Get-AlleavesLauncherPath` can't trust ARP `InstallLocation` — the shipping Alleaves MSI
+  leaves it BLANK**, so the terminal's *primary* app silently lost its pin while the install loop
+  three screens earlier reported it installed. It now falls through `InstallLocation` (Test-Path'd,
+  so a stale one doesn't win) → the ARP `DisplayIcon` with its `,0` index stripped, when that names
+  `AlleavesLauncher.exe` → a `-Depth 3` search of `%ProgramFiles%`, `%ProgramFiles(x86)%` and
+  `%LOCALAPPDATA%\Programs`. All three are **measured** sources, which is the bar the original
+  "no literal fallback" note set — a hardcoded path would still be wrong. `$null` still means
+  "don't pin it", and the warning says *"could not locate AlleavesLauncher.exe"*, never
+  "not installed", which contradicted the install loop.
   Still no XML comments in that here-string.
   **The per-user marker stores the LAYOUT, not a bare flag.** The logon task's
   `TaskbarApplied` value holds the pin list **plus a deployment generation**
@@ -710,10 +798,13 @@ Major function groups in `alleaves_setup.ps1`:
     treatment the Zebra wrappers get (`$DownloadDir` survives `-Uninstall` by design). Costs
     ~600 MB of cache; re-extracted every run, which is cheap beside the download it came from.
   - `SkipIfInstalled` — the raw-exe branch had **no ARP short-circuit at all**, so a raw-exe row
-    replays its installer on every run. Tolerable for Chrome's 1.3 MB stub, not for a 111 MB
-    MSI-backed installer. Opt-in rather than blanket so Chrome and NiceLabel keep their
-    validated behaviour byte-for-byte (NiceLabel in particular re-runs to re-apply its license
-    code). It consults `Test-PriorInstallFailed`, same as the MSI/`.iss` guards.
+    replays its installer on every run. It is now set on **every** raw-exe row, Chrome and
+    NiceLabel included: replaying an installer over an already-installed product is how a working
+    terminal ends up printing a red `[FAIL]` the tech has to interpret, which is exactly what
+    `logs2/` showed. It consults `Test-PriorInstallFailed` and `-ForceReinstall`, same as the
+    MSI/`.iss` guards, so a run that failed is still retried and a forced run still replays. One
+    trade-off, accepted: a NiceLabel installed **by hand** (no prior manifest row) skips on ARP
+    alone and its license is not re-applied — `-ForceReinstall` is the remedy.
 - **The download path already handles 471 MB, and Drive's `confirm=t` is enough.** Don't
   "fix" it. `Invoke-FileDownload` is **BITS → `WebClient.DownloadFile`**, never
   `Invoke-WebRequest -OutFile` (which on PS 5.1 buffers the whole body in memory) — the comment
@@ -740,6 +831,24 @@ Major function groups in `alleaves_setup.ps1`:
   alone (installed by hand or by an older build), and an `ok` row carrying `note='msi-fallback'`
   counts as **not** successfully installed (see the fallback bullet). Consequence to expect: a
   genuinely failing product retries every run until it succeeds.
+- **`Invoke-Installer` must dereference `$p.Handle` before `WaitForExit`, or there is no exit
+  code at all.** On PS 5.1, `Start-Process -PassThru` **combined with
+  `-RedirectStandardOutput`/`-RedirectStandardError`** hands back a Process whose `.ExitCode`
+  reads **`$null`** after the wait — PowerShell releases the process handle and the exit status
+  goes with it. Measured 2026-09-13 (identical at 0 s, 1 s and 3 s process lifetimes, so not a
+  race). This is the **only** launch site in the file that redirects, which is why it was the only
+  one affected — and why `Invoke-SilentUninstall` in the same run correctly printed
+  `uninstaller exit 0`. Without the line, **every** product routed through here — the raw-exe rows
+  *and every MSI*, via `Invoke-Msi` — recorded `exitCode=null`, so `$okCodes -contains $exit` was
+  false and installs that had **succeeded** were recorded `result='fail'` and printed
+  `<name> exited  -` with a blank where the code belongs; Chrome's `-ConfirmRegistry` check was
+  never reached and 3010/1641 could never raise the deferred-reboot flag. A one-line fix with no
+  visible effect on a healthy run, so it has a runnable check:
+  `tests\Test-InstallerExitCode.ps1` asserts the live platform behaviour *and* AST-asserts the
+  line still sits between the `Start-Process` and the `WaitForExit`. A null `$exit` that survives
+  anyway now takes its **own arm** rather than falling into the failure `else`: product in ARP →
+  `result='ok'`, `note='exit-unknown-but-registered'`; absent → `fail`, `note='exit-unknown'` and
+  a message that says the code was unreadable.
 - **The exit-code tally is snapshotted BEFORE `Save-Manifest`.** The merge carries prior-run rows
   forward for every product this run didn't touch (`-SkipPrograms`, `-PrinterBrand None`), so
   tallying after it counts an OLD failure as a new one — exit 1 forever, which then also suppresses
@@ -822,7 +931,7 @@ Major function groups in `alleaves_setup.ps1`:
   printer rows. `Test-SkipMatch` tests `Label`/`File` for downloads but `Name`/`File` for
   installs, so a drifted Label makes one `-SkipPrograms` fragment hit only one phase
   (`-SkipPrograms NiceLabel` downloaded the whole suite and never installed it).
-- **`tests\`** holds the runnable self-checks, both AST-lifting functions out of the `.ps1` rather
+- **`tests\`** holds the runnable self-checks, all AST-lifting functions out of the `.ps1` rather
   than loading it: `Test-AccountPrecheck.ps1` (verdict arms, `ConvertTo-ResumeArgs` **round-trip**
   — not just its string shape, `Clear-AccountSwapState`'s dry-run/unreadable-marker arms plus the
   **surviving resume task** case: marker and staged copy kept, autologon still restored) and
@@ -833,8 +942,16 @@ Major function groups in `alleaves_setup.ps1`:
   "counts zero failures / does not resurrect the retired device key" claim is actually executed —
   plus the cross-table check that every `$PrinterBrands` `RowName` appears as both a `$DriveFiles`
   **Label** and an `$Installers` **Name**, since step 0b's brand skip goes through `Test-SkipMatch`,
-  which reads a different field in each phase).
-  Both exit 0/1, no framework. Stub order matters in the first one —
+  which reads a different field in each phase, plus `Test-PrinterOposConfigured`'s arms against a
+  scratch `HKCU` root — notably that a key with values but **no `(default)`** is NOT configured,
+  and that another logical name or class does not count) and `Test-StepIsolation.ps1`
+  (`Invoke-Step`: a throw sets the flag, the step AFTER it still runs, a clean body's output
+  passes through and a throwing one yields nothing — the brand fallback depends on that; plus two
+  AST asserts that no **bare** step call survives in the install branch and that the install
+  loop's `foreach` body still opens with a `try` recording `fail-exception`) and
+  `Test-InstallerExitCode.ps1` (the `$p.Handle` trap: the live platform behaviour *and* an AST
+  assert that the dereference still sits between the `Start-Process` and the `WaitForExit`).
+  All exit 0/1, no framework. Stub order matters in the first one —
   the `Clear-AccountSwapState` section shadows `Restore-AutoLogon`/`Test-Path`/`Get-Content`/
   `Remove-Item`, so it must stay **last**.
 - Single elevation owner is `Install-Alleaves.bat`; the `.ps1` never self-relaunches — aborts if
