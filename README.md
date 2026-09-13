@@ -3,6 +3,13 @@
 Single-file, double-clickable bootstrap for an **Alleaves POS** terminal on stock
 Windows 10/11. Everything downloads and installs from one `.bat`.
 
+## Download
+
+**[Install-Alleaves.bat](https://github.com/nightious/Alleaves-Auto/releases/latest/download/Install-Alleaves.bat)**
+— always the latest release. Save it to the terminal and double-click it; nothing else is needed.
+
+Older builds and per-release notes: [Releases](https://github.com/nightious/Alleaves-Auto/releases).
+
 ## Prerequisites
 
 - Stock Windows 10/11, internet access to Google Drive and the vendor CDNs (nothing is bundled).
@@ -189,3 +196,7 @@ Edit `alleaves_setup.ps1`, then `.\build-bat.ps1`. Never edit `Install-Alleaves.
 it is a generated, SHA256-verified base64 pack of the `.ps1`. A failed self-verify renames the
 output to `.bat.corrupt`. Self-checks: `tests\Test-AccountPrecheck.ps1`,
 `tests\Test-ManifestMerge.ps1` (exit 0/1, no framework).
+
+To ship it: `.\release.ps1 -Version v1.2.0`. That rebuilds the `.bat`, runs every test, refuses
+a dirty tree (a rebuild that changes the `.bat` means the committed one was stale), then tags and
+publishes the `.bat` as a GitHub release asset. Needs `gh auth status` to be green.

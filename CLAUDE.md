@@ -16,6 +16,7 @@ transport** and the whole deliverable.
 .\build-bat.ps1                                     # ALWAYS after editing the .ps1
 PowerShell -File .\alleaves_setup.ps1 -DryRun       # dev run, no admin, no packing
 .\Install-Alleaves.bat                              # target terminal; self-elevates once
+.\release.ps1 -Version v1.2.0                       # ship: rebuild + test + tag + publish the .bat
 ```
 
 - **The `.bat` does not pick up `.ps1` edits on its own — rebuild.** Never hand-edit the `.bat`; a
