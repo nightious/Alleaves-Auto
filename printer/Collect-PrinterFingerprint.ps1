@@ -1,50 +1,26 @@
 <#
-    Collect-PrinterFingerprint.ps1
-    ---------------------------------------------------------------------------
-    Run this on a terminal that has a POS-X receipt printer ATTACHED (with the cash
-    drawer on its RJ-11, if there is one). We have never had one on the bench: every
-    constant in Set-PrinterOpos
-    was captured from the vendor's own SetupPOS.exe on a printer-less rig, and the
-    OPOS device entries were proved to Open() with nothing plugged in. What is still
-    unknown is everything that only a real unit can show.
+    Collect-PrinterFingerprint.ps1 - field diagnostic for a terminal that has a
+    receipt printer ATTACHED (drawer on its RJ-11, if there is one).
 
-    This capture yields, in order:
-
-      1. The OPOS device entries as they actually exist, verbatim, in BOTH registry
-         views - validates what Set-PrinterOpos wrote (the per-terminal LDN
-         <POSname>_Printer), and reads back the printer's DrawerOpen value.
-         The cash drawer has NO device entry of its own as of 2026-08-12: it follows
-         the printer. A CashDrawer\* key showing up here is a leftover from an older
-         run, not something this build creates.
-      2. The ProgID -> CLSID -> InprocServer32 chain, i.e. whether the service
-         objects the entries point at are really registered and really on disk.
-      3. Get-PnpDevice for the attached USB printer: VID / PID / status / device
-         path. WE HAVE NO SAMPLE OF THIS AT ALL. It is the single most valuable
-         thing a field run can bring back, and it is what would let a future build
-         detect "printer present" the way the scanner step detects a scanner.
-      4. Spooler + Get-Printer / Get-PrinterPort as DIAGNOSTIC CONTEXT ONLY. Nothing
-         is expected to be there - the print path is OPOS, not the Windows queue
-         (POSPrinterSOU.dll imports no WINSPOOL at all). A queue showing up is
-         itself informative, not a requirement.
-      5. Unless -SnapshotOnly, a live OPOS probe: Open -> ClaimDevice ->
-         DeviceEnabled -> PrintNormal, reporting a result code per call. THIS PRINTS
-         A TEST RECEIPT. Watch the drawer while it prints: whether it kicks is the
-         test of the printer's DrawerOpen ("Open CashDrawer") setting - there is no
-         separate drawer device to probe any more.
-
-    Already known (do NOT need again): the printer value set, the ProgID
-    (RecPrinter.POSPrinter.SOU), and that Open() returns 0 with no hardware.
-
-    Invocation (ELEVATED):
+    Run ELEVATED:
         powershell -ExecutionPolicy Bypass -File .\Collect-PrinterFingerprint.ps1
         powershell -ExecutionPolicy Bypass -File .\Collect-PrinterFingerprint.ps1 -SnapshotOnly
 
-    It writes ONE report file to the Desktop and prints the path. Send that file back.
+    Writes ONE report to the Desktop and prints the path. Send that file back.
+
+    WITHOUT -SnapshotOnly it PRINTS A TEST RECEIPT (Open -> ClaimDevice ->
+    DeviceEnabled -> PrintNormal). Watch the drawer while it prints: whether it
+    kicks is the test of the printer's DrawerOpen setting - there is no separate
+    drawer device to probe. Use -SnapshotOnly for the before/after capture that
+    fills Star's value tables.
+
+    What it collects and what is already known: docs/PRINTER-OPOS.md
+    Results so far: docs/PRINTER_OPOS_FIELD_RESULTS.md
 #>
 [CmdletBinding()]
 param(
-    [switch]$SnapshotOnly,      # read current state only; do not touch the hardware
-    [string]$PrinterName        # override the printer LDN (default <COMPUTERNAME>_Printer)
+    [switch]$SnapshotOnly,
+    [string]$PrinterName
 )
 
 $ErrorActionPreference = 'Continue'
@@ -52,17 +28,13 @@ $OposRoots  = @('HKLM:\SOFTWARE\WOW6432Node\OLEforRetail', 'HKLM:\SOFTWARE\OLEfo
 $InstDir    = 'C:\Program Files (x86)\OPOS\StdOPOS2.84'
 $Ps32       = "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 if (-not $PrinterName) { $PrinterName = "$env:COMPUTERNAME`_Printer" }
-# GetFolderPath, not $env:USERPROFILE\Desktop: a OneDrive-redirected Desktop makes that
-# path nonexistent, Start-Transcript then fails and the closing Stop-Transcript throws.
 $Desktop    = [Environment]::GetFolderPath('Desktop')
 if (-not $Desktop -or -not (Test-Path $Desktop)) { $Desktop = $env:USERPROFILE }
 $ReportPath = Join-Path $Desktop ("PrinterFingerprint_{0}_{1:yyyyMMdd_HHmmss}.txt" -f $env:COMPUTERNAME, (Get-Date))
 
 function Section($t) { Write-Host ''; Write-Host ('=' * 72); Write-Host "== $t"; Write-Host ('=' * 72) }
 
-# --- helpers ---------------------------------------------------------------
 
-# Full recursive dump of a registry subtree, values typed, default shown as (Default).
 function Dump-Key($path, $indent = '  ') {
     if (-not (Test-Path $path)) { Write-Host "$indent(absent) $path"; return }
     $k = Get-Item $path -ErrorAction SilentlyContinue
@@ -75,12 +47,6 @@ function Dump-Key($path, $indent = '  ') {
     foreach ($c in ($k.GetSubKeyNames() | Sort-Object)) { Dump-Key (Join-Path $path $c) ($indent + '  ') }
 }
 
-# ProgID -> CLSID -> InprocServer32. NOTE the redirection asymmetry: under
-# HKLM\SOFTWARE\Classes the ProgID keys are SHARED (not redirected), while CLSID
-# keys ARE redirected - so a 32-bit SO's ProgID lives at ...\Classes\<ProgID> but
-# its InprocServer32 lives at ...\Classes\WOW6432Node\CLSID\{...}. Looking for the
-# ProgID under WOW6432Node returns "absent" and reads as a broken registration
-# when nothing is wrong.
 function Resolve-ProgId($progId) {
     $pk = "HKLM:\SOFTWARE\Classes\$progId"
     if (-not (Test-Path $pk)) { Write-Host ("  {0,-30} PROGID ABSENT" -f $progId); return }
@@ -91,14 +57,12 @@ function Resolve-ProgId($progId) {
         $ip = "$v\$clsid\InprocServer32"
         if (Test-Path $ip) {
             $dll = (Get-Item $ip).GetValue('')
-            # No 8.3 expansion needed: Test-Path resolves C:\PROGRA~2\... natively.
             Write-Host ("  {0,-30}   -> {1}" -f '', $dll)
             Write-Host ("  {0,-30}      on disk: {1}" -f '', (Test-Path $dll))
         }
     }
 }
 
-# --------------------------------------------------------------------------
 Start-Transcript -Path $ReportPath -Append | Out-Null
 Write-Host "POS-X receipt printer OPOS FINGERPRINT - $(Get-Date)"
 Write-Host "Machine : $env:COMPUTERNAME   User: $env:USERNAME"
@@ -127,9 +91,6 @@ foreach ($r in $OposRoots) {
 if (-not $found) { Write-Host '    NONE - the installer step did not run, or ran against a different name.' }
 Write-Host ''
 Write-Host ("  expected printer LDN present : {0}" -f ($found -contains $PrinterName))
-# The cash drawer has no device entry of its own - it follows the printer, and THIS is
-# the value that decides whether it does. Captured default is 0 ("not used"); the value
-# for SetupPOS's "Open CashDrawer = Follow Printer" is what a field capture must confirm.
 $drawerOpen = '(printer key not found)'
 foreach ($r in $OposRoots) {
     $pk = "$r\ServiceOPOS\POSPrinter\$PrinterName"
@@ -196,8 +157,6 @@ if ($SnapshotOnly) {
 }
 
 Section '6. LIVE OPOS PROBE - this prints a test receipt'
-# The CCOs are 32-bit, so shell out to the WOW64 host rather than relaunching the
-# whole script under it. Each call reports its own result code.
 $probe = @"
 `$ErrorActionPreference = 'Continue'
 function RC(`$label, `$code) { Write-Host ('  {0,-34} {1}' -f `$label, `$code) }

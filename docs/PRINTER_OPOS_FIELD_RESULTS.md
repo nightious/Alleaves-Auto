@@ -3,10 +3,8 @@
 Running table of real-terminal results for the OPOS receipt-printer step, mirroring
 `SCANNER_OPOS_RIG_VALIDATION_PROMPT.md`'s "Field confirmations so far".
 
-Two brands: **POS-X** (`OLE POS Setup`) and **Star TSP100** (futurePRNT). How the cash drawer is
-handled differs between them — on POS-X, since 2026-08-12, it has **no OPOS device of its own**
-and follows the printer via the printer key's `DrawerOpen` value (captured below); on Star it is
-a genuine second OPOS device.
+Two brands: **POS-X** (`OLE POS Setup`) and **Star TSP100** (futurePRNT); the cash drawer differs
+between them — [PRINTER-OPOS.md#device-count](PRINTER-OPOS.md#device-count).
 
 Every row is backed by a `printer/Collect-PrinterFingerprint.ps1` report. Add a row per
 terminal; attach or paste the raw capture into `docs/` alongside, as the scanner work does.
@@ -104,10 +102,11 @@ the whole install half, end to end:
   and `Scanner` classes — no `POSPrinter`, no `CashDrawer` key.
 
 **The four value tables ship EMPTY** (`$StarPrinterStrings` / `$StarPrinterDWords` /
-`$StarDrawerStrings` / `$StarDrawerDWords`, all `TODO[rig]`). `Set-PrinterOpos`'s
-`not-captured` guard tests `Strings.Count -eq 0` and exits **7** rather than writing a valueless
-device key. Do not fill them with plausible values — the POS-X history is the warning: deriving
-values from the vendor `.inf` instead of a real diff produced a subtly wrong key.
+`$StarDrawerStrings` / `$StarDrawerDWords`, marked in the script `# EMPTY until the bench
+capture - do NOT stub`). `Set-PrinterOpos`'s `not-captured` guard
+([PRINTER-OPOS.md#uncaptured](PRINTER-OPOS.md#uncaptured)) then exits **7** rather than writing a
+valueless device key. Do not fill them with plausible values — the POS-X history is the warning:
+deriving values from the vendor `.inf` instead of a real diff produced a subtly wrong key.
 
 ### The capture procedure
 

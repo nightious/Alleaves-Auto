@@ -61,10 +61,12 @@ Working root `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`) survives `-Uni
 | `alleaves_setup.ps1` | The installer — download, silent install, manifest-driven uninstall. |
 | `build-bat.ps1` | Base64-packs the `.ps1` into `Install-Alleaves.bat` (SHA256 self-verified). |
 | `Install-Alleaves.bat` | **The deliverable.** Generated — never hand-edit. |
+| `docs/` | How it works and why — one file per subsystem; start at `docs/ARCHITECTURE.md`. |
+| `tests/` | Runnable self-checks (no framework; each exits 0 on pass, 1 on failure). |
 | `scanner/Scanner_OPOS_barcode.pdf` | One-scan USB-OPOS programming barcode; no PC software needed. |
-| `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Scanner hardware-validation notes (design lives in the `Set-ScannerOpos` header). |
+| `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` | Scanner hardware-validation notes and results table. |
 | `printer/Collect-PrinterFingerprint.ps1` | Field diagnostic: dumps OPOS entries, ProgID→CLSID→DLL chain, USB IDs, then prints a test receipt (`-SnapshotOnly` reads only). Also the Star capture tool. |
-| `docs/PRINTER_OPOS_FIELD_RESULTS.md` | Printer OPOS design, captured registry values, field results. |
+| `docs/PRINTER_OPOS_FIELD_RESULTS.md` | Printer OPOS captured registry values and field results. |
 
 ## Usage
 
@@ -94,7 +96,7 @@ and printer brand on an interactive run; otherwise it runs unattended.
 
 ### Exit codes
 
-`0` ok · `1` install / uninstall / download / finishing failure · `2` mode ambiguity or a bad
+`0` ok · `1` install / uninstall / download / finishing / step failure · `2` mode ambiguity or a bad
 argument · `3` not elevated · `4` scanner degraded, CoreScanner missing (re-run) · `5`
 working-dir failed · `6` USB-OPOS switch failed (re-run with the scanner attached) · `7` OPOS
 printer registration failed — also when the brand's values aren't captured yet (`StarTSP100`)
@@ -103,6 +105,10 @@ and was not overridden (nothing downloaded or written; `-Uninstall` skips the ch
 reports and continues) · `9` account swap armed, rebooting to resume — do not dispatch a tech.
 
 `4`, `6` and `7` are non-fatal "re-run" signals and never mask `1`.
+
+`10` comes from the **launcher**, not the script: `Install-Alleaves.bat` could not decode its
+embedded payload, so nothing ran. It sits outside the `0`–`9` set above on purpose — it used to
+be `9`, which an RMM reads as "the box is rebooting to finish itself" and skips.
 
 ### Account precheck and automatic fix
 
