@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Single-file Alleaves POS bootstrap: Google Drive download + silent install +
@@ -96,6 +96,7 @@ param(
 #   docs/SCANNER-OPOS.md    Zebra USB-OPOS switch
 #   docs/PRINTER-OPOS.md    receipt printer OPOS registration
 #   docs/BUILD-BAT.md       the .bat stub: fetch, elevation probe, arg relay
+#   docs/LOG-SHIPPING.md    the per-run Slack summary: webhook, payload, fail-soft
 # Add new rationale THERE and leave a pointer here; do not re-grow the essays.
 # ---------------------------------------------------------------------------
 $ErrorActionPreference = 'Continue'
@@ -525,6 +526,233 @@ function Invoke-AccountSwapOffer($acct, $bound, $promote) {
     return $true
 }
 
+# ---------------------------------------------------------------------------
+# Run summary shipping. Defined HERE, ahead of the pre-dispatch guards, because
+# the exit-9 account-swap path posts before the dispatch tail exists.
+# docs/LOG-SHIPPING.md#hook
+# ---------------------------------------------------------------------------
+$script:RunStart = Get-Date
+
+# docs/LOG-SHIPPING.md#webhook  (encoded, not secret - the .ps1 is a public release asset)
+# ponytail: base64 only dodges the leaked-credential scanners that would auto-revoke a plaintext
+# URL. If it is revoked anyway, re-issue the webhook and cut a release - there is no rotation lever.
+$script:SlackHook = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(
+    'aHR0cHM6Ly9ob29rcy5zbGFjay5jb20vc2VydmljZXMvVDBBUEEyMDlIRkIvQjBDMkczR1VEU0wvUHppTFFjNTFoUlZqOGkyVnJ6a3VJTnBx'))
+
+# docs/INSTALL-ENGINE.md#download
+function Set-Tls12 {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]3072
+}
+
+# docs/PRINTER-OPOS.md#ldn
+function Get-PosNamePrefix {
+    if ($Manifest -and $Manifest.computerRenamed -and $Manifest.computerRenamed.to -and
+        ($Manifest.computerRenamed.applied -or $Manifest.computerRenamed.dryRun)) {
+        return $Manifest.computerRenamed.to
+    }
+    $pending = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' `
+                -Name ComputerName -ErrorAction SilentlyContinue).ComputerName
+    if ($pending) { return $pending }
+    return $env:COMPUTERNAME
+}
+
+# one code per line - these land in a narrow 2-column field: docs/LOG-SHIPPING.md#payload
+function Get-ResultTally {
+    param($Rows)
+    # Group-Object takes the scriptblock, not 'result': a bare name does not resolve a hashtable key.
+    ((@($Rows) | Where-Object { $_.result } | Group-Object { $_.result } | Sort-Object Name |
+        ForEach-Object { "$($_.Count) $($_.Name)" }) -join "`n")
+}
+
+# ok-sets mirror the exit tally's $failed / $depFailed AND the config-only "did anything change"
+# check - a success code missing here names a healthy row as a failure. docs/LOG-SHIPPING.md#payload
+function Get-FailedRows {
+    param($Rows, [string[]]$OkResults = @('ok', 'dryrun'))
+    $out = @()
+    foreach ($r in @($Rows)) {
+        if (-not $r) { continue }
+        $res = [string]$r.result
+        if (-not $res -or $OkResults -contains $res -or $res -like 'skipped*') { continue }
+        $name = if ($r.name) { $r.name } elseif ($r.logicalName) { $r.logicalName }
+                elseif ($r.model) { $r.model } else { '(unnamed)' }
+        $out += "$name ($res)"
+    }
+    $out
+}
+
+# '04:12' reads as a clock time; '4m 12s' does not. docs/LOG-SHIPPING.md#payload
+function Format-Elapsed {
+    param([timespan]$Span)
+    if ($Span.TotalHours -ge 1) { '{0}h {1:00}m' -f [int]$Span.TotalHours, $Span.Minutes }
+    else { '{0}m {1:00}s' -f $Span.Minutes, $Span.Seconds }
+}
+
+# docs/LOG-SHIPPING.md#payload  (pure: no I/O, so tests\Test-LogShipping.ps1 can run it)
+function Format-RunSummary {
+    param(
+        [Parameter(Mandatory)][int]$ExitCode,
+        [string]$Terminal = '',
+        [string]$Mode = 'install',
+        [string]$RunLog = '',
+        [string]$Elapsed = '',
+        $RunManifest = $null,
+        [string[]]$FailLines = @(),
+        [string]$Tail = '',
+        [int]$Budget = 2800,    # per detail part; docs/LOG-SHIPPING.md#payload
+        # MEASURED, not documented: Slack silently truncates legacy attachment text at exactly
+        # 8000 chars - a 12000-char probe kept offset 7900 and lost 8000. docs/LOG-SHIPPING.md#payload
+        [int]$MaxDetail = 7990
+    )
+    # Mirrors docs/ARCHITECTURE.md#exit-codes; 2/3/5/8 are pre-dispatch and never reach here.
+    # Kept SHORT: this shares a two-column row with Elapsed, and a wrap reads as one run-on line.
+    $meaning = switch ($ExitCode) {
+        0 { 'ok' }
+        1 { 'step failure' }
+        4 { 'scanner degraded' }
+        6 { 'OPOS switch failed' }
+        7 { 'printer OPOS failed' }
+        9 { 'account swap - rebooting to resume' }
+        default { 'see log' }
+    }
+    # icon, rail colour and verb are one three-way split: docs/LOG-SHIPPING.md#colour
+    $icon, $colour, $verb = switch ($ExitCode) {
+        0                  { ':white_check_mark:', 'good',    'complete' }
+        { $_ -in 4, 6, 7, 9 } { ':warning:',       'warning', 'finished with warnings' }
+        default            { ':x:',                'danger',  'failed' }
+    }
+    $fence  = '```'
+    $redact = { param($s) $s -replace '(?i)(LICENSECODE=).*', '$1***' }   # docs/LOG-SHIPPING.md#redaction
+    $clamp  = { param($s, $n) if ($s.Length -gt $n) { $s.Substring(0, $n - 3) + '...' } else { $s } }
+
+    # Card 1: the summary grid. 'short' pairs the fields into two columns.
+    $fields = @(@{ title = 'Result'; value = "exit $ExitCode - $meaning"; short = $true })
+    if ($Elapsed) { $fields += @{ title = 'Elapsed'; value = $Elapsed; short = $true } }
+    if ($RunManifest) {
+        foreach ($p in @(@('installed', 'Products'), @('dependencies', 'Dependencies'),
+                         @('scannerConfigured', 'Scanner'), @('printerConfigured', 'Printer'))) {
+            $tally = Get-ResultTally $RunManifest.($p[0])
+            if ($tally) { $fields += @{ title = $p[1]; value = $tally; short = $true } }
+        }
+        if ($RunManifest.computerRenamed -and $RunManifest.computerRenamed.to) {
+            $fields += @{ title = 'Renamed'
+                          value = "$($RunManifest.computerRenamed.from) -> $($RunManifest.computerRenamed.to)"
+                          short = $true }
+        }
+    }
+
+    # Card 2: the detail, in the order you would read it - what failed, then why, then the raw end.
+    $detail = @()
+
+    # Which item failed, by name - the thing a count can never tell you.
+    $named = @()
+    if ($RunManifest) {
+        $named += Get-FailedRows $RunManifest.installed
+        $named += Get-FailedRows $RunManifest.dependencies      -OkResults @('ok', 'already-present', 'dryrun')
+        $named += Get-FailedRows $RunManifest.scannerConfigured -OkResults @('ok', 'already-opos', 'dryrun')
+        $named += Get-FailedRows $RunManifest.printerConfigured -OkResults @('ok', 'already-configured', 'dryrun')
+    }
+    if ($named.Count) {
+        $detail += & $clamp ("*Failed*`n" + (($named | ForEach-Object { "- $_" }) -join "`n")) $Budget
+    }
+
+    # Harvested from the WHOLE transcript, so an early failure is still visible. Keep the FIRST
+    # ones: the first failure is usually the cause of every one after it.
+    if ($FailLines.Count) {
+        $keep = @($FailLines | Select-Object -First 25 | ForEach-Object { & $redact $_ })
+        $detail += "*Flagged lines* ($($FailLines.Count) in the log)`n$fence`n" +
+                   (& $clamp ($keep -join "`n") ($Budget - 200)) + "`n$fence"
+    }
+
+    # The raw tail, trimmed from the TOP so the newest output always survives. It is the LAST
+    # part, so it takes whatever is left under the hard ceiling - clamping the JOINED text
+    # instead would cut the newest lines, which is what the top-trim exists to protect.
+    # No $Budget cap here: the tail is capped upstream at 60 lines, so letting it use the
+    # headroom the other parts left just means fewer of those 60 get trimmed away.
+    $room = $MaxDetail - ($detail -join "`n`n").Length - 2 - 40
+    if ($ExitCode -ne 0 -and $Tail -and $room -gt 200) {
+        $rows  = @((& $redact $Tail) -split "`r?`n")
+        $start = $rows.Count
+        $len   = 0
+        for ($i = $rows.Count - 1; $i -ge 0; $i--) {
+            $len += $rows[$i].Length + 1
+            if ($len -gt $room) { break }
+            $start = $i
+        }
+        # One line fatter than the whole budget must still produce a clamped tail, not silence.
+        if ($start -eq $rows.Count) { $start = $rows.Count - 1 }
+        $detail += "*Log tail*`n$fence`n" +
+                   (& $clamp (($rows[$start..($rows.Count - 1)]) -join "`n") $room) + "`n$fence"
+    }
+
+    $bits = @()
+    if ($RunManifest -and $RunManifest.user) { $bits += $RunManifest.user }
+    if ($RunLog) { $bits += $RunLog }
+    $footer = $bits -join '  |  '
+
+    # Legacy attachment fields, NOT blocks: the colour rail renders for one and not the other.
+    # Two cards so the grid sits ABOVE the detail - a single attachment renders text before
+    # fields, which buries the summary. docs/LOG-SHIPPING.md#colour
+    $card = @{
+        color     = $colour
+        fallback  = "$icon $Terminal - $Mode - exit $ExitCode ($meaning)"
+        title     = & $clamp "$icon $Terminal - $Mode $verb" 150
+        fields    = $fields
+        mrkdwn_in = @('fields', 'text')
+    }
+    if ($detail.Count) {
+        @{ attachments = @($card, @{ color     = $colour
+                                     text      = ($detail -join "`n`n")
+                                     footer    = $footer
+                                     mrkdwn_in = @('text') }) }
+    } else {
+        $card.footer = $footer
+        @{ attachments = @($card) }
+    }
+}
+
+# docs/LOG-SHIPPING.md#hook
+function Send-RunSummary {
+    param([Parameter(Mandatory)][int]$ExitCode)
+    if ($DryRun) { Dry 'would post the run summary to Slack (#autoinstall-logs)'; return }
+    $msg = ''
+    try {
+        Set-Tls12   # process-wide, but an uninstall or config-only run never reached a download
+        $failLines = @()
+        $tail      = ''
+        if ($ExitCode -ne 0 -and $RunLog -and (Test-Path -LiteralPath $RunLog)) {
+            # ONE read: the whole transcript for flagged lines, its end for the tail.
+            $all       = @(Get-Content -LiteralPath $RunLog -ErrorAction SilentlyContinue)
+            $failLines = @($all | Where-Object { $_ -match '\[(FAIL|WARN)\]' })
+            $tail      = (@($all | Select-Object -Last 60)) -join "`n"
+        }
+        # exit 9 posts pre-dispatch: no $ModeBanner, no manifest, no transcript yet.
+        $modeName = if ($ModeBanner) { $ModeBanner[0] } else { $Mode }
+        # The summary must see THIS run, not the merged-back prior ones: docs/MANIFEST.md#merge
+        $runMan   = if ($script:SummaryManifest) { $script:SummaryManifest } else { $Manifest }
+        $payload = Format-RunSummary -ExitCode $ExitCode -Terminal (Get-PosNamePrefix) -Mode $modeName `
+                                     -RunLog $RunLog -RunManifest $runMan -Tail $tail -FailLines $failLines `
+                                     -Elapsed (Format-Elapsed ((Get-Date) - $script:RunStart))
+        # -Depth 10 is load-bearing: the default of 2 flattens blocks to the literal string
+        # 'System.Collections.Hashtable' and Slack answers 400. docs/LOG-SHIPPING.md#payload
+        Invoke-RestMethod -Uri $script:SlackHook -Method Post -ContentType 'application/json' `
+                          -Body ($payload | ConvertTo-Json -Depth 10 -Compress) -TimeoutSec 15 | Out-Null
+        $msg = 'run summary posted to Slack (#autoinstall-logs)'
+        Ok $msg
+    } catch {
+        # Slack states the real reason (invalid_payload, no_text) in the BODY, which PS 5.1 drops
+        # from $_.Exception.Message and keeps in $_.ErrorDetails. docs/LOG-SHIPPING.md#fail-soft
+        $why = if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        $msg = "run summary NOT posted: $why"
+        # Never Warn - a failed post is not actionable at the terminal. docs/LOG-SHIPPING.md#fail-soft
+        Info "  Slack $msg"
+    }
+    # The console is gone on an unattended run and the transcript is already closed, so the one
+    # thing worth recording gets appended by hand. docs/LOG-SHIPPING.md#fail-soft
+    if ($RunLog -and (Test-Path -LiteralPath $RunLog)) {
+        Add-Content -LiteralPath $RunLog -Value "  [slack] $msg" -ErrorAction SilentlyContinue
+    }
+}
+
 $Mode = if ($Uninstall) { 'Uninstall' } elseif ($ScannerConfigOnly) { 'ScannerConfig' } elseif ($PrinterConfigOnly) { 'PrinterConfig' } else { 'Install' }
 Write-Host "Alleaves setup - parsed MODE: $Mode" -ForegroundColor Cyan
 Info ("  Args: Uninstall={0} DryRun={1} SkipMasterList={2} SkipUninstallTeamViewer={3} ForceReinstall={4} ScannerConfigOnly={5} ForceFingerprint={6} SkipPrograms='{7}'" -f `
@@ -685,6 +913,9 @@ if (-not $Uninstall) {
             else { exit 8 }
         }
         elseif ($wouldOffer -and (Invoke-AccountSwapOffer $acct $PSBoundParameters $wouldPromote)) {
+            # The one pre-dispatch exit worth posting: the box is rebooting to resume itself,
+            # so nobody should be dispatched to it. docs/LOG-SHIPPING.md#gap
+            Invoke-Step 'Slack swap summary' { Send-RunSummary -ExitCode 9 }
             exit 9
         }
         elseif (Confirm-Swap $continueMsg) { Set-AccountCheckOverride $acct 'prompt' }
@@ -722,6 +953,8 @@ $script:PrinterConfigFailed = $false
 $script:PrinterBrandResolved = $null
 $script:ManifestWriteFailed = $false
 $script:UserAgent       = 'Mozilla/5.0 AlleavesAuto/1.0'
+# Pre-merge snapshot for the Slack card; $null until a mode sets it: docs/LOG-SHIPPING.md#payload
+$script:SummaryManifest = $null
 
 $AlleavesUrl = 'https://app.alleaves.com'
 
@@ -923,11 +1156,6 @@ function Remove-InstallShieldOrphans {
     return $failed
 }
 
-
-# docs/INSTALL-ENGINE.md#download
-function Set-Tls12 {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]3072
-}
 
 # docs/INSTALL-ENGINE.md#truncation
 function Test-RealBinary {
@@ -3377,18 +3605,6 @@ $PrinterBrands = [ordered]@{
     }
 }
 
-# docs/PRINTER-OPOS.md#ldn
-function Get-PosNamePrefix {
-    if ($Manifest -and $Manifest.computerRenamed -and $Manifest.computerRenamed.to -and
-        ($Manifest.computerRenamed.applied -or $Manifest.computerRenamed.dryRun)) {
-        return $Manifest.computerRenamed.to
-    }
-    $pending = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' `
-                -Name ComputerName -ErrorAction SilentlyContinue).ComputerName
-    if ($pending) { return $pending }
-    return $env:COMPUTERNAME
-}
-
 # docs/PRINTER-OPOS.md#brand-prompt
 function Resolve-PrinterBrand {
     if ($script:PrinterBrandResolved) { return $script:PrinterBrandResolved }
@@ -3690,6 +3906,10 @@ try {
                 if ($scan) { $script:ScannerConfigFailed = $true } else { $script:PrinterConfigFailed = $true }
             }
         }
+        # The card must show THIS run: Save-Manifest merges prior rows back in.
+        # A round trip, not .Clone(): New-InstallManifest returns an [ordered] hashtable, and
+        # OrderedDictionary has no Clone(). docs/ARCHITECTURE.md#tally-snapshot-ordering
+        $script:SummaryManifest = $Manifest | ConvertTo-Json -Depth 6 | ConvertFrom-Json
         Save-Manifest
         $script:ManifestSaved = -not $script:ManifestWriteFailed
         # docs/ARCHITECTURE.md#what-folds-into-exit-1  (Clear-AccountSwapState runs pre-dispatch in EVERY mode)
@@ -3764,6 +3984,8 @@ try {
         $failed    = @($Manifest.installed    | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
         $depFailed = @($Manifest.dependencies | Where-Object { $_.result -and ($_.result -notin @('ok','already-present','dryrun')) })
         $renamedTo = $Manifest.computerRenamed.to
+        # the same snapshot, for the Slack card (round trip: OrderedDictionary has no Clone())
+        $script:SummaryManifest = $Manifest | ConvertTo-Json -Depth 6 | ConvertFrom-Json
 
         Save-Manifest
         $script:ManifestSaved = -not $script:ManifestWriteFailed
@@ -3827,6 +4049,8 @@ try {
 } finally {
     if (-not $Uninstall -and $Manifest -and -not $script:ManifestSaved) { try { Save-Manifest } catch { Write-Verbose "finally: last-resort Save-Manifest failed: $($_.Exception.Message)" } }
     try { Stop-Transcript | Out-Null } catch { Write-Verbose "finally: Stop-Transcript failed: $($_.Exception.Message)" }
+    # AFTER Stop-Transcript so the tail is flushed and complete: docs/LOG-SHIPPING.md#hook
+    Invoke-Step 'Slack run summary' { Send-RunSummary -ExitCode $exitCode }
 }
 
 exit $exitCode

@@ -33,11 +33,12 @@ PowerShell -File .\alleaves_setup.ps1 -DryRun       # dev run, no admin. There i
 ## Checks to run before calling a change done
 
 ```powershell
-.\tests\Test-DocLinks.ps1                           # all five exit 0 on pass, 1 on failure
+.\tests\Test-DocLinks.ps1                           # all six exit 0 on pass, 1 on failure
 .\tests\Test-AccountPrecheck.ps1
 .\tests\Test-ManifestMerge.ps1
 .\tests\Test-StepIsolation.ps1
 .\tests\Test-InstallerExitCode.ps1
+.\tests\Test-LogShipping.ps1
 PowerShell -File .\alleaves_setup.ps1 -DryRun
 ```
 
@@ -79,6 +80,7 @@ first edit — every rule here has a failure behind it.
 | Zebra USB-OPOS switch | `docs/SCANNER-OPOS.md` |
 | Receipt-printer OPOS registration | `docs/PRINTER-OPOS.md` |
 | The `.bat` stub: the fetch, elevation probe, arg relay, two-repo release split | `docs/BUILD-BAT.md` |
+| Per-run Slack summary: the encoded webhook, payload budget, fail-soft rules | `docs/LOG-SHIPPING.md` |
 | Coding conventions above, in full | `docs/CONVENTIONS.md` |
 | Printer bench evidence | `docs/PRINTER_OPOS_FIELD_RESULTS.md` |
 | Scanner rig validation log | `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` |

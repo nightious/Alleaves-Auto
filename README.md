@@ -125,6 +125,13 @@ survives `-Uninstall`):
 - `install_manifest.json` — everything installed, placed and changed; `-Uninstall` replays it.
 - `scanner_new_model_<model>_<ts>.txt` — scanner fingerprint for an unrecognized model. Send it back.
 
+Every real run also posts a one-message card to the private Slack channel `#autoinstall-logs` — terminal
+name, exit code, per-step results, and a green / yellow / red bar down the left edge. A failure adds the
+items that failed **by name**, every `[FAIL]`/`[WARN]` line found anywhere in the log, and the last 60
+lines of the transcript. `-DryRun` posts nothing.
+If the terminal has no route to `hooks.slack.com` the post is skipped with a white note and the install is
+otherwise unaffected; the log on disk is always the authority.
+
 ## Files
 
 | File | Purpose |
