@@ -132,3 +132,21 @@ switch to piping via `-EncodedCommand`.
 
 `PowerShell -File .\alleaves_setup.ps1 -DryRun` — no admin needed, and `-DryRun` falls back to `%TEMP%` for
 its working root.
+
+## <a id="dist-repo"></a>Two repos: source private, releases public
+
+The download link has to work for an anonymous browser on a fresh terminal, and a release asset in a
+**private** repo does not: `releases/latest/download/...` needs a token. So the split is two repos, not
+one private one:
+
+| Repo | Visibility | Holds |
+|---|---|---|
+| `nightious/Alleaves-Auto` | private | source, `docs/`, `tests/`, tags |
+| `nightious/Alleaves-Install` | public | a README and the release assets, nothing else |
+
+`release.ps1` tags the **source** repo and publishes the asset to `$DistRepo` with `gh ... --repo`.
+`gh release create` creates the tag in the dist repo at its default-branch HEAD, so that repo needs at
+least one commit before the first release — an empty repo has no branch to tag and the call fails.
+
+This hides the docs, the tests and the history. It does not hide the script: the `.bat` is base64 of
+`alleaves_setup.ps1` ([#pack](#pack)), so anyone holding the deliverable can decode the source.

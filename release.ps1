@@ -9,8 +9,9 @@
     aborts - that is the "forgot to run build-bat.ps1" guard, caught before anyone
     downloads a .bat built from stale source.
 
-    Published asset lands at the permanent link
-    https://github.com/<owner>/<repo>/releases/latest/download/Install-Alleaves.bat
+    The tag goes on this (private) repo; the asset is published to the public dist repo,
+    landing at the permanent link
+    https://github.com/nightious/Alleaves-Install/releases/latest/download/Install-Alleaves.bat
 
     Needs the gh CLI, authenticated (gh auth status).
 
@@ -31,6 +32,8 @@ param(
 
 $ErrorActionPreference = 'Continue'   # native stderr is not a failure; $LASTEXITCODE is
 Set-Location $PSScriptRoot
+
+$DistRepo = 'nightious/Alleaves-Install'   # docs/BUILD-BAT.md#dist-repo
 
 function Fail($m) { Write-Host "[FAIL] $m" -ForegroundColor Red; exit 1 }
 function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
@@ -69,8 +72,8 @@ if ($LASTEXITCODE -ne 0) { Fail 'git tag failed.' }
 git push origin $Version
 if ($LASTEXITCODE -ne 0) { git tag -d $Version | Out-Null; Fail 'git push failed - local tag removed.' }
 
-gh release create $Version Install-Alleaves.bat --title $Version --notes $Notes
-if ($LASTEXITCODE -ne 0) { Fail "gh release create failed. The tag is pushed; re-run just: gh release create $Version Install-Alleaves.bat" }
+gh release create $Version Install-Alleaves.bat --repo $DistRepo --title $Version --notes $Notes
+if ($LASTEXITCODE -ne 0) { Fail "gh release create failed. The tag is pushed; re-run just: gh release create $Version Install-Alleaves.bat --repo $DistRepo" }
 
 Write-Host "`nReleased $Version" -ForegroundColor Green
-gh release view $Version --json url --jq .url
+gh release view $Version --repo $DistRepo --json url --jq .url

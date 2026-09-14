@@ -15,8 +15,8 @@ Everything downloads and installs from one `.bat`.
 
 **Run it**
 
-1. Download **[Install-Alleaves.bat](https://github.com/nightious/Alleaves-Auto/releases/latest/download/Install-Alleaves.bat)**
-   ([older builds](https://github.com/nightious/Alleaves-Auto/releases)) onto the terminal.
+1. Download **[Install-Alleaves.bat](https://github.com/nightious/Alleaves-Install/releases/latest/download/Install-Alleaves.bat)**
+   ([older builds](https://github.com/nightious/Alleaves-Install/releases)) onto the terminal.
 2. Double-click it and accept the UAC prompt. It elevates once, then runs.
 3. Answer the two prompts: **computer name** (Enter skips) and **printer brand**.
 4. Wait. Everything else is silent; nothing reboots on its own.
