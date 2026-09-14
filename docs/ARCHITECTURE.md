@@ -1,8 +1,9 @@
 # Architecture
 
 `alleaves_setup.ps1` is a single-file, self-bootstrapping POS installer for stock Windows 10/11 terminals:
-silent, idempotent, reversible. `Install-Alleaves.bat` is a generated transport around it
-([BUILD-BAT.md](BUILD-BAT.md)) and is the whole deliverable.
+silent, idempotent, reversible. `Install-Alleaves.bat` is a payload-free stub around it that downloads this
+script from the latest release on every run ([BUILD-BAT.md#fetch](BUILD-BAT.md#fetch)) and is the whole
+deliverable.
 
 Subsystem docs: [ACCOUNT-SWAP.md](ACCOUNT-SWAP.md) · [INSTALL-ENGINE.md](INSTALL-ENGINE.md) ·
 [MANIFEST.md](MANIFEST.md) · [FINISHING.md](FINISHING.md) · [SCANNER-OPOS.md](SCANNER-OPOS.md) ·
@@ -11,7 +12,7 @@ Subsystem docs: [ACCOUNT-SWAP.md](ACCOUNT-SWAP.md) · [INSTALL-ENGINE.md](INSTAL
 ## <a id="run-shape"></a>Run shape
 
 Working root `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`, `logs\install_manifest.json`). It
-deliberately **survives `-Uninstall`** — the `.bat` deletes its own decoded `.ps1` from `%TEMP%`, so the
+deliberately **survives `-Uninstall`** — the `.bat` deletes its own downloaded `.ps1` from `%TEMP%`, so the
 working root is the only durable state. `-DryRun` without admin falls back to `%TEMP%`. `$WorkDir` is **not
 caller-overridable**: a deep path overflows the IS5 stub's fixed command-line buffer
 ([INSTALL-ENGINE.md#is5-buffer](INSTALL-ENGINE.md#is5-buffer)), and nothing ever set it.
@@ -25,8 +26,8 @@ and the transcript still live under `$WorkDir`.
 The transcript is opened **once, before the mode branch**, from a mode-keyed log prefix and banner; all
 three branches used to carry their own copy and one dry-run banner had already drifted from the others.
 
-**Single elevation owner is the `.bat`.** The `.ps1` never relaunches itself; it aborts with exit 3 if not
-admin (except `-DryRun`).
+**Single elevation owner is the `.bat`** ([BUILD-BAT.md#elevation-probe](BUILD-BAT.md#elevation-probe)).
+The `.ps1` never relaunches itself; it aborts with exit 3 if not admin (except `-DryRun`).
 
 ## <a id="order-of-operations"></a>Order of operations
 
@@ -105,12 +106,12 @@ Set in the `$exitCode` dispatch tail — the authoritative copy. This is an RMM 
 | 7 | OPOS receipt-printer registration failed |
 | 8 | account precheck failed and was not overridden |
 | 9 | account swap armed, rebooting to resume — **an RMM must not dispatch a tech** |
-| 10 | **launcher only** — the `.bat` could not decode its payload; nothing ran |
+| 10 | **launcher only** — the `.bat` could not download the installer; nothing ran |
 
 `2`/`3`/`5`/`8`/`9` are pre-dispatch `exit`s: console-only, nothing logged to file. `9` is distinct from `8`
 on purpose — `8` means blocked and nothing was done, `9` means the box is coming back to finish itself — and
 `10` sits outside the `0`–`9` set so the launcher's own failure can never be read as `9`
-([BUILD-BAT.md#decode-guard](BUILD-BAT.md#decode-guard)).
+([BUILD-BAT.md#fetch](BUILD-BAT.md#fetch)).
 
 ### <a id="what-folds-into-exit-1"></a>What folds into exit 1
 

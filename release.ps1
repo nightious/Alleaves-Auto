@@ -1,17 +1,22 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Cut a GitHub release: rebuild Install-Alleaves.bat, run the tests, tag, publish.
+    Cut a GitHub release: run the tests, tag, publish BOTH assets.
 
 .DESCRIPTION
-    The .bat is the whole deliverable, so it is rebuilt here instead of trusted from
-    the tree. If the rebuild changes it, the working tree goes dirty and the release
-    aborts - that is the "forgot to run build-bat.ps1" guard, caught before anyone
-    downloads a .bat built from stale source.
+    Publishing is a DEPLOYMENT, not just an upload. The shipped .bat carries no payload -
+    it downloads alleaves_setup.ps1 from `releases/latest/download` on every run
+    (docs/BUILD-BAT.md#fetch), so the .ps1 published here is what every terminal already
+    in the field executes on its next run. There is no pin lever; roll back by deleting
+    the bad release, which re-points `latest` at the previous one:
 
-    The tag goes on this (private) repo; the asset is published to the public dist repo,
-    landing at the permanent link
-    https://github.com/nightious/Alleaves-Install/releases/latest/download/Install-Alleaves.bat
+        gh release delete vX.Y.Z
+
+    Both files are uploaded. Shipping the .bat without the .ps1 makes every stub 404.
+
+    One public repo serves both the source and the assets (docs/BUILD-BAT.md#dist-repo), so
+    `gh` resolves it from `origin` and no --repo flag is needed. The permanent link is
+    https://github.com/nightious/Alleaves-Auto/releases/latest/download/Install-Alleaves.bat
 
     Needs the gh CLI, authenticated (gh auth status).
 
@@ -33,16 +38,10 @@ param(
 $ErrorActionPreference = 'Continue'   # native stderr is not a failure; $LASTEXITCODE is
 Set-Location $PSScriptRoot
 
-$DistRepo = 'nightious/Alleaves-Install'   # docs/BUILD-BAT.md#dist-repo
-
 function Fail($m) { Write-Host "[FAIL] $m" -ForegroundColor Red; exit 1 }
 function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 
 if (git tag -l $Version) { Fail "tag $Version already exists." }
-
-Step 'Rebuild Install-Alleaves.bat'
-& .\build-bat.ps1
-if ($LASTEXITCODE -ne 0) { Fail 'build-bat.ps1 failed - not releasing.' }
 
 Step 'Tests'
 # Count first: an empty tests\ makes the loop body never run and the gate pass vacuously.
@@ -56,7 +55,7 @@ foreach ($t in $tests) {
 }
 
 $dirty = git status --porcelain
-if ($dirty) { Fail "working tree is dirty - commit first. A rebuilt .bat here means the committed one was stale:`n$dirty" }
+if ($dirty) { Fail "working tree is dirty - commit first. The .ps1 uploaded below IS the deployment, so it must be the committed one:`n$dirty" }
 
 if (-not $Notes) {
     $prev  = git describe --tags --abbrev=0 2>$null
@@ -72,8 +71,10 @@ if ($LASTEXITCODE -ne 0) { Fail 'git tag failed.' }
 git push origin $Version
 if ($LASTEXITCODE -ne 0) { git tag -d $Version | Out-Null; Fail 'git push failed - local tag removed.' }
 
-gh release create $Version Install-Alleaves.bat --repo $DistRepo --title $Version --notes $Notes
-if ($LASTEXITCODE -ne 0) { Fail "gh release create failed. The tag is pushed; re-run just: gh release create $Version Install-Alleaves.bat --repo $DistRepo" }
+# No --repo: gh resolves it from origin, which is also where the assets belong.
+# This repo must stay PUBLIC or every installer in the field breaks. docs/BUILD-BAT.md#dist-repo
+gh release create $Version Install-Alleaves.bat alleaves_setup.ps1 --title $Version --notes $Notes
+if ($LASTEXITCODE -ne 0) { Fail "gh release create failed. The tag is pushed; re-run just: gh release create $Version Install-Alleaves.bat alleaves_setup.ps1" }
 
 Write-Host "`nReleased $Version" -ForegroundColor Green
-gh release view $Version --repo $DistRepo --json url --jq .url
+gh release view $Version --json url --jq .url

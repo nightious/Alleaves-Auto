@@ -7,20 +7,23 @@ not repeat it. End-user usage and the option / exit-code tables are in `README.m
 
 AlleavesAuto is a single-file, self-bootstrapping POS installer for "Alleaves" on stock Windows
 10/11 terminals: silent, idempotent (re-runs skip installed products), reversible (manifest-driven
-uninstall). `alleaves_setup.ps1` is the **source of truth**; `Install-Alleaves.bat` is a
-**generated transport** and the whole deliverable.
+uninstall). `alleaves_setup.ps1` is the **source of truth** *and* the shipped artifact;
+`Install-Alleaves.bat` is a payload-free stub that downloads it from the latest release on every
+run, and is the whole deliverable.
 
 ## Build & run
 
 ```powershell
-.\build-bat.ps1                                     # ALWAYS after editing the .ps1
-PowerShell -File .\alleaves_setup.ps1 -DryRun       # dev run, no admin, no packing
-.\Install-Alleaves.bat                              # target terminal; self-elevates once
-.\release.ps1 -Version v1.2.0                       # ship: rebuild + test + tag + publish the .bat
+PowerShell -File .\alleaves_setup.ps1 -DryRun       # dev run, no admin. There is nothing to build.
+.\Install-Alleaves.bat                              # target terminal; elevates, fetches, runs
+.\release.ps1 -Version v1.3.0                       # ship: test + tag + publish BOTH assets
 ```
 
-- **The `.bat` does not pick up `.ps1` edits on its own — rebuild.** Never hand-edit the `.bat`; a
-  failed self-verify renames it to `.bat.corrupt`, and that is deliberate.
+- **The `.bat` runs the *published* `.ps1`, never your local edits.** Test against the `.ps1`
+  directly; exercise the `.bat` only after a release. It is a checked-in ~90-line source file —
+  edit it like any other, nothing generates it.
+- **Publishing is a deployment.** Every `.bat` in the field runs the newly uploaded `.ps1` on its
+  next double-click. There is no pin lever; roll back with `gh release delete`.
 - The `.ps1` `param()` block is the authoritative option set — `README.md`'s table mirrors it.
 - Working root `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`, `logs\install_manifest.json`)
   survives `-Uninstall` by design. `-DryRun` without admin falls back to `%TEMP%`.
@@ -30,7 +33,6 @@ PowerShell -File .\alleaves_setup.ps1 -DryRun       # dev run, no admin, no pack
 ## Checks to run before calling a change done
 
 ```powershell
-.\build-bat.ps1                                     # self-verifies SHA256 out of the written .bat
 .\tests\Test-DocLinks.ps1                           # all five exit 0 on pass, 1 on failure
 .\tests\Test-AccountPrecheck.ps1
 .\tests\Test-ManifestMerge.ps1
@@ -76,7 +78,7 @@ first edit — every rule here has a failure behind it.
 | Rename, taskbar pins, default browser, Chrome bookmark, the logon task | `docs/FINISHING.md` |
 | Zebra USB-OPOS switch | `docs/SCANNER-OPOS.md` |
 | Receipt-printer OPOS registration | `docs/PRINTER-OPOS.md` |
-| `build-bat.ps1` and the `.bat` transport / elevation probe | `docs/BUILD-BAT.md` |
+| The `.bat` stub: the fetch, elevation probe, arg relay, two-repo release split | `docs/BUILD-BAT.md` |
 | Coding conventions above, in full | `docs/CONVENTIONS.md` |
 | Printer bench evidence | `docs/PRINTER_OPOS_FIELD_RESULTS.md` |
 | Scanner rig validation log | `docs/SCANNER_OPOS_RIG_VALIDATION_PROMPT.md` |

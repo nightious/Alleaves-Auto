@@ -1,55 +1,54 @@
-# Build and the `.bat` transport
+# The `.bat` transport
 
-`alleaves_setup.ps1` is the **source of truth**. `Install-Alleaves.bat` is a **generated transport** —
-`build-bat.ps1` base64-packs the `.ps1` into it — and is the whole deliverable.
+`alleaves_setup.ps1` is the **source of truth**. `Install-Alleaves.bat` is a **fetching stub** — it carries
+no payload, it downloads the current `.ps1` from the latest release and runs that — and is the whole
+deliverable.
+
+It is ~90 lines of plain cmd, checked in and hand-edited like any other source file. **Nothing generates
+it, and it does not change when the `.ps1` changes** — that is the entire point: a `.bat` a terminal
+downloaded a year ago runs today's installer. Write it ASCII, no BOM, CRLF; a BOM on line 1 breaks
+`@echo off`.
+
+## <a id="fetch"></a>The fetch
 
 ```
-.\build-bat.ps1        # after EVERY edit to the .ps1 - never hand-edit the .bat
+https://github.com/nightious/Alleaves-Auto/releases/latest/download/alleaves_setup.ps1
 ```
 
-## <a id="pack"></a>What the pack does
+`releases/latest/download/…` is GitHub's own redirect to the newest non-prerelease asset of that name, so
+the URL is a constant and what it resolves to is whatever `release.ps1` published last. **There is no
+version check, no pin lever and no cached fallback**, deliberately: always-latest is the feature, and a
+cached copy would only help in a no-network case where the install dies at the first Google Drive download
+anyway ([INSTALL-ENGINE.md#download](INSTALL-ENGINE.md#download)). Roll back with `gh release delete`,
+which re-points `latest` ([#dist-repo](#dist-repo)).
 
-- Reads the `.ps1` as **raw bytes**, guaranteeing a byte-identical decode on the client regardless of BOM or
-  line endings, then base64-encodes and chunks it into ≤4000-char lines.
-- Emits a `.bat` that elevates once, transports the base64 via a **temp file**, decodes it with 64-bit
-  PowerShell (`Sysnative`), runs the `.ps1` synchronously in the elevated console, propagates the exit code.
-- Writes the `.bat` as **ASCII with no BOM** — a BOM on line 1 breaks `@echo off` — with CRLF.
+This trades a build-time integrity guarantee for HTTPS plus GitHub at run time. There is no way to keep
+both: a pinned hash in the `.bat` *is* a pinned version. Four properties of the fetch block carry what is
+left, and an edit must keep all four:
 
-The temp file is not optional: a single cmd variable caps at ~8191 chars, while the payload runs to a
-quarter-megabyte of base64 (roughly 4/3 of the `.ps1`'s size, in ≤4000-char lines) — **~30× that cap**,
-and it grows with every edit. `build-bat.ps1` prints the exact char and chunk counts on every run; do
-not copy them back into this file, they go stale the next time the `.ps1` changes.
+1. **`.part` staging, renamed on success.** `WebClient.DownloadFile` leaves a partial or zero-byte file
+   behind when a transfer dies mid-stream, and the only guard here is `if not exist` — against the real
+   name that check would pass and a truncated script would run against a terminal. Renaming only after the
+   download returns is what makes `if not exist` a genuine success signal. Same `.part` idiom as
+   `Get-FileWithRetry` ([INSTALL-ENGINE.md#download-retry](INSTALL-ENGINE.md#download-retry)).
+2. **A parse check, `[ScriptBlock]::Create`, not a minimum byte count.** It rejects a truncated script
+   *and* a 404 / captive-portal HTML page, and leaves no magic number to go stale as the `.ps1` grows.
+   `Test-RealBinary` is the wrong tool here — it matches PK/OLE/MZ magic bytes and would reject any text
+   payload.
+3. **TLS 1.2 set before the request**, same `3072` as `Set-Tls12` in the installer.
+4. **Both temp names pre-deleted**, `.ps1` and `.part`. The fetch's exit code is never checked, so a run
+   killed between the download and the trailing `del` leaves the *previous* release's `.ps1` in `%TEMP%` —
+   and a later run whose fetch failed then ran THAT against a terminal, with its exit code attributed to
+   the new build. (That is a real incident from the base64 era; the mechanism survives the transport
+   change unchanged.)
 
-`-LiteralPath` on the source `Test-Path`: without it a checkout under a bracketed directory throws
-"Source not found" on a file that is plainly there ([INSTALL-ENGINE.md#literalpath](INSTALL-ENGINE.md#literalpath)).
+A failed fetch exits **10, not 9**: an RMM that read 9 here concluded the terminal was coming back to
+finish itself and skipped it, when the script never ran at all. **10 is launcher-only** —
+[ARCHITECTURE.md#exit-codes](ARCHITECTURE.md#exit-codes). Its pause honours `ALLEAVES_NOPAUSE`, unlike the
+relaunch below: a network failure is ordinary, and a bare `pause` hangs an unattended run forever.
 
-### <a id="echo-redirection"></a>Redirection first, command second
-
-Each chunk is emitted `>>"%TEMP%\file" echo <chunk>`, never `echo <chunk>>>"%TEMP%\file"`: glued, cmd can
-read a trailing digit as a **handle** (the classic `echo done 2>log` trap), and roughly one chunk in ten
-ends in 0–9. The glued form measures safe on Win11 26200 — cmd only takes the digit as a handle when a
-delimiter precedes it, and the base64 alphabet never puts one there — but the split form costs nothing and
-removes the question. `+ / =` are not cmd metacharacters here.
-
-## <a id="self-verify"></a>Self-verification
-
-The build decodes the base64 back **out of the `.bat` it just wrote** — `ReadAllLines` plus a prefix-match
-on the emitted echo lines — and confirms byte-length **and** SHA256 identity against the source. Both
-hashes come from `SHA256.ComputeHash` over the byte arrays already in memory; the old `Get-FileHash`
-form had to write the decode to a temp file first, purely to hash it.
-
-> Deliberately **not** `$chunks`: that variable IS the source by construction, so comparing it to the source
-> could only ever pass, and it cannot see the one kind of corruption this build step causes — a mangled
-> echo line.
-
-`[Convert]::FromBase64String` ignores whitespace, which is what lets both the verify and the client's
-`ReadAllText` of the CRLF-separated temp file rejoin lines with no separator handling. Corrupt base64
-**throws**, so the decode is caught: a bad build reports through the RESULT line / exit 1 contract instead
-of dying with a stack trace.
-
-<a id="corrupt"></a>**A failed self-verify renames the output to `.corrupt`**. The `.bat` is the whole
-deliverable, so a corrupt one must not keep the shipping name: exit 1 alone left a plausible,
-double-clickable `Install-Alleaves.bat` in the repo root, one `git add -A` from being shipped to a terminal.
+One retry, no backoff, is on purpose. `Get-FileWithRetry`'s four attempts exist for 600 MB Drive
+transfers; this is a 200 KB GitHub asset, and "re-run it" is the same recovery with none of the code.
 
 ## <a id="elevation-probe"></a>The elevation probe
 
@@ -77,23 +76,13 @@ relaunch when it cannot tell. Any future edit keeps all three.
 propagates its real exit code. **`exit /b` MUST stay OUTSIDE any `( )` block**: inside a parenthesized
 block cmd freezes `%ERRORLEVEL%` at parse time to the find result (=1), reporting a successful install as
 a failure. That is now free — there is no block, because neither `%*` nor `%~f0` may appear inside the
-relaunch's `-Command "…"` string ([#args](#args)). `%ERRORLEVEL%` is captured into `RC` before the
-args-file `del`, which would otherwise clobber it.
+relaunch's `-Command "…"` string ([#args](#args)), for two separate reasons one underneath the other
+([#relaunch-args](#relaunch-args)). `%ERRORLEVEL%` is captured into `RC` before the args-file `del`,
+which would otherwise clobber it.
 
 Treat the relaunch as **interactive-only** — `ALLEAVES_NOPAUSE` has not been observed to survive the UAC
-boundary (nothing in `build-bat.ps1` forwards or tests it, so that is field behaviour, not a code fact),
-and RMM callers should invoke it already-elevated.
-
-## <a id="decode-guard"></a>The decode guard
-
-The decoded `%TEMP%\alleaves_setup.ps1` is **pre-deleted** before the decode. The decode's exit code is
-never checked and the only guard is `if not exist`, so a run killed between the decode and the trailing
-`del` left the *previous* build's `.ps1` in `%TEMP%` — and a later run whose decode failed then ran THAT
-against a terminal, with its exit code attributed to the new build.
-
-A failed decode exits **10, not 9**: an RMM that read 9 here concluded the terminal was coming back to
-finish itself and skipped it, when the script never ran at all. **10 is launcher-only** —
-[ARCHITECTURE.md#exit-codes](ARCHITECTURE.md#exit-codes).
+boundary (nothing in the `.bat` forwards or tests it across that call, so that is field behaviour, not a
+code fact), and RMM callers should invoke it already-elevated.
 
 ## <a id="args"></a>Argument forwarding
 
@@ -107,9 +96,10 @@ finish itself and skipped it, when the script never ran at all. **10 is launcher
   opened before `exit` and the `|` in `"Chrome|NiceLabel"` became a real pipe — the documented
   invocation simply did not elevate, while running the `.ps1` directly worked. A `)` in any argument
   ended the `if ( )` block the same way, and an apostrophe in the checkout path ended `'%~f0'`. Both now
-  travel out of band: the path in `ALLEAVES_SELF`, the args written redirection-first to
-  `%TEMP%\alleaves_args.txt` ([#echo-redirection](#echo-redirection), where the caller's quotes stay
-  balanced) and read back with `Get-Content`. The relaunch line itself contains only single quotes.
+  travel out of band: the path in `ALLEAVES_SELF`, the args written **redirection-first** to
+  `%TEMP%\alleaves_args.txt` (`>"%TEMP%\…" echo.%*`, never the glued form — cmd can read a trailing digit
+  as a handle — and where the caller's quotes stay balanced) and read back with `Get-Content`. The
+  relaunch line itself contains only single quotes.
 
   **That fixes the cmd-parse layer, and there is a second one underneath it.** `Start-Process -Verb
   RunAs` on a `.bat` cannot carry a quoted argument at all: ShellExecute hands the batch to `cmd /c`,
@@ -128,25 +118,30 @@ finish itself and skipped it, when the script never ran at all. **10 is launcher
 `-ExecutionPolicy Bypass` loses to an `AllSigned`/`Restricted` GPO; if that ever bites on a managed fleet,
 switch to piping via `-EncodedCommand`.
 
-## <a id="dev"></a>Dev run without packing
+## <a id="dev"></a>Dev run
 
 `PowerShell -File .\alleaves_setup.ps1 -DryRun` — no admin needed, and `-DryRun` falls back to `%TEMP%` for
-its working root.
+its working root. Nothing to build first: the `.bat` fetches the *published* `.ps1`, so it never runs local
+edits. Test edits against the `.ps1` directly, and the `.bat` only after a release.
 
-## <a id="dist-repo"></a>Two repos: source private, releases public
+## <a id="dist-repo"></a>One repo, and it must stay public
 
-The download link has to work for an anonymous browser on a fresh terminal, and a release asset in a
-**private** repo does not: `releases/latest/download/...` needs a token. So the split is two repos, not
-one private one:
+> **`nightious/Alleaves-Auto` going private breaks every installer in the field.** Not "the download
+> page 404s" — every `.bat` already on a terminal fails at the fetch and exits 10, because
+> `releases/latest/download/...` needs a token on a private repo. This is the single operational
+> constraint the whole transport rests on.
 
-| Repo | Visibility | Holds |
-|---|---|---|
-| `nightious/Alleaves-Auto` | private | source, `docs/`, `tests/`, tags |
-| `nightious/Alleaves-Install` | public | a README and the release assets, nothing else |
+That constraint used to be served by a **split**: a private source repo plus a public
+`nightious/Alleaves-Install` holding nothing but the assets, because a private repo cannot serve an
+anonymous download link. The split was deleted on 2026-09-14 and the dist repo with it — once the
+source repo is public, one repo does both jobs and the second was pure indirection. `release.ps1`
+passes no `--repo`; `gh` resolves it from `origin`.
 
-`release.ps1` tags the **source** repo and publishes the asset to `$DistRepo` with `gh ... --repo`.
-`gh release create` creates the tag in the dist repo at its default-branch HEAD, so that repo needs at
-least one commit before the first release — an empty repo has no branch to tag and the call fails.
+**Publishing is a deployment.** The `.ps1` uploaded here is what every `.bat` already in the field runs
+on its next double-click, not merely a new download someone may or may not take. And shipping a release
+without the `.ps1` asset makes every stub 404 — `release.ps1` uploads the pair for that reason.
 
-This hides the docs, the tests and the history. It does not hide the script: the `.bat` is base64 of
-`alleaves_setup.ps1` ([#pack](#pack)), so anyone holding the deliverable can decode the source.
+Public means public: `docs/`, `tests/` and the history are readable, and so are the nine Google Drive
+`FileId`s and the default NiceLabel key in `alleaves_setup.ps1`. That exposure predates this — the
+`.ps1` was already base64 inside a public `.bat`, which is the same exposure with a decode step in
+front of it. Asked and answered; don't re-litigate it, and don't "fix" it by going private.

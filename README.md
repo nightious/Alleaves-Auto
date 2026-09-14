@@ -3,11 +3,16 @@
 Single-file, double-clickable bootstrap for an **Alleaves POS** terminal on stock Windows 10/11.
 Everything downloads and installs from one `.bat`.
 
+The `.bat` pulls the current installer from the latest release every time it runs, so a copy kept on a
+terminal, a USB stick or a tech's desktop never goes stale — **keep it and re-use it, you do not need to
+re-download it.**
+
 ## Quick start
 
 **Before you start**
 
-1. Stock Windows 10/11 with internet access (Google Drive + vendor CDNs — nothing is bundled).
+1. Stock Windows 10/11 with internet access (GitHub, Google Drive + vendor CDNs — nothing is bundled;
+   the `.bat` needs the network to *start*, not just to install).
 2. **Sign in as a plain local administrator.** Not a Microsoft, domain or Entra account — typing a
    *different* admin's password at UAC does not count; the signed-in profile is the one that runs
    the POS. Otherwise the install stops with exit `8`.
@@ -15,9 +20,9 @@ Everything downloads and installs from one `.bat`.
 
 **Run it**
 
-1. Download **[Install-Alleaves.bat](https://github.com/nightious/Alleaves-Install/releases/latest/download/Install-Alleaves.bat)**
-   ([older builds](https://github.com/nightious/Alleaves-Install/releases)) onto the terminal.
-2. Double-click it and accept the UAC prompt. It elevates once, then runs.
+1. Download **[Install-Alleaves.bat](https://github.com/nightious/Alleaves-Auto/releases/latest/download/Install-Alleaves.bat)**
+   ([older builds](https://github.com/nightious/Alleaves-Auto/releases)) onto the terminal.
+2. Double-click it and accept the UAC prompt. It elevates once, downloads the current installer, runs.
 3. Answer the two prompts: **computer name** (Enter skips) and **printer brand**.
 4. Wait. Everything else is silent; nothing reboots on its own.
 5. **Reboot, then sign back in** — the taskbar pins and default browser are applied by a logon
@@ -77,7 +82,7 @@ Optional — a bare double-click needs none. From a terminal:
 | `7` | OPOS printer registration failed — including `StarTSP100`, whose values aren't captured yet, and an entry under a previous computer name that couldn't be retired. |
 | `8` | Account precheck failed and wasn't overridden. Nothing was downloaded or written. |
 | `9` | Account swap armed, rebooting to resume — **do not dispatch a tech**. |
-| `10` | The `.bat` couldn't decode its payload; nothing ran. Outside `0`–`9` on purpose so an RMM doesn't read it as `9`. |
+| `10` | The `.bat` couldn't download the installer; nothing ran. Check the terminal's internet connection and re-run. Outside `0`–`9` on purpose so an RMM doesn't read it as `9`. |
 
 `4`, `6` and `7` are non-fatal "re-run" signals and never mask `1`. A `-DryRun` never returns
 `6` or `7`.
@@ -124,10 +129,9 @@ survives `-Uninstall`):
 
 | File | Purpose |
 | --- | --- |
-| `alleaves_setup.ps1` | The installer — source of truth. |
-| `build-bat.ps1` | Base64-packs the `.ps1` into `Install-Alleaves.bat` (SHA256 self-verified). |
-| `Install-Alleaves.bat` | **The deliverable.** Generated — never hand-edit. |
-| `release.ps1` | Rebuild + test + tag + publish the `.bat` as a release asset. |
+| `alleaves_setup.ps1` | The installer — source of truth, and the release asset every terminal runs. |
+| `Install-Alleaves.bat` | **The deliverable.** ~90 lines: elevate, download the current `.ps1`, run it. Carries no payload and never changes. |
+| `release.ps1` | Test + tag + publish both assets. Publishing is a deployment. |
 | `docs/` | How it works and why — start at `docs/ARCHITECTURE.md`. |
 | `tests/` | Self-checks, no framework; each `Test-*.ps1` exits 0 on pass, 1 on failure (`_common.ps1` is shared helpers, not a test). |
 | `scanner/Scanner_OPOS_barcode.pdf` | One-scan USB-OPOS programming barcode; no PC needed. |
@@ -136,15 +140,16 @@ survives `-Uninstall`):
 ## Developing
 
 ```powershell
-.\build-bat.ps1                                 # ALWAYS after editing the .ps1
-PowerShell -File .\alleaves_setup.ps1 -DryRun   # dev run, no admin
+PowerShell -File .\alleaves_setup.ps1 -DryRun   # dev run, no admin (docs/BUILD-BAT.md#dev)
 .\tests\Test-*.ps1                              # all five must exit 0
-.\release.ps1 -Version v1.2.0                   # rebuild + test + tag + publish (needs gh auth)
+.\release.ps1 -Version v1.3.0                   # test + tag + publish (needs gh auth)
 ```
 
-The `.bat` does not pick up `.ps1` edits on its own. Never hand-edit it — a failed self-verify
-renames it to `.bat.corrupt`, deliberately. `release.ps1` refuses a dirty tree, because a rebuild
-that changes the `.bat` means the committed one was stale.
+Nothing to build: the `.bat` is a checked-in stub that fetches the **published** `.ps1`, so it never
+runs local edits — test edits against the `.ps1` directly, and the `.bat` only after a release.
+`release.ps1` refuses a dirty tree, because the `.ps1` it uploads is what every terminal in the field
+executes on its next run. Rolling back is `gh release delete <tag>`,
+which re-points `latest` at the previous release.
 
 Reasoning lives in `docs/`: [ARCHITECTURE](docs/ARCHITECTURE.md) (flow, step isolation, exit
 codes) · [INSTALL-ENGINE](docs/INSTALL-ENGINE.md) (download, MSI/`.iss`/wrapper families) ·
