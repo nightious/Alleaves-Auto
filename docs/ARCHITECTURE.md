@@ -7,7 +7,7 @@ deliverable.
 
 Subsystem docs: [ACCOUNT-SWAP.md](ACCOUNT-SWAP.md) · [INSTALL-ENGINE.md](INSTALL-ENGINE.md) ·
 [MANIFEST.md](MANIFEST.md) · [FINISHING.md](FINISHING.md) · [SCANNER-OPOS.md](SCANNER-OPOS.md) ·
-[PRINTER-OPOS.md](PRINTER-OPOS.md)
+[PRINTER-OPOS.md](PRINTER-OPOS.md) · [LOG-SHIPPING.md](LOG-SHIPPING.md)
 
 ## <a id="run-shape"></a>Run shape
 
@@ -108,7 +108,10 @@ Set in the `$exitCode` dispatch tail — the authoritative copy. This is an RMM 
 | 9 | account swap armed, rebooting to resume — **an RMM must not dispatch a tech** |
 | 10 | **launcher only** — the `.bat` could not download the installer; nothing ran |
 
-`2`/`3`/`5`/`8`/`9` are pre-dispatch `exit`s: console-only, nothing logged to file. `9` is distinct from `8`
+`2`/`3`/`5`/`8`/`9` are pre-dispatch `exit`s: console-only, nothing logged to file. `2`/`3`/`5`/`8` post no
+Slack run summary for that reason; `9` posts a thin one from its own call site, because *do not dispatch a
+tech* is the single pre-dispatch fact worth putting in a review channel
+([LOG-SHIPPING.md#gap](LOG-SHIPPING.md#gap)). `9` is distinct from `8`
 on purpose — `8` means blocked and nothing was done, `9` means the box is coming back to finish itself — and
 `10` sits outside the `0`–`9` set so the launcher's own failure can never be read as `9`
 ([BUILD-BAT.md#fetch](BUILD-BAT.md#fetch)).
@@ -140,6 +143,15 @@ every product this run didn't touch (`-SkipPrograms`, `-PrinterBrand None`), so 
 OLD failure as a new one — exit 1 forever, which then also suppresses the non-fatal 4/6/7 signals, gated as
 they are on `$exitCode -eq 0`. `computerRenamed` is snapshotted for the same reason: a `-SkipRename` re-run
 otherwise announced a rename that landed weeks ago.
+
+**The Slack card needs the same snapshot and did not inherit it** — it was added downstream of the merge, so
+it named prior-run failures in every future green card. `$script:SummaryManifest` is captured immediately
+before `Save-Manifest` in the install **and** config-only branches, and `Send-RunSummary` prefers it over the
+live `$Manifest` ([LOG-SHIPPING.md#payload](LOG-SHIPPING.md#payload)). It is a
+`ConvertTo-Json -Depth 6 | ConvertFrom-Json` round trip rather than `.Clone()`: `New-InstallManifest` returns
+an `[ordered]` hashtable and `OrderedDictionary` has no `Clone()` method, which a dry run caught after the
+unit tests were already green. The cost is that the formatter sees `PSCustomObject`s in production and
+hashtables under test, so the test formats both and asserts they agree.
 
 ### <a id="the-non-fatal-block"></a>The non-fatal block
 
@@ -194,12 +206,12 @@ the current name — correct, since by then the rename reboot has happened.
 
 ## <a id="tests"></a>Tests
 
-`tests\` holds the runnable self-checks; all exit 0/1, no framework. Three AST-lift functions out of the
+`tests\` holds the runnable self-checks; all exit 0/1, no framework. Four AST-lift functions out of the
 `.ps1` rather than loading it; `Test-InstallerExitCode.ps1` lifts nothing — it spawns a live `cmd.exe /c
 exit 7`, then only compares AST extents and regex-matches body text.
 
 `_common.ps1` holds `Assert-Eq`, `Get-InstallerAst`, `Get-InstallerFunctions` and
-`Assert-InstallerHas`, dot-sourced by all five. It is **not** a test — the runner and `release.ps1` glob
+`Assert-InstallerHas`, dot-sourced by all six. It is **not** a test — the runner and `release.ps1` glob
 `Test-*.ps1` — and `$script:Failures` still belongs to each dot-sourcing test, since that is the scope the
 functions are defined in.
 
@@ -208,6 +220,7 @@ functions are defined in.
 | `Test-AccountPrecheck.ps1` | every `Test-InstallAccount` verdict arm on stubbed probes; `Get-MicrosoftAccountId`'s tri-state ([ACCOUNT-SWAP.md#msa](ACCOUNT-SWAP.md#msa)); `ConvertTo-ResumeArgs` **round-trip**, not just its string shape; `Confirm-Swap`'s headless NO; `Restore-AutoLogon` ([ACCOUNT-SWAP.md#autologon](ACCOUNT-SWAP.md#autologon)) — a pre-existing value is never deleted and **no password is ever written back**; `Clear-AccountSwapState`'s dry-run / unreadable-marker / surviving-task arms; `Set-AccountCheckOverride`'s recorded fields |
 | `Test-ManifestMerge.ps1` | `Merge-PriorList` direction and the prior-side falsy-key drop per list ([MANIFEST.md#merge](MANIFEST.md#merge)); the `.iss` fallback row-drop; `Test-PriorInstallFailed`'s arms; `Get-PriorManifest` against a **locked** file; uninstall step 4b's stale-row loop on a scratch `HKCU` key; that every `$PrinterBrands` `RowName` is both a `$DriveFiles` **Label** and an `$Installers` **Name**; `Test-PrinterOposConfigured` |
 | `Test-StepIsolation.ps1` | `Invoke-Step`'s four behaviours ([#step-isolation](#step-isolation)), plus AST asserts that no bare step call survives and that the install loop's `foreach` still opens with a `try` recording `fail-exception` |
+| `Test-LogShipping.ps1` | `Format-RunSummary` lifted and run, asserting on the serialized payload: the title clamp ([LOG-SHIPPING.md#payload](LOG-SHIPPING.md#payload)), `attachments` still serializing as an **array**, nothing flattened by a shallow `-Depth`, **no `blocks` key** — they silently suppress the rail ([LOG-SHIPPING.md#colour](LOG-SHIPPING.md#colour)) — the rail colour tracking the exit code, `LICENSECODE=` redacted in **both** the tail and the flagged lines ([LOG-SHIPPING.md#redaction](LOG-SHIPPING.md#redaction)), a failure visible only early in the log still surfacing, exit 0 carrying no tail, `already-opos` / `already-configured` never named as failures, one tail line fatter than the whole budget still shipping a clamped block, a null manifest still formatting (the `-Uninstall` card), and a JSON round-tripped manifest formatting identically to a hashtable — the round trip production actually uses ([#tally-snapshot-ordering](#tally-snapshot-ordering)); plus AST asserts that `Send-RunSummary` keeps its `-DryRun` early return and `-Depth 10`, never calls `Warn` ([LOG-SHIPPING.md#fail-soft](LOG-SHIPPING.md#fail-soft)), and that the hook sits **after** `Stop-Transcript` |
 | `Test-InstallerExitCode.ps1` | the `$p.Handle` trap ([INSTALL-ENGINE.md#invoke-installer](INSTALL-ENGINE.md#invoke-installer)) — live behaviour *and* an AST assert that the dereference still sits between `Start-Process` and `WaitForExit`; the null-exit arm's `note='exit-unknown-but-registered'` row |
 
 Stub order matters in `Test-AccountPrecheck.ps1`: the `Clear-AccountSwapState` section shadows

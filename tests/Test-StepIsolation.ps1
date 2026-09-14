@@ -41,7 +41,8 @@ Write-Host "`nEvery install-branch step is guarded" -ForegroundColor Cyan
 $stepFns = @('Invoke-ComputerRename','Invoke-DownloadPhase','Uninstall-TeamViewer',
              'Install-VcRedist','Invoke-InstallLoop','Invoke-ChromeTaskbar',
              'Invoke-ChromeDefaultBrowser','Invoke-ChromeBookmark',
-             'Register-FinishLogonTask','Copy-MasterList','Set-ScannerOpos','Set-PrinterOpos')
+             'Register-FinishLogonTask','Copy-MasterList','Set-ScannerOpos','Set-PrinterOpos',
+             'Send-RunSummary')
 $unguarded = @()
 foreach ($cmd in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
     $name = $cmd.GetCommandName()
