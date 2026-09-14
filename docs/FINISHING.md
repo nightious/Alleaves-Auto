@@ -291,6 +291,12 @@ matters: no pins, no default browser, and a log line saying "running as installe
 merges the prior row forward — so a later re-run by a tech signed in as the swap-created account (the
 terminal's only admin, which is the point of the swap) baked that name in again. Blank means skip nobody.
 
+**Both counts go through `| Where-Object { $_ }`, not a bare `@(…)`.** `@($null).Count` is **1**, and on
+a first install there is no prior manifest, so `(Get-PriorManifest).accountCreated` is `$null` and the
+test read "a swap happened" — `$installUser` went blank and the finish ran **for the tech**, wiping their
+Taskband and flipping their default browser at the next sign-in. Run 2 found `accountCreated: []`,
+counted 0, and silently started behaving correctly.
+
 ### <a id="progid"></a>Chrome's ProgId is resolved at logon from HKCU
 
 The install-time HKLM value is only the **fallback**. A per-user Chrome registers a *suffixed* ProgId
@@ -305,3 +311,7 @@ minute can roll mid-write, Windows rejects the association silently, and the rea
 it compares the key against what the script itself just wrote (the same self-confirming trap as the ProgId
 above). Re-check the clock and rebuild rather than confirm a hash Windows will never honour; no sleep is
 needed, because the minute just turned and the next attempt has a full one to itself.
+
+The "already set" short-circuit therefore requires the **`Hash` value as well as the `ProgId`**: a key
+carrying the right ProgId and no hash is one Windows ignores, and reading only the ProgId declared
+success on it and never repaired it at any later logon.

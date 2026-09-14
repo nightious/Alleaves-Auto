@@ -11,30 +11,13 @@
     Exits 0 on pass, 1 on failure.
 #>
 $ErrorActionPreference = 'Stop'
-$script:Failures = 0
+. (Join-Path $PSScriptRoot '_common.ps1')
 
-function Assert-Eq($expected, $actual, $what) {
-    if ("$expected" -eq "$actual") { Write-Host "  ok   $what" -ForegroundColor Green }
-    else {
-        Write-Host "  FAIL $what -- expected '$expected', got '$actual'" -ForegroundColor Red
-        $script:Failures++
-    }
-}
-
-$target = Join-Path (Split-Path $PSScriptRoot -Parent) 'alleaves_setup.ps1'
-$errs = $null
-$ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
-if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
-
+$ast    = Get-InstallerAst
+$funcs  = Get-InstallerFunctions $ast
 $wanted = @('Merge-PriorList', 'Get-PriorManifest', 'Test-PriorInstallFailed')
-$found  = @{}
-foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-    if ($wanted -contains $f.Name) { $found[$f.Name] = $f.Extent.Text }
-}
-foreach ($w in $wanted) {
-    if (-not $found.ContainsKey($w)) { Write-Host "FAIL: $w not found in the installer" -ForegroundColor Red; exit 1 }
-    . ([scriptblock]::Create($found[$w]))
-}
+Assert-InstallerHas $funcs $wanted
+foreach ($w in $wanted) { . ([scriptblock]::Create($funcs[$w].Extent.Text)) }
 
 Write-Host "`nMerge-PriorList direction" -ForegroundColor Cyan
 $byPath = { param($e) $e.path }
@@ -112,11 +95,8 @@ $state = "warned=$($script:Warned) memo=$(if ($null -eq $script:PriorManifest) {
 Assert-Eq 'warned=1 memo=hashtable' $state 'a locked manifest reaches the catch once and leaves the memo non-null'
 
 Write-Host "`nUninstall step 4b survives a STALE regValuesSet row" -ForegroundColor Cyan
-$uninst = $null
-foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-    if ($f.Name -eq 'Invoke-UninstallPhase') { $uninst = $f }
-}
-if (-not $uninst) { Write-Host 'FAIL: Invoke-UninstallPhase not found' -ForegroundColor Red; exit 1 }
+Assert-InstallerHas $funcs @('Invoke-UninstallPhase')
+$uninst = $funcs['Invoke-UninstallPhase']
 $rvLoop = @($uninst.FindAll({ param($n)
     $n -is [System.Management.Automation.Language.ForEachStatementAst] -and
     $n.Variable.VariablePath.UserPath -eq 'rv' }, $true))
@@ -186,12 +166,8 @@ foreach ($r in $rows) {
 }
 
 Write-Host "`nTest-PrinterOposConfigured" -ForegroundColor Cyan
-$fn = $null
-foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-    if ($f.Name -eq 'Test-PrinterOposConfigured') { $fn = $f }
-}
-if (-not $fn) { Write-Host 'FAIL: Test-PrinterOposConfigured not found' -ForegroundColor Red; exit 1 }
-. ([scriptblock]::Create($fn.Extent.Text))
+Assert-InstallerHas $funcs @('Test-PrinterOposConfigured')
+. ([scriptblock]::Create($funcs['Test-PrinterOposConfigured'].Extent.Text))
 
 $PrinterOposRoot = 'HKCU:\Software\AlleavesAutoTest\ServiceOPOS'
 Remove-Item -LiteralPath 'HKCU:\Software\AlleavesAutoTest' -Recurse -Force -ErrorAction SilentlyContinue
@@ -214,6 +190,25 @@ try {
 } finally {
     Remove-Item -LiteralPath 'HKCU:\Software\AlleavesAutoTest' -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+Write-Host "`nAdd-AlreadyInstalledRow decides removable from the PRIOR manifest" -ForegroundColor Cyan
+# This is what keeps -Uninstall off software the installer only ever FOUND:
+# docs/INSTALL-ENGINE.md#already-installed
+Assert-InstallerHas $funcs @('Add-AlreadyInstalledRow')
+. ([scriptblock]::Create($funcs['Add-AlreadyInstalledRow'].Extent.Text))
+function Step($m) { }
+function Info($m) { }
+$Manifest = @{ installed = @() }
+$script:PriorManifest = [pscustomobject]@{ installed = @(
+    [pscustomobject]@{ name='Chrome';    result='ok'                                          }
+    [pscustomobject]@{ name='NiceLabel'; result='ok'; note='already-installed'; removable=$false }
+) }
+Add-AlreadyInstalledRow -Name 'Chrome'       -Source 'c' -Method 'exe' -Match 'm'
+Add-AlreadyInstalledRow -Name 'NiceLabel'    -Source 'c' -Method 'exe' -Match 'm'
+Add-AlreadyInstalledRow -Name 'POS for .NET' -Source 'c' -Method 'msi' -Match 'm'
+Assert-Eq $true  $Manifest.installed[0].removable 'a product WE installed last run stays removable'
+Assert-Eq $false $Manifest.installed[1].removable 'a pre-existing product stays non-removable across re-runs'
+Assert-Eq $false $Manifest.installed[2].removable 'no prior row at all = we never installed it'
 
 Write-Host "`nManifest row shapes match docs/MANIFEST.md#keys" -ForegroundColor Cyan
 # The key table is the one thing a reader must trust literally, and it drifted six ways before this

@@ -11,28 +11,11 @@
     Exits 0 on pass, 1 on failure.
 #>
 $ErrorActionPreference = 'Stop'
-$script:Failures = 0
+. (Join-Path $PSScriptRoot '_common.ps1')
 
-function Assert-Eq($expected, $actual, $what) {
-    if ("$expected" -eq "$actual") { Write-Host "  ok   $what" -ForegroundColor Green }
-    else {
-        Write-Host "  FAIL $what -- expected '$expected', got '$actual'" -ForegroundColor Red
-        $script:Failures++
-    }
-}
-
-$target = Join-Path (Split-Path $PSScriptRoot -Parent) 'alleaves_setup.ps1'
-$errs = $null
-$ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
-if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
-
-$funcs = @{}
-foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-    $funcs[$f.Name] = $f
-}
-foreach ($w in @('Invoke-Step', 'Invoke-InstallLoop')) {
-    if (-not $funcs.ContainsKey($w)) { Write-Host "FAIL: $w not found in the installer" -ForegroundColor Red; exit 1 }
-}
+$ast   = Get-InstallerAst
+$funcs = Get-InstallerFunctions $ast
+Assert-InstallerHas $funcs @('Fail', 'Invoke-Step', 'Invoke-InstallLoop')
 
 . ([scriptblock]::Create($funcs['Fail'].Extent.Text))
 . ([scriptblock]::Create($funcs['Invoke-Step'].Extent.Text))
@@ -63,10 +46,11 @@ $unguarded = @()
 foreach ($cmd in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
     $name = $cmd.GetCommandName()
     if ($stepFns -notcontains $name) { continue }
+    # ONLY an Invoke-Step ancestor counts: an enclosing function used to count too, which
+    # excused exactly the nesting a bare call would hide in.
     $p = $cmd.Parent; $guarded = $false
     while ($p) {
         if ($p -is [System.Management.Automation.Language.CommandAst] -and $p.GetCommandName() -eq 'Invoke-Step') { $guarded = $true; break }
-        if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $guarded = $true; break }
         $p = $p.Parent
     }
     if (-not $guarded) { $unguarded += "$name (line $($cmd.Extent.StartLineNumber))" }

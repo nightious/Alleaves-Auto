@@ -38,8 +38,8 @@ Optional — a bare double-click needs none. From a terminal:
 | --- | --- |
 | `-ComputerName "POS-1"` | Preset the POS name; the only way to name an unattended run. Applies on next reboot. |
 | `-PrinterBrand <name>` | `POS-X`, `StarTSP100` or `None` — skips the brand prompt. Only the chosen brand is downloaded. `None` = no driver, no OPOS entry. |
-| `-DryRun` | Simulate; change nothing. The only mode that runs without admin (working root moves to `%TEMP%\AlleavesAuto`). |
-| `-Uninstall` | Reverse a prior install from the manifest — products, bookmark policy, both pins (sign out/in to see it). Does **not** revert the rename, the scanner's OPOS mode or shared runtimes. |
+| `-DryRun` | Simulate; change nothing but the working root and this run's log. The only mode that runs without admin (working root moves to `%TEMP%\AlleavesAuto`; the manifest it previews against is still the real one). |
+| `-Uninstall` | Reverse a prior install from the manifest — products, bookmark policy, both pins (sign out/in to see it). Does **not** revert the rename, the scanner's OPOS mode, shared runtimes, or anything the installer found already installed. |
 | `-ForceReinstall` | Re-download and reinstall even if cached / already present. |
 | `-SkipPrograms <regex...>` | Drop matching products from **both** download and install (`-SkipPrograms Zebra`). Quote cmd metacharacters: `"Chrome\|NiceLabel"`. Invalid regex exits `2`. |
 | `-SkipMasterList` | Don't copy the NiceLabel `.nlbl` master list into each user's Documents. |
@@ -60,7 +60,8 @@ Optional — a bare double-click needs none. From a terminal:
 **Combinations rejected with exit `2`:** `-ScannerConfigOnly` with `-Uninstall` or
 `-SkipScannerConfig` · `-PrinterConfigOnly` with `-Uninstall`, `-ScannerConfigOnly`,
 `-SkipPrinterConfig` or `-PrinterBrand None` · `-ComputerName` with `-SkipRename` ·
-`-NiceLabelLicense` with `-SkipNiceLabelActivation`.
+`-NiceLabelLicense` with `-SkipNiceLabelActivation`. Every option needs its leading dash — a bare word
+(`Install-Alleaves.bat uninstall`) is rejected too, rather than binding to `-SkipPrograms`.
 
 ## Exit codes
 
@@ -128,7 +129,7 @@ survives `-Uninstall`):
 | `Install-Alleaves.bat` | **The deliverable.** Generated — never hand-edit. |
 | `release.ps1` | Rebuild + test + tag + publish the `.bat` as a release asset. |
 | `docs/` | How it works and why — start at `docs/ARCHITECTURE.md`. |
-| `tests/` | Self-checks, no framework; each exits 0 on pass, 1 on failure. |
+| `tests/` | Self-checks, no framework; each `Test-*.ps1` exits 0 on pass, 1 on failure (`_common.ps1` is shared helpers, not a test). |
 | `scanner/Scanner_OPOS_barcode.pdf` | One-scan USB-OPOS programming barcode; no PC needed. |
 | `printer/Collect-PrinterFingerprint.ps1` | Field diagnostic: OPOS entries, ProgID→CLSID→DLL, USB IDs, test receipt (`-SnapshotOnly` reads only). |
 

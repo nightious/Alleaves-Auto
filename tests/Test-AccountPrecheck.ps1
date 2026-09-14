@@ -12,32 +12,14 @@
     Exits 0 on pass, 1 on failure.
 #>
 $ErrorActionPreference = 'Stop'
-$script:Failures = 0
+. (Join-Path $PSScriptRoot '_common.ps1')
 
-function Assert-Eq($expected, $actual, $what) {
-    if ("$expected" -eq "$actual") { Write-Host "  ok   $what" -ForegroundColor Green }
-    else {
-        Write-Host "  FAIL $what -- expected '$expected', got '$actual'" -ForegroundColor Red
-        $script:Failures++
-    }
-}
-
-$target = Join-Path (Split-Path $PSScriptRoot -Parent) 'alleaves_setup.ps1'
-$errs = $null
-$ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
-if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
-
-$wanted = @('Get-MicrosoftAccountId','Get-MsaLinkedEmail','Get-IdentityStoreEmail','Test-InstallAccount',
+$funcs  = Get-InstallerFunctions (Get-InstallerAst)
+$wanted = @('Get-MicrosoftAccountId','Get-IdentityStoreEmail','Test-InstallAccount',
             'ConvertTo-ResumeArgs','Confirm-Swap','Read-SwapAnswer','Restore-AutoLogon',
             'Set-AccountCheckOverride','Clear-AccountSwapState')
-$found = @{}
-foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-    if ($wanted -contains $f.Name) { $found[$f.Name] = $f.Extent.Text }
-}
-foreach ($w in $wanted) {
-    if (-not $found.ContainsKey($w)) { Write-Host "FAIL: $w not found in the installer" -ForegroundColor Red; exit 1 }
-    . ([scriptblock]::Create($found[$w]))
-}
+Assert-InstallerHas $funcs $wanted
+foreach ($w in $wanted) { . ([scriptblock]::Create($funcs[$w].Extent.Text)) }
 
 $script:StubAccount = $null; $script:StubMsa = $null; $script:StubAdmin = $true
 function Get-SignedInAccount { $script:StubAccount }
@@ -69,7 +51,7 @@ Assert-Eq 'account-type-unknown' (Get-Verdict 'POS01\till'     'S-1-5-21-1-2-3-1
 Assert-Eq 'not-local'            (Get-Verdict 'a@b.com'        'S-1-12-1-11-22-33-44' $null    $true)  'bare Entra SID reports not-local, not no-interactive-user'
 
 Write-Host "`nGet-MicrosoftAccountId tri-state" -ForegroundColor Cyan
-. ([scriptblock]::Create($found['Get-MicrosoftAccountId']))
+. ([scriptblock]::Create($funcs['Get-MicrosoftAccountId'].Extent.Text))
 function Get-LocalUser { param($SID, $Name, $ErrorAction) [pscustomobject]@{ PrincipalSource = $script:StubPs } }
 $script:StubPs = 'Local'
 Assert-Eq ''        (Get-MicrosoftAccountId 'S-1-5-21-1-2-3-1001') "PrincipalSource 'Local' => proven local (null)"
@@ -115,7 +97,9 @@ function New-ItemProperty { param($Path,$Name,$Value,$PropertyType,[switch]$Forc
 function Remove-ItemProperty { param($Path,$Name,[switch]$Force,$ErrorAction) $script:Removed += $Name }
 $AutoLogonValues = @('AutoAdminLogon','DefaultUserName','DefaultDomainName','DefaultPassword','AutoLogonCount')
 $WinlogonKey = 'HKLM:\fake'
-$failures = Restore-AutoLogon ([pscustomobject]@{
+# NOT $failures: that is $script:Failures (names are case-insensitive) and assigning it
+# here would zero the assertion counter mid-run. docs/ARCHITECTURE.md#tests
+$restoreFailures = Restore-AutoLogon ([pscustomobject]@{
     AutoAdminLogon    = [pscustomobject]@{ present = $true;  value = '0' }
     DefaultUserName   = [pscustomobject]@{ present = $false; value = $null }
     DefaultDomainName = [pscustomobject]@{ present = $false; value = $null }
@@ -126,7 +110,7 @@ Assert-Eq '0/String' $script:Wrote['AutoAdminLogon']       'a pre-existing AutoA
 Assert-Eq $true      ($script:Removed -contains 'DefaultPassword') 'the password we added is removed'
 Assert-Eq 4          $script:Removed.Count                 'exactly the four values that were absent are removed'
 Assert-Eq $true      ($script:Removed -notcontains 'AutoAdminLogon') 'a value that existed is never removed'
-Assert-Eq 0          $failures                             'a clean restore reports zero failures (not $null, not silence)'
+Assert-Eq 0          $restoreFailures                      'a clean restore reports zero failures (not $null, not silence)'
 
 $script:Wrote = @{}; $script:Removed = @()
 Restore-AutoLogon ([pscustomobject]@{
@@ -151,18 +135,24 @@ function Step($m) {}
 function Ok($m) {}
 function Fail($m) {}
 function Dry($m) {}
-function Test-Path { param($Path, $LiteralPath, $ErrorAction) $true }
+# The marker's existence has to TRACK the stubbed delete, or the post-delete readback
+# always says "still there" and the exit-1 arm is the only one the test ever exercises.
+function Test-Path { param($Path, $LiteralPath, $ErrorAction)
+                     if ("$Path" -eq $AccountSwapMarker) { return $script:MarkerExists }
+                     $true }
 function Get-Content { param($Path, [switch]$Raw, $EA, $ErrorAction) if ($null -eq $script:MarkerBody) { throw 'truncated' }; $script:MarkerBody }
 function Unregister-ScheduledTask { param($TaskName, [switch]$Confirm, $EA, $ErrorAction) $script:Unregistered++ }
 function Get-ScheduledTask { param($TaskName, $EA, $ErrorAction)
                              if ($script:TaskSurvives) { [pscustomobject]@{ TaskName = $TaskName } } }
 function Restore-AutoLogon($prior) { $script:Restored++ }
 function Remove-Item { param($Path, [switch]$Recurse, [switch]$Force, $EA, $ErrorAction)
-                       if ("$Path" -eq $AccountSwapMarker) { $script:MarkerDeleted++ } else { $script:ResumeDirDeleted++ } }
+                       if ("$Path" -eq $AccountSwapMarker) { $script:MarkerDeleted++; $script:MarkerExists = $script:MarkerSticky }
+                       else { $script:ResumeDirDeleted++ } }
 
 function Reset-SwapStubs { $script:Unregistered=0; $script:MarkerDeleted=0; $script:Restored=0; $script:ResumeDirDeleted=0
                            $script:AccountSwapAttempted=$false; $script:AccountSwapDone=$null
-                           $script:TaskSurvives=$false }
+                           $script:TaskSurvives=$false; $script:FinishFailed=$false
+                           $script:MarkerExists=$true; $script:MarkerSticky=$false }
 
 Reset-SwapStubs; $DryRun = $true
 Clear-AccountSwapState
@@ -177,6 +167,7 @@ Clear-AccountSwapState
 Assert-Eq 1 $script:Unregistered  'unreadable marker: the resume task is STILL unregistered'
 Assert-Eq 1 $script:MarkerDeleted 'unreadable marker: the marker is cleaned up'
 Assert-Eq 1 $script:ResumeDirDeleted 'unreadable marker: the staged resume copy is STILL removed'
+Assert-Eq $false $script:FinishFailed 'unreadable marker: not an exit-1 - the state IS cleared'
 
 Reset-SwapStubs; $script:MarkerBody = '{"account":"POS01\\till","sid":"S-1-5-21-1-2-3-1001","created":true,"winlogonPrior":{}}'
 Clear-AccountSwapState
@@ -184,6 +175,13 @@ Assert-Eq 1        $script:Unregistered            'resume: task unregistered'
 Assert-Eq 1        $script:Restored                'resume: autologon restored'
 Assert-Eq 1        $script:MarkerDeleted           'resume: marker deleted'
 Assert-Eq 'POS01\till' $script:AccountSwapDone.name 'resume: the account reaches the manifest seed'
+Assert-Eq $false   $script:FinishFailed            'resume: a clean pass does NOT raise the exit-1 flag'
+
+Reset-SwapStubs; $script:MarkerSticky = $true
+$script:MarkerBody = '{"account":"POS01\\till","sid":"S-1-5-21-1-2-3-1001","created":true,"winlogonPrior":{}}'
+Clear-AccountSwapState
+Assert-Eq 1     $script:MarkerDeleted 'undeletable marker: the delete is still attempted'
+Assert-Eq $true $script:FinishFailed  'undeletable marker: the next run would re-enter resume, so exit 1'
 
 Reset-SwapStubs; $script:TaskSurvives = $true
 $script:MarkerBody = '{"account":"POS01\\till","sid":"S-1-5-21-1-2-3-1001","created":true,"winlogonPrior":{}}'
@@ -191,6 +189,7 @@ Clear-AccountSwapState
 Assert-Eq 0 $script:MarkerDeleted    'surviving resume task: the marker is KEPT so the next run retries'
 Assert-Eq 0 $script:ResumeDirDeleted 'surviving resume task: the staged script it launches is kept too'
 Assert-Eq 1 $script:Restored         'surviving resume task: autologon is STILL restored (never left armed)'
+Assert-Eq $true $script:FinishFailed 'surviving resume task: raises the exit-1 flag'
 
 Write-Host "`nSet-AccountCheckOverride records the waiver" -ForegroundColor Cyan
 $script:AccountCheckOverride = $null

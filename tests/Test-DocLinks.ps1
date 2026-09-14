@@ -17,15 +17,7 @@
     Exits 0 on pass, 1 on failure.
 #>
 $ErrorActionPreference = 'Stop'
-$script:Failures = 0
-
-function Assert-Eq($expected, $actual, $what) {
-    if ("$expected" -eq "$actual") { Write-Host "  ok   $what" -ForegroundColor Green }
-    else {
-        Write-Host "  FAIL $what -- expected '$expected', got '$actual'" -ForegroundColor Red
-        $script:Failures++
-    }
-}
+. (Join-Path $PSScriptRoot '_common.ps1')
 
 $Root    = Split-Path $PSScriptRoot -Parent
 $DocsDir = Join-Path $Root 'docs'

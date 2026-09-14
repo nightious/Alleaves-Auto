@@ -15,7 +15,8 @@
 .PARAMETER Uninstall
     Reverse a prior install using the persisted manifest.
 .PARAMETER DryRun
-    Simulate everything; make no system changes. Allowed without admin.
+    Simulate everything; change nothing but the working root and this run's log.
+    Allowed without admin, where the working root moves to %TEMP%.
 .PARAMETER SkipMasterList
     Don't copy the NiceLabel master list to Documents.
 .PARAMETER SkipUninstallTeamViewer
@@ -40,7 +41,7 @@
     Don't flip the connected Zebra scanner(s) to USB-OPOS.
 .PARAMETER PrinterBrand
     POS-X, StarTSP100 or None. Skips the brand prompt. Only the chosen brand's
-    driver is downloaded and installed. Single word (the .bat double-wraps args).
+    driver is downloaded and installed.
 .PARAMETER SkipPrinterConfig
     Don't register the OPOS receipt printer device entry.
 .PARAMETER PrinterConfigOnly
@@ -57,7 +58,7 @@
     Recorded in the manifest as accountCheckOverride.
 #>
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [switch]$Uninstall,
     [switch]$DryRun,
@@ -79,7 +80,9 @@ param(
     [switch]$PrinterConfigOnly,
     [string]$NiceLabelLicense = 'FXQWA-6CPFD-ST4FB-TWTCZ-HMUMB',
     [switch]$SkipNiceLabelActivation,
-    [switch]$IgnoreAccountCheck
+    [switch]$IgnoreAccountCheck,
+    # docs/ARCHITECTURE.md#argument-guards-exit-2
+    [Parameter(ValueFromRemainingArguments)][string[]]$UnknownArgs
 )
 
 # ---------------------------------------------------------------------------
@@ -146,7 +149,8 @@ function Get-MicrosoftAccountId($sid) {
         $ps = (Get-LocalUser -SID $sid -ErrorAction Stop).PrincipalSource
         if ($ps -eq 'Local') { return $null }
         if ($ps -eq 'MicrosoftAccount') {
-            return (Get-MsaLinkedEmail $sid)
+            $linked = Get-IdentityStoreEmail $sid
+            return $(if ($linked) { $linked } else { '(linked email unknown)' })
         }
     } catch { Write-Verbose "Get-MicrosoftAccountId: PrincipalSource probe failed: $($_.Exception.Message)" }
     $email = Get-IdentityStoreEmail $sid
@@ -161,12 +165,6 @@ function Get-IdentityStoreEmail($sid) {
         if ($email) { return $email }
     } catch { Write-Verbose "Get-IdentityStoreEmail: cache read failed: $($_.Exception.Message)" }
     return $null
-}
-
-function Get-MsaLinkedEmail($sid) {
-    $email = Get-IdentityStoreEmail $sid
-    if ($email) { return $email }
-    return '(linked email unknown)'
 }
 
 # docs/ACCOUNT-SWAP.md#msa
@@ -237,6 +235,10 @@ function ConvertFrom-SecureStringPlain([Security.SecureString]$s) {
 
 # docs/ACCOUNT-SWAP.md#swap
 function Read-SwapAnswer($prompt) {
+    if (-not [Environment]::UserInteractive -or $env:ALLEAVES_NOPAUSE) {
+        Write-Verbose "Read-SwapAnswer: unattended run - declining '$prompt'"
+        return $null
+    }
     try { return ("$(Read-Host $prompt)").Trim() } catch { Write-Verbose "Read-SwapAnswer: Read-Host failed (headless host?): $($_.Exception.Message)"; return $null }
 }
 
@@ -338,7 +340,7 @@ function ConvertTo-ResumeArgs($bound) {
     $out = @()
     foreach ($k in $bound.Keys) {
         if ($k -eq 'DryRun') { continue }
-        if ($k -eq 'NiceLabelLicense') { continue }
+        if ($k -eq 'NiceLabelLicense') { Warn 'the resumed run falls back to the built-in NiceLabel license - the key is not persisted to the resume task'; continue }
         $v = $bound[$k]
         if ($v -is [switch]) { if ($v.IsPresent) { $out += "-$k" } }
         elseif ($v -is [array]) {
@@ -531,16 +533,17 @@ Info ("        ComputerName='{0}' SkipRename={1} SkipChromeTaskbar={2} SkipDefau
 Info ("        PrinterBrand='{0}' SkipPrinterConfig={1} PrinterConfigOnly={2} IgnoreAccountCheck={3}" -f `
     $PrinterBrand, $SkipPrinterConfig, $PrinterConfigOnly, $IgnoreAccountCheck)
 
-# docs/ARCHITECTURE.md#argument-guards-exit-2
+# docs/ARCHITECTURE.md#argument-guards-exit-2  (#positional)
+if ($UnknownArgs) {
+    Fail "Unexpected argument(s): $($UnknownArgs -join ' ')"
+    Fail "Every option takes a leading dash - see README.md. Did you mean -$($UnknownArgs[0])?"
+    exit 2
+}
 $requested = $env:ALLEAVES_REQUESTED_MODE
 if ($requested) {
     Info "  Launcher requested mode: $requested"
     if ($requested -eq 'uninstall' -and -not $Uninstall) {
         Fail "Launcher requested UNINSTALL but -Uninstall did not survive. Refusing to run INSTALL."
-        exit 2
-    }
-    if ($requested -eq 'install' -and $Uninstall) {
-        Fail "Launcher requested INSTALL but script parsed UNINSTALL. Aborting ambiguous run."
         exit 2
     }
 }
@@ -692,7 +695,8 @@ if (-not $Uninstall) {
 $WorkDir = if ($IsAdmin) { Join-Path $env:ProgramData 'AlleavesAuto' } else { Join-Path $env:TEMP 'AlleavesAuto' }
 $DownloadDir  = Join-Path $WorkDir 'downloads'
 $LogDir       = Join-Path $WorkDir 'logs'
-$ManifestPath = Join-Path $LogDir  'install_manifest.json'
+# Always the REAL manifest, even when $WorkDir fell back: docs/ARCHITECTURE.md#run-shape
+$ManifestPath = Join-Path $env:ProgramData 'AlleavesAuto\logs\install_manifest.json'
 try {
     New-Item -ItemType Directory -Force -Path $DownloadDir -ErrorAction Stop | Out-Null
     New-Item -ItemType Directory -Force -Path $LogDir      -ErrorAction Stop | Out-Null
@@ -737,100 +741,95 @@ function Find-InstalledProducts {
     }
 }
 
+# docs/INSTALL-ENGINE.md#nicelabel-uninstall  (msiexec + an explicit Suite-residue sweep)
+function Remove-NiceLabel {
+    param([string]$DisplayName, [string]$Cmd, [string]$ProductCode)
+    if ($DryRun) { Dry "would remove NiceLabel via msiexec /x + Suite residue cleanup: $DisplayName ($ProductCode)"; return $true }
+    $nlDir = (Find-InstalledProducts -Pattern '(?i)NiceLabel' |
+              Where-Object { $_.PSChildName -eq $ProductCode -and $_.InstallLocation } |
+              Select-Object -First 1).InstallLocation
+    Get-Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'NiceLabel*' -and $_.Status -ne 'Stopped' } |
+        ForEach-Object { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue }
+    $guid = if ($ProductCode -match '^\{[0-9A-Fa-f-]+\}$') { $ProductCode } else {
+        (Find-InstalledProducts -Pattern '(?i)NiceLabel' |
+         Where-Object { $_.PSChildName -match '^\{[0-9A-Fa-f-]+\}$' } |
+         Select-Object -First 1).PSChildName
+    }
+    $nlOk = $true
+    if ($guid) {
+        Info "  NiceLabel: msiexec.exe /x $guid /qn /norestart (Suite MSI)"
+        $mp = Start-Process msiexec.exe -ArgumentList "/x $guid /qn /norestart" -Wait -PassThru -WindowStyle Hidden
+        $nlOk = ($mp.ExitCode -in @(0,3010,1641,1605))
+        if (-not $nlOk) { Warn "NiceLabel msiexec /x $guid exited $($mp.ExitCode)" }
+    }
+    $residueOk  = $true
+    $removedKey = $false
+    Find-InstalledProducts -Pattern '(?i)NiceLabel' |
+        Where-Object { $_.PSChildName -eq $ProductCode } |
+        ForEach-Object {
+            $arp = $_.PSChildName
+            try { Remove-Item $_.PSPath -Recurse -Force -ErrorAction Stop; $removedKey = $true }
+            catch { Warn "could not remove NiceLabel Suite ARP ${arp}: $($_.Exception.Message)"; $residueOk = $false }
+        }
+    $svcOk = $true
+    foreach ($svc in @(Get-Service -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -like 'NiceLabel*' } | Select-Object -ExpandProperty Name)) {
+        & "$env:SystemRoot\System32\sc.exe" delete $svc | Out-Null
+        if ($LASTEXITCODE -eq 0) { Info "  removed NiceLabel service: $svc" }
+        else { Warn "could not remove NiceLabel service ${svc}: sc.exe exit $LASTEXITCODE"; $svcOk = $false }
+    }
+    foreach ($p in @(Get-ChildItem 'HKLM:\SOFTWARE\Classes\Installer\Products' -ErrorAction SilentlyContinue |
+                     Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProductName -match '(?i)NiceLabel' })) {
+        $feat = "HKLM:\SOFTWARE\Classes\Installer\Features\$($p.PSChildName)"
+        if (Test-Path $feat) {
+            try { Remove-Item $feat -Recurse -Force -ErrorAction Stop }
+            catch { Warn "could not remove NiceLabel Installer Features key $($p.PSChildName): $($_.Exception.Message)"; $residueOk = $false }
+        }
+        try { Remove-Item $p.PSPath -Recurse -Force -ErrorAction Stop }
+        catch { Warn "could not remove NiceLabel Installer Products key $($p.PSChildName): $($_.Exception.Message)"; $residueOk = $false }
+    }
+    foreach ($u in @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products' -ErrorAction SilentlyContinue |
+                     Where-Object { (Get-ItemProperty "$($_.PSPath)\InstallProperties" -ErrorAction SilentlyContinue).DisplayName -match '(?i)NiceLabel' })) {
+        try { Remove-Item $u.PSPath -Recurse -Force -ErrorAction Stop }
+        catch { Warn "could not remove NiceLabel UserData product key $($u.PSChildName): $($_.Exception.Message)"; $residueOk = $false }
+    }
+    if ($Cmd -match '([A-Za-z]:\\ProgramData\\\{[0-9A-Fa-f-]+\})') {
+        $nlCache = $Matches[1]
+        if (Test-Path $nlCache) {
+            try { Remove-Item $nlCache -Recurse -Force -ErrorAction Stop }
+            catch { Warn "could not remove NiceLabel bootstrapper cache ${nlCache}: $($_.Exception.Message)"; $residueOk = $false }
+        }
+    }
+    if ($nlDir -and $nlDir -match '(?i)NiceLabel' -and (Test-Path $nlDir)) {
+        try { Remove-Item $nlDir -Recurse -Force -ErrorAction Stop; Info "  removed NiceLabel program files: $nlDir" }
+        catch { Warn "could not fully remove NiceLabel program files ${nlDir}: $($_.Exception.Message)"; $residueOk = $false }
+    }
+    if (-not $svcOk -or -not $residueOk) {
+        Fail "NiceLabel residue survived (service / registry / files - see warnings above) - reboot and re-run -Uninstall: $DisplayName"
+        return $false
+    }
+    if ($guid) {
+        if (-not $nlOk) { Fail "NiceLabel not removed (msiexec exit $($mp.ExitCode)): $DisplayName"; return $false }
+    } else {
+        if (Find-InstalledProducts -Pattern '(?i)NiceLabel') {
+            Fail "NiceLabel not fully removed (no product GUID resolved; still in registry): $DisplayName"; return $false
+        }
+    }
+    Ok "removed NiceLabel: $DisplayName$(if ($removedKey) { ' (+ Suite residue)' } else { '' })"
+    return $true
+}
+
 # docs/INSTALL-ENGINE.md#uninstall-flags
 function Invoke-SilentUninstall {
     param([string]$DisplayName, [string]$UninstallString, [string]$QuietUninstallString, [string]$ProductCode)
     $UninstallTimeoutMs = 360000
     $cmd = if ($QuietUninstallString) { $QuietUninstallString } else { $UninstallString }
-    # docs/INSTALL-ENGINE.md#nicelabel-uninstall  (msiexec + an explicit Suite-residue sweep)
-    if ($cmd -match '(?i)NiceLabel\d*\.exe') {
-        if ($DryRun) { Dry "would remove NiceLabel via msiexec /x + Suite residue cleanup: $DisplayName ($ProductCode)"; return $true }
-        $nlDir = $null
-        foreach ($h in $UninstallHives) {
-            $rec = Get-ItemProperty $h -ErrorAction SilentlyContinue |
-                Where-Object { $_.PSChildName -eq $ProductCode -and $_.DisplayName -match '(?i)NiceLabel' -and $_.InstallLocation } |
-                Select-Object -First 1
-            if ($rec) { $nlDir = $rec.InstallLocation; break }
-        }
-        Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'NiceLabel*' -and $_.Status -ne 'Stopped' } |
-            ForEach-Object { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue }
-        $guid = if ($ProductCode -match '^\{[0-9A-Fa-f-]+\}$') { $ProductCode } else {
-            $sib = $null
-            foreach ($h in $UninstallHives) {
-                $sib = Get-ItemProperty $h -ErrorAction SilentlyContinue |
-                    Where-Object { $_.PSChildName -match '^\{[0-9A-Fa-f-]+\}$' -and $_.DisplayName -match '(?i)NiceLabel' } |
-                    Select-Object -First 1
-                if ($sib) { break }
-            }
-            if ($sib) { $sib.PSChildName } else { $null }
-        }
-        $nlOk = $true
-        if ($guid) {
-            Info "  NiceLabel: msiexec.exe /x $guid /qn /norestart (Suite MSI)"
-            $mp = Start-Process msiexec.exe -ArgumentList "/x $guid /qn /norestart" -Wait -PassThru -WindowStyle Hidden
-            $nlOk = ($mp.ExitCode -in @(0,3010,1641,1605))
-            if (-not $nlOk) { Warn "NiceLabel msiexec /x $guid exited $($mp.ExitCode)" }
-        }
-        $residueOk  = $true
-        $removedKey = $false
-        foreach ($h in $UninstallHives) {
-            Get-ItemProperty $h -ErrorAction SilentlyContinue |
-                Where-Object { $_.PSChildName -eq $ProductCode -and $_.DisplayName -match '(?i)NiceLabel' } |
-                ForEach-Object {
-                    $arp = $_.PSChildName
-                    try { Remove-Item $_.PSPath -Recurse -Force -ErrorAction Stop; $removedKey = $true }
-                    catch { Warn "could not remove NiceLabel Suite ARP ${arp}: $($_.Exception.Message)"; $residueOk = $false }
-                }
-        }
-        $svcOk = $true
-        foreach ($svc in @(Get-Service -ErrorAction SilentlyContinue |
-                           Where-Object { $_.Name -like 'NiceLabel*' } | Select-Object -ExpandProperty Name)) {
-            & "$env:SystemRoot\System32\sc.exe" delete $svc | Out-Null
-            if ($LASTEXITCODE -eq 0) { Info "  removed NiceLabel service: $svc" }
-            else { Warn "could not remove NiceLabel service ${svc}: sc.exe exit $LASTEXITCODE"; $svcOk = $false }
-        }
-        foreach ($p in @(Get-ChildItem 'HKLM:\SOFTWARE\Classes\Installer\Products' -ErrorAction SilentlyContinue |
-                         Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProductName -match '(?i)NiceLabel' })) {
-            $feat = "HKLM:\SOFTWARE\Classes\Installer\Features\$($p.PSChildName)"
-            if (Test-Path $feat) {
-                try { Remove-Item $feat -Recurse -Force -ErrorAction Stop }
-                catch { Warn "could not remove NiceLabel Installer Features key $($p.PSChildName): $($_.Exception.Message)"; $residueOk = $false }
-            }
-            try { Remove-Item $p.PSPath -Recurse -Force -ErrorAction Stop }
-            catch { Warn "could not remove NiceLabel Installer Products key $($p.PSChildName): $($_.Exception.Message)"; $residueOk = $false }
-        }
-        foreach ($u in @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products' -ErrorAction SilentlyContinue |
-                         Where-Object { (Get-ItemProperty "$($_.PSPath)\InstallProperties" -ErrorAction SilentlyContinue).DisplayName -match '(?i)NiceLabel' })) {
-            try { Remove-Item $u.PSPath -Recurse -Force -ErrorAction Stop }
-            catch { Warn "could not remove NiceLabel UserData product key $($u.PSChildName): $($_.Exception.Message)"; $residueOk = $false }
-        }
-        if ($cmd -match '([A-Za-z]:\\ProgramData\\\{[0-9A-Fa-f-]+\})') {
-            $nlCache = $Matches[1]
-            if (Test-Path $nlCache) {
-                try { Remove-Item $nlCache -Recurse -Force -ErrorAction Stop }
-                catch { Warn "could not remove NiceLabel bootstrapper cache ${nlCache}: $($_.Exception.Message)"; $residueOk = $false }
-            }
-        }
-        if ($nlDir -and $nlDir -match '(?i)NiceLabel' -and (Test-Path $nlDir)) {
-            try { Remove-Item $nlDir -Recurse -Force -ErrorAction Stop; Info "  removed NiceLabel program files: $nlDir" }
-            catch { Warn "could not fully remove NiceLabel program files ${nlDir}: $($_.Exception.Message)"; $residueOk = $false }
-        }
-        if (-not $svcOk -or -not $residueOk) {
-            Fail "NiceLabel residue survived (service / registry / files - see warnings above) - reboot and re-run -Uninstall: $DisplayName"
-            return $false
-        }
-        if ($guid) {
-            if (-not $nlOk) { Fail "NiceLabel not removed (msiexec exit $($mp.ExitCode)): $DisplayName"; return $false }
-        } else {
-            $stillThere = [bool](Find-InstalledProducts -Pattern '(?i)NiceLabel')
-            if ($stillThere) { Fail "NiceLabel not fully removed (no product GUID resolved; still in registry): $DisplayName"; return $false }
-        }
-        Ok "removed NiceLabel: $DisplayName$(if ($removedKey) { ' (+ Suite residue)' } else { '' })"
-        return $true
-    }
+    if ($cmd -match '(?i)NiceLabel\d*\.exe') { return (Remove-NiceLabel -DisplayName $DisplayName -Cmd $cmd -ProductCode $ProductCode) }
     if (-not $cmd) { Warn "no uninstall command for $DisplayName"; return $false }
     $okCodes = @(0, 3010, 1641, 1605)
+    # docs/INSTALL-ENGINE.md#anchoring  (exact entry, both families: #exit0-recheck)
+    $escName = '^' + [regex]::Escape($DisplayName) + '$'
     if ($DryRun) { Dry "would uninstall: $cmd"; return $true }
     Info "  $DisplayName"
     Info "    cmd: $cmd"
@@ -859,7 +858,6 @@ function Invoke-SilentUninstall {
             if ($rest) { $spArgs['ArgumentList'] = $rest }
             $p = Start-Process @spArgs
 
-            $escName  = '^' + [regex]::Escape($DisplayName) + '$'
             $started  = Get-Date
             $deadline = $started.AddMilliseconds($UninstallTimeoutMs)
             # docs/INSTALL-ENGINE.md#hang-heuristic
@@ -883,7 +881,7 @@ function Invoke-SilentUninstall {
         if ($p.ExitCode -in $okCodes) {
             # docs/INSTALL-ENGINE.md#exit0-recheck
             # ponytail: flat 60 s ceiling, matching the hang floor above.
-            if ($escName -and $p.ExitCode -notin @(3010,1641)) {
+            if ($p.ExitCode -notin @(3010,1641)) {
                 $arpDeadline = (Get-Date).AddSeconds(60)
                 while ((Find-InstalledProducts -Pattern $escName) -and (Get-Date) -lt $arpDeadline) {
                     Start-Sleep -Seconds 3
@@ -952,8 +950,8 @@ function Test-RealBinary {
 function Save-FileSizeSidecar {
     param([string]$Path)
     try {
-        $size = (Get-Item $Path -ErrorAction Stop).Length
-        Set-Content -Path "$Path.len" -Value $size -Encoding ASCII -ErrorAction Stop
+        $size = (Get-Item -LiteralPath $Path -ErrorAction Stop).Length
+        Set-Content -LiteralPath "$Path.len" -Value $size -Encoding ASCII -ErrorAction Stop
     } catch { Warn "could not write size sidecar for ${Path}: $($_.Exception.Message)" }
 }
 # docs/INSTALL-ENGINE.md#truncation
@@ -961,19 +959,17 @@ function Test-CachedFileValid {
     param([string]$Path)
     if (-not (Test-RealBinary $Path)) { return $false }
     $lenFile = "$Path.len"
-    if (-not (Test-Path $lenFile)) { return $false }
+    if (-not (Test-Path -LiteralPath $lenFile)) { return $false }
     $expected = $null
-    try { $expected = [int64]((Get-Content $lenFile -Raw -ErrorAction Stop).Trim()) } catch { Write-Verbose "Test-CachedFileValid: no usable .len sidecar: $($_.Exception.Message)"; return $false }
+    try { $expected = [int64]((Get-Content -LiteralPath $lenFile -Raw -ErrorAction Stop).Trim()) } catch { Write-Verbose "Test-CachedFileValid: no usable .len sidecar: $($_.Exception.Message)"; return $false }
     if ($expected -le 0) { return $false }
-    $actual = (Get-Item $Path -ErrorAction SilentlyContinue).Length
+    $actual = (Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue).Length
     return ($actual -eq $expected)
 }
 
-$script:RemoteLengthCache = @{}
 # docs/INSTALL-ENGINE.md#truncation
 function Get-RemoteLength {
     param([string]$Url)
-    if ($script:RemoteLengthCache.ContainsKey($Url)) { return $script:RemoteLengthCache[$Url] }
     $result = [int64](-1)
     foreach ($method in @('HEAD', 'GET')) {
         try {
@@ -996,8 +992,7 @@ function Get-RemoteLength {
             if ($_.Exception.Response) { $_.Exception.Response.Close() }
         }
     }
-    if ($result -gt 0) { $script:RemoteLengthCache[$Url] = $result }
-    else { Warn "no Content-Length for $Url - the size guard is off for this file" }
+    if ($result -le 0) { Warn "no Content-Length for $Url - the size guard is off for this file" }
     return $result
 }
 
@@ -1050,12 +1045,15 @@ function Get-FileWithRetry {
     Step "Download: $Label"
 
     if (-not $ForceReinstall -and (Test-CachedFileValid $TargetPath)) {
-        $sz = (Get-Item $TargetPath).Length
+        $sz = (Get-Item -LiteralPath $TargetPath).Length
         Ok "already present, valid: $(Split-Path $TargetPath -Leaf) ($sz bytes)"
         return $true
     }
     if ($DryRun) { Dry "would download $Label -> $TargetPath"; return $true }
 
+    # Staged via .part so a failed attempt cannot destroy a valid cached copy:
+    # docs/INSTALL-ENGINE.md#download-retry
+    $part = "$TargetPath.part"
     for ($i = 0; $i -lt $MaxRetries; $i++) {
         $url = if ($i -ge ($MaxRetries - 1) -and $Urls.Count -gt 1) { $Urls[-1] } else { $Urls[0] }
         Info "  attempt $($i + 1)/$MaxRetries : $url"
@@ -1063,22 +1061,28 @@ function Get-FileWithRetry {
         $expected = Get-RemoteLength $url
         if ($expected -gt 0) { Info "  expected Content-Length: $expected bytes" }
 
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
         $got = $false
-        try { $got = Invoke-FileDownload -Url $url -Dest $TargetPath }
+        try { $got = Invoke-FileDownload -Url $url -Dest $part }
         catch { Warn "download error: $($_.Exception.Message)"; $got = $false }
 
         if ($got) {
-            $size = (Get-Item $TargetPath -ErrorAction SilentlyContinue).Length
+            $size = (Get-Item -LiteralPath $part -ErrorAction SilentlyContinue).Length
             $retryNote = if ($i -lt ($MaxRetries - 1)) { ' - retrying' } else { ' - no attempts left' }
             if ($expected -gt 0 -and $size -ne $expected) {
                 Warn "size mismatch: on-disk $size != Content-Length $expected$retryNote"
-            } elseif (-not (Test-RealBinary $TargetPath)) {
+            } elseif (-not (Test-RealBinary $part)) {
                 Warn "magic-byte check failed (HTML interstitial / truncation)$retryNote"
             } else {
-                Unblock-FileSafe $TargetPath
-                Save-FileSizeSidecar $TargetPath
-                Ok "downloaded $Label ($size bytes)"
-                return $true
+                $staged = $false
+                try { Move-Item -LiteralPath $part -Destination $TargetPath -Force -ErrorAction Stop; $staged = $true }
+                catch { Warn "could not move the staged download into place: $($_.Exception.Message)$retryNote" }
+                if ($staged) {
+                    Unblock-FileSafe $TargetPath
+                    Save-FileSizeSidecar $TargetPath
+                    Ok "downloaded $Label ($size bytes)"
+                    return $true
+                }
             }
         }
 
@@ -1087,6 +1091,7 @@ function Get-FileWithRetry {
             Info "  backing off $delay s..."; Start-Sleep -Seconds $delay
         }
     }
+    Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
     Fail "could not download $Label after $MaxRetries attempts"
     if (Test-CachedFileValid $TargetPath) {
         Warn "keeping the existing valid cached copy of $Label"
@@ -1101,10 +1106,10 @@ function Get-FileWithRetry {
 # docs/INSTALL-ENGINE.md#download  (confirm=t, alternate host)
 function Get-DriveFile {
     param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string]$FileId,
-          [Parameter(Mandatory)][string]$TargetPath, [int]$MaxRetries = 4)
+          [Parameter(Mandatory)][string]$TargetPath)
     $primary  = "https://drive.usercontent.google.com/download?id=$FileId&export=download&confirm=t"
     $fallback = "https://drive.google.com/uc?export=download&id=$FileId&confirm=t"
-    return Get-FileWithRetry -Label $Label -Urls @($primary, $fallback) -TargetPath $TargetPath -MaxRetries $MaxRetries
+    return Get-FileWithRetry -Label $Label -Urls @($primary, $fallback) -TargetPath $TargetPath
 }
 
 # docs/INSTALL-ENGINE.md#tables  (Label MUST equal the $Installers Name)
@@ -1141,8 +1146,10 @@ function Invoke-DownloadPhase {
     Info "  TLS: $([Net.ServicePointManager]::SecurityProtocol)"
     $results = @()
     foreach ($d in $DriveFiles) {
-        if (Test-SkipMatch -Names @($d.Label, $d.File)) {
-            Step "Download: $($d.Label)"; Warn "skipped via -SkipPrograms"
+        $why = if ($SkipMasterList -and $d.Label -eq 'Master List') { '-SkipMasterList' }
+               elseif (Test-SkipMatch -Names @($d.Label, $d.File))  { '-SkipPrograms' }
+        if ($why) {
+            Step "Download: $($d.Label)"; Warn "skipped via $why"
             continue
         }
         $target = Join-Path $DownloadDir $d.File
@@ -1320,23 +1327,22 @@ function Install-VcRedist {
 
     Step 'Bootstrap: Microsoft Visual C++ 2015-2022 x64 Redistributable'
 
+    $vcBase = @{
+        name='Microsoft Visual C++ 2015-2022 x64 Redistributable'
+        displayNameMatch='Microsoft Visual C\+\+ 201[5-9].*x64|2015-2022.*x64'
+        method='vcredist'; removable=$false
+    }
+    $vcSrc = @{ source='vc_redist.x64.exe' }
+
     if (Test-VcRedistPresent) {
         Ok 'Visual C++ x64 runtime already present - skipping'
-        $Manifest.dependencies += @{
-            name='Microsoft Visual C++ 2015-2022 x64 Redistributable'
-            displayNameMatch='Microsoft Visual C\+\+ 201[5-9].*x64|2015-2022.*x64'
-            method='vcredist'; result='already-present'; removable=$false
-        }
+        $Manifest.dependencies += ($vcBase + @{ result='already-present' })
         return
     }
 
     if ($DryRun) {
         Dry 'would download + install vc_redist.x64.exe /install /quiet /norestart'
-        $Manifest.dependencies += @{
-            name='Microsoft Visual C++ 2015-2022 x64 Redistributable'
-            displayNameMatch='Microsoft Visual C\+\+ 201[5-9].*x64|2015-2022.*x64'
-            method='vcredist'; result='dryrun'; removable=$false
-        }
+        $Manifest.dependencies += ($vcBase + @{ result='dryrun' })
         return
     }
 
@@ -1348,12 +1354,7 @@ function Install-VcRedist {
 
     if (-not $haveExe) {
         Fail 'could not obtain a valid vc_redist.x64.exe'
-        $Manifest.dependencies += @{
-            name='Microsoft Visual C++ 2015-2022 x64 Redistributable'
-            source='vc_redist.x64.exe'; method='vcredist'
-            displayNameMatch='Microsoft Visual C\+\+ 201[5-9].*x64|2015-2022.*x64'
-            result='fail-download'; removable=$false
-        }
+        $Manifest.dependencies += ($vcBase + $vcSrc + @{ result='fail-download' })
         return
     }
 
@@ -1367,21 +1368,11 @@ function Install-VcRedist {
         $exit = $p.ExitCode
     } catch {
         Fail "vc_redist launch failed: $($_.Exception.Message)"
-        $Manifest.dependencies += @{
-            name='Microsoft Visual C++ 2015-2022 x64 Redistributable'
-            source='vc_redist.x64.exe'; method='vcredist'
-            displayNameMatch='Microsoft Visual C\+\+ 201[5-9].*x64|2015-2022.*x64'
-            result="launch-failed: $($_.Exception.Message)"; removable=$false
-        }
+        $Manifest.dependencies += ($vcBase + $vcSrc + @{ result="launch-failed: $($_.Exception.Message)" })
         return
     }
 
-    $entry = @{
-        name='Microsoft Visual C++ 2015-2022 x64 Redistributable'
-        source='vc_redist.x64.exe'; method='vcredist'; logFile=$log
-        displayNameMatch='Microsoft Visual C\+\+ 201[5-9].*x64|2015-2022.*x64'
-        exitCode=$exit; removable=$false
-    }
+    $entry = $vcBase + $vcSrc + @{ logFile=$log; exitCode=$exit }
     if ($exit -in 0,1638,3010,1641) {
         if ($exit -eq 3010 -or $exit -eq 1641) { $script:RebootPending = $true; Warn 'VC++ requests a reboot (3010/1641) - deferred to end of run' }
         if (Test-VcRedistPresent) {
@@ -1563,7 +1554,7 @@ function Invoke-IssSilent {
         [Parameter(Mandatory)][string]$IssContent,
         [Parameter(Mandatory)][string]$IssLeaf,
         [Parameter(Mandatory)][string]$DisplayNameMatch,
-        [string]               $RecordMatch = '',
+        [Parameter(Mandatory)][string]$RecordMatch,
         [string]   $ArgFormat = '-s -f1"{0}" -f2"{1}"',
         [string[]] $WaitNames = @('setup','ISBEW64','ISSetupPrerequisites'),
         [string[]] $ReapNames = @('setup','ISBEW64','ISSetupPrerequisites'),
@@ -1571,7 +1562,6 @@ function Invoke-IssSilent {
     )
     $TimeoutSeconds = 900
     Step $Name
-    if (-not $RecordMatch) { $RecordMatch = $DisplayNameMatch }
 
     if ($DryRun) {
         Dry ("would run: `"$WrapperPath`" " + ($ArgFormat -f "<$IssLeaf>", '<log>'))
@@ -1873,6 +1863,25 @@ function Test-PriorInstallFailed {
     }).Count)
 }
 
+# docs/INSTALL-ENGINE.md#already-installed  (removable: docs/MANIFEST.md#step-2)
+function Add-AlreadyInstalledRow {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][string]$Match
+    )
+    Step $Name
+    Ok 'already installed; skipping'
+    $weInstalledIt = [bool](@((Get-PriorManifest).installed |
+        Where-Object { $_.name -eq $Name -and $_.removable -ne $false }).Count)
+    if (-not $weInstalledIt) { Info '  (found pre-installed - -Uninstall will leave it alone)' }
+    $Manifest.installed += @{
+        name=$Name; source=$Source; method=$Method; displayNameMatch=$Match
+        result='ok'; note='already-installed'; removable=$weInstalledIt
+    }
+}
+
 # docs/INSTALL-ENGINE.md#install-loop
 function Invoke-InstallLoop {
     foreach ($i in $Installers) {
@@ -1923,12 +1932,7 @@ function Invoke-InstallLoop {
             if ($i.Msi) {
                 if (-not $ForceReinstall -and -not (Test-PriorInstallFailed -Name $i.Name) -and
                     (Find-InstalledProducts -Pattern $i.Match)) {
-                    Step $i.Name
-                    Ok 'already installed; skipping'
-                    $Manifest.installed += @{
-                        name=$i.Name; source=$full; method='msi'
-                        displayNameMatch=$i.Match; result='ok'; note='already-installed'
-                    }
+                    Add-AlreadyInstalledRow -Name $i.Name -Source $full -Method 'msi' -Match $i.Match
                     continue
                 }
                 Invoke-Msi -Name $i.Name -Msi $full -DisplayNameMatch $i.Match
@@ -1936,12 +1940,7 @@ function Invoke-InstallLoop {
                 $uMatch = if ($i.UninstallMatch) { $i.UninstallMatch } else { $i.Match }
                 if (-not $ForceReinstall -and -not (Test-PriorInstallFailed -Name $i.Name) -and
                     (Find-InstalledProducts -Pattern $i.Match)) {
-                    Step $i.Name
-                    Ok 'already installed; skipping'
-                    $Manifest.installed += @{
-                        name=$i.Name; source=$full; method='iss-silent'
-                        displayNameMatch=$uMatch; result='ok'; note='already-installed'
-                    }
+                    Add-AlreadyInstalledRow -Name $i.Name -Source $full -Method 'iss-silent' -Match $uMatch
                     continue
                 }
                 $issOpt = @{}
@@ -1970,12 +1969,7 @@ function Invoke-InstallLoop {
                 }
             } else {
                 if ($skipInstalled) {
-                    Step $i.Name
-                    Ok 'already installed; skipping'
-                    $Manifest.installed += @{
-                        name=$i.Name; source=$full; method='exe'
-                        displayNameMatch=$i.Match; result='ok'; note='already-installed'
-                    }
+                    Add-AlreadyInstalledRow -Name $i.Name -Source $full -Method 'exe' -Match $i.Match
                     continue
                 }
                 Invoke-Installer -Name $i.Name -Path $full -DisplayNameMatch $i.Match -ArgList $i.Args -ConfirmRegistry:([bool]$i.ConfirmRegistry)
@@ -2575,8 +2569,7 @@ function Get-UserChoiceHash {
 function Get-HexDateTimeNow {
     $now=[DateTime]::Now
     $dt=[DateTime]::new($now.Year,$now.Month,$now.Day,$now.Hour,$now.Minute,0)
-    $ft=$dt.ToFileTime(); $hi=($ft -shr 32); $low=($ft -band 0xFFFFFFFFL)
-    return ($hi.ToString('X8')+$low.ToString('X8')).ToLower()
+    return $dt.ToFileTime().ToString('x16')
 }
 $experience='User Choice set via Windows User Experience {D18B6DD5-6124-4341-9318-804003BAFA0B}'
 # docs/FINISHING.md#minute-roll  (ProgId resolution: docs/FINISHING.md#progid)
@@ -2590,8 +2583,10 @@ function Set-UserChoiceDefault {
         $kp="HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell\Associations\UrlAssociations\$Token\UserChoice"
         $rk="HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell\Associations\UrlAssociations\$Token\UserChoice"
     }
-    $cur=(Get-ItemProperty $kp -ErrorAction SilentlyContinue).ProgId
-    if ($cur -eq $ProgId) { L "$Token already $ProgId"; return $true }
+    $have=(Get-ItemProperty $kp -ErrorAction SilentlyContinue)
+    $cur=$have.ProgId
+    # The Hash has to be there too: a ProgId with no hash is one Windows silently ignores.
+    if ($cur -eq $ProgId -and $have.Hash) { L "$Token already $ProgId"; return $true }
     # The Remove-Item below destroys this user's prior association and -Uninstall cannot
     # put it back (it runs as the tech, and the cashier's hive is not loaded). Log what it
     # was so the value is at least recoverable by hand from finish_<user>.log.
@@ -2655,7 +2650,10 @@ L 'finish done'
     $body = $body -replace '__DO_BROWSER__', $(if ($DoBrowser) { '$true' } else { '$false' })
     $body = $body -replace '__DO_TASKBAR__', $(if ($DoTaskbar) { '$true' } else { '$false' })
     $body = $body.Replace('__TASKBAR_STAMP__', ("$($script:TaskbarStamp)").Replace("'","''"))
-    $installUser = if (@($Manifest.accountCreated).Count -or @((Get-PriorManifest).accountCreated).Count) { '' } else { ("$env:USERNAME").Replace("'","''") }
+    # docs/FINISHING.md#install-user  (pipeline, not @(): @($null).Count is 1)
+    $swapped = @($Manifest.accountCreated | Where-Object { $_ }).Count -or
+               @((Get-PriorManifest).accountCreated | Where-Object { $_ }).Count
+    $installUser = if ($swapped) { '' } else { ("$env:USERNAME").Replace("'","''") }
     $body = $body.Replace('__INSTALL_USER__', $installUser)
     $chromeProgId = 'ChromeHTML'
     try {
@@ -2861,7 +2859,9 @@ function Wait-ScannerReenum {
     $cand = $null
     while ($sw.Elapsed.TotalSeconds -lt $ScannerReenumMaxWaitSec) {
         Start-Sleep -Milliseconds $ScannerReenumPollMs
-        $cand = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $PreHopSerial -PreHopId $PreHopId -PreHopMode $PreHopMode
+        # keep the last scanner actually seen - a mid-detach final poll must not erase it
+        $seen = Get-ReenumeratedScanner -Obj $Obj -PreHopSerial $PreHopSerial -PreHopId $PreHopId -PreHopMode $PreHopMode
+        if ($seen) { $cand = $seen }
         if ($cand -and ($cand.Id -ne $PreHopId -or (Get-ScannerHostMode $cand) -ne $PreHopMode)) { break }
     }
     $sw.Stop()
@@ -2911,27 +2911,31 @@ function Write-NewScannerFingerprint {
 function Set-ScannerOpos {
     Step 'Set Zebra scanner(s) to USB-OPOS'
 
+    # every bail records a row: docs/SCANNER-OPOS.md#bails
+    $bail = { param($r) $Manifest.scannerConfigured += @{
+        serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result=$r; removable=$false } }
+
     if ($SkipScannerConfig) {
         Ok 'scanner OPOS skipped (-SkipScannerConfig)'
-        $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='skipped:flag'; removable=$false }
+        & $bail 'skipped:flag'
         return
     }
     if ($script:ScannerDegraded) {
         Warn 'CoreScanner missing - skipping scanner OPOS'
-        $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='skipped:degraded'; removable=$false }
+        & $bail 'skipped:degraded'
         return
     }
 
     if ($DryRun) {
         Dry 'would set connected Zebra scanner(s) to USB-OPOS via CoreScanner (opcode 6200, XUA-45001-8)'
-        $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='dryrun'; removable=$false }
+        & $bail 'dryrun'
         return
     }
 
     $interopDll = Join-Path $env:ProgramFiles 'Zebra Technologies\Barcode Scanners\Common\Interop.CoreScanner.dll'
     if (-not (Test-Path $interopDll)) {
         Warn "Interop.CoreScanner.dll not found ($interopDll) - skipping scanner OPOS"
-        $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='no-interop'; removable=$false }
+        & $bail 'no-interop'
         $script:ScannerConfigFailed = $true
         return
     }
@@ -2948,7 +2952,7 @@ function Set-ScannerOpos {
         $obj.Open($appHandle, $types, [int16]1, [ref]$status)
         if ($status -ne 0) {
             Warn "CoreScanner Open() returned status $status - skipping scanner OPOS"
-            $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result="open-failed:$status"; removable=$false }
+            & $bail "open-failed:$status"
             $script:ScannerConfigFailed = $true
             return
         }
@@ -2956,7 +2960,7 @@ function Set-ScannerOpos {
 
         if (-not (Confirm-ScannerServicesReady)) {
             Fail 'Zebra CoreScanner service is not Running - the RSM channel the OPOS switch rides is unavailable'
-            $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='rsm-unavailable'; removable=$false }
+            & $bail 'rsm-unavailable'
             $script:ScannerConfigFailed = $true
             return
         }
@@ -2964,13 +2968,13 @@ function Set-ScannerOpos {
         $scanners = @(Get-CoreScannerInventory $obj)
         if ($scanners.Count -eq 0 -and $script:ScannerInventoryStatus -ne 0) {
             Fail "GetScanners failed (status $script:ScannerInventoryStatus) - cannot enumerate scanners"
-            $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result="enum-failed:$script:ScannerInventoryStatus"; removable=$false }
+            & $bail "enum-failed:$script:ScannerInventoryStatus"
             $script:ScannerConfigFailed = $true
             return
         }
         if ($scanners.Count -eq 0) {
             Warn 'no Zebra scanner connected - skipping OPOS (re-run with the scanner attached)'
-            $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result='no-scanner'; removable=$false }
+            & $bail 'no-scanner'
             return
         }
 
@@ -3015,20 +3019,26 @@ function Set-ScannerOpos {
                 $entry.fingerprintLog = Write-NewScannerFingerprint -Model $dumpModel -Hops $script:ScannerHopLog
             }
             } catch {
-                Fail "  $label threw during the OPOS switch: $($_.Exception.Message)"
-                $script:ScannerConfigFailed = $true
-                if (-not $entry) {
-                    $entry = @{ serial=$s.Serial; serialFinal=$script:ScannerFinalSerial; model=$s.Model
-                                modelFinal=$script:ScannerFinalModel; hostBefore=$mode; target='USB-OPOS'
-                                removable=$false }
+                # A throw PAST the verdict (the fingerprint dump) must not unmake a confirmed
+                # switch - it would force exit 6 on a scanner that IS in OPOS.
+                if ($entry -and $entry.result -in @('ok','already-opos')) {
+                    Warn "  $label is in USB-OPOS, but its bookkeeping threw: $($_.Exception.Message)"
+                } else {
+                    Fail "  $label threw during the OPOS switch: $($_.Exception.Message)"
+                    $script:ScannerConfigFailed = $true
+                    if (-not $entry) {
+                        $entry = @{ serial=$s.Serial; serialFinal=$script:ScannerFinalSerial; model=$s.Model
+                                    modelFinal=$script:ScannerFinalModel; hostBefore=$mode; target='USB-OPOS'
+                                    removable=$false }
+                    }
+                    $entry.result = "fail: $($_.Exception.Message)"
                 }
-                $entry.result = "fail: $($_.Exception.Message)"
             }
             if ($entry) { $Manifest.scannerConfigured += $entry }
         }
     } catch {
         Fail "scanner OPOS step failed: $($_.Exception.Message)"
-        $Manifest.scannerConfigured += @{ serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result="error: $($_.Exception.Message)"; removable=$false }
+        & $bail "error: $($_.Exception.Message)"
         $script:ScannerConfigFailed = $true
     } finally {
         if ($obj) {
@@ -3108,7 +3118,6 @@ function Invoke-UninstallPhase {
     }
     if (-not $man) { Fail "Manifest is empty: $ManifestPath"; return 1 }
     Write-Host "Manifest from $($man.timestamp) on $($man.machine) by $($man.user)" -ForegroundColor Cyan
-    if ($DryRun) { Write-Host "DRY RUN - nothing will be removed" -ForegroundColor Yellow }
 
     $uninstallFailures = 0
 
@@ -3141,8 +3150,9 @@ function Invoke-UninstallPhase {
     }
 
     Step 'Uninstall Alleaves stack'
-    $allowedResults = if ($DryRun) { @('ok','fail','dryrun') } else { @('ok','fail') }
-    $reverseInstalled = @($man.installed | Where-Object { $allowedResults -contains $_.result })
+    # docs/MANIFEST.md#step-2  (every attempt is replayed; removable=false = we never installed it)
+    $reverseInstalled = @($man.installed | Where-Object {
+        $_.result -and $_.removable -ne $false -and ($DryRun -or $_.result -ne 'dryrun') })
     [Array]::Reverse($reverseInstalled)
     if ($DryRun -and ($man.installed | Where-Object { $_.result -eq 'dryrun' })) {
         Warn "manifest is from a DRY-RUN install; in real-uninstall mode these would be skipped"
@@ -3247,7 +3257,7 @@ function Invoke-UninstallPhase {
                         default  { [string]$rv.prev }
                     }
                     if (-not (Test-Path $rv.path)) { Ok "already gone: $($rv.path) - nothing to restore"; continue }
-                    New-ItemProperty -Path $rv.path -Name $rv.name -Value $val -PropertyType $rv.type -Force | Out-Null
+                    New-ItemProperty -Path $rv.path -Name $rv.name -Value $val -PropertyType $rv.type -Force -ErrorAction Stop | Out-Null
                     Ok "restored $($rv.path)\$($rv.name) = $($rv.prev)"
                 }
             } catch { Warn "could not restore $($rv.path)\$($rv.name): $($_.Exception.Message)"; $uninstallFailures++ }
@@ -3287,9 +3297,9 @@ function Invoke-UninstallPhase {
         if ($DryRun) { Dry "would restore Taskband for sid $($tb.sid)"; continue }
         if (-not (Test-Path $hive)) { Warn "sid $($tb.sid) hive not loaded - taskbar restore skipped (cosmetic)"; continue }
         try {
-            if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
-            if ($tb.favorites)        { New-ItemProperty -Path $p -Name 'Favorites'        -Value ([Convert]::FromBase64String($tb.favorites))        -PropertyType Binary -Force | Out-Null }
-            if ($tb.favoritesResolve) { New-ItemProperty -Path $p -Name 'FavoritesResolve' -Value ([Convert]::FromBase64String($tb.favoritesResolve)) -PropertyType Binary -Force | Out-Null }
+            if (-not (Test-Path $p)) { New-Item -Path $p -Force -ErrorAction Stop | Out-Null }
+            if ($tb.favorites)        { New-ItemProperty -Path $p -Name 'Favorites'        -Value ([Convert]::FromBase64String($tb.favorites))        -PropertyType Binary -Force -ErrorAction Stop | Out-Null }
+            if ($tb.favoritesResolve) { New-ItemProperty -Path $p -Name 'FavoritesResolve' -Value ([Convert]::FromBase64String($tb.favoritesResolve)) -PropertyType Binary -Force -ErrorAction Stop | Out-Null }
             Remove-ItemProperty -Path "$hive\Software\AlleavesAuto" -Name 'TaskbarApplied' -ErrorAction SilentlyContinue
             Ok "restored Taskband for sid $($tb.sid) (sign out/in to see the original pins)"
         } catch { Warn "could not restore Taskband for $($tb.sid): $($_.Exception.Message)"; $uninstallFailures++ }
@@ -3457,13 +3467,15 @@ function Remove-StalePrinterOpos {
 
 # docs/PRINTER-OPOS.md  (#readback, #brand-switch, #bails)
 function Set-PrinterOpos {
+    # every bail records a row: docs/PRINTER-OPOS.md#bails
+    $bail = { param($tag, $res, $b) $Manifest.printerConfigured += @{
+        logicalName="(none:$tag)"; deviceClass=$null; deviceType=$null
+        progId=$null; brand=$b; result=$res; removable=$true } }
+
     if ($SkipPrinterConfig) {
         Step 'Register receipt printer (OPOS)'
         Ok 'printer OPOS skipped (-SkipPrinterConfig)'
-        $Manifest.printerConfigured += @{
-            logicalName='(none:skipped-flag)'; deviceClass=$null; deviceType=$null
-            progId=$null; brand=$PrinterBrand; result='skipped:flag'; removable=$true
-        }
+        & $bail 'skipped-flag' 'skipped:flag' $script:PrinterBrandResolved
         return
     }
 
@@ -3472,20 +3484,14 @@ function Set-PrinterOpos {
 
     if ($brand -eq 'None') {
         Ok 'no receipt printer selected - skipping OPOS registration'
-        $Manifest.printerConfigured += @{
-            logicalName='(none:None)'; deviceClass=$null; deviceType=$null
-            progId=$null; brand=$brand; result='skipped'; removable=$true
-        }
+        & $bail 'None' 'skipped' $brand
         return
     }
 
     $brandDef = $PrinterBrands[$brand]
     if (-not $brandDef) {
         Fail "no device table for printer brand '$brand' - this is a build error, not a terminal fault"
-        $Manifest.printerConfigured += @{
-            logicalName='(none:unknown-brand)'; deviceClass=$null; deviceType=$null
-            progId=$null; brand=$brand; result='fail: unknown brand'; removable=$true
-        }
+        & $bail 'unknown-brand' 'fail: unknown brand' $brand
         if (-not $DryRun) { $script:PrinterConfigFailed = $true }
         return
     }
@@ -3494,10 +3500,7 @@ function Set-PrinterOpos {
     if (-not ($DryRun -and -not $PrinterConfigOnly) -and -not (Find-InstalledProducts -Pattern $brandDef.ArpPattern)) {
         Warn "$brand printer driver ('$($brandDef.RowName)') is not installed - skipping OPOS registration."
         Warn 'Install it (full run, or without -SkipPrograms), then re-run with -PrinterConfigOnly.'
-        $Manifest.printerConfigured += @{
-            logicalName="(none:no-driver)"; deviceClass=$null; deviceType=$null
-            progId=$null; brand=$brand; result='no-driver'; removable=$true
-        }
+        & $bail 'no-driver' 'no-driver' $brand
         return
     }
 
@@ -3527,24 +3530,23 @@ function Set-PrinterOpos {
         }
         Warn "$brand OPOS values have not been captured yet ($what)."
         Warn 'Run the bench capture in docs/PRINTER_OPOS_FIELD_RESULTS.md, fill the tables, then re-run with -PrinterConfigOnly.'
-        $Manifest.printerConfigured += @{
-            logicalName='(none:not-captured)'; deviceClass=$null; deviceType=$null
-            progId=$null; brand=$brand; result='not-captured'; removable=$true
-        }
+        & $bail 'not-captured' 'not-captured' $brand
         if (-not $DryRun) { $script:PrinterConfigFailed = $true }
         return
     }
 
     $prior = Get-PriorManifest
+    # docs/PRINTER-OPOS.md#prior-brand
+    $priorBrand = { param($ldn, $cls) $prior.printerConfigured |
+        Where-Object { $_.logicalName -eq $ldn -and $_.deviceClass -eq $cls -and
+                       $_.brand -and $_.brand -ne $brand } |
+        ForEach-Object { $_.brand } }
 
     if ($DryRun) {
         $null = Remove-StalePrinterOpos -Registered @($brandDef.Devices | ForEach-Object { "$prefix$($_.Suffix)" })
         foreach ($dev in $brandDef.Devices) {
             $ldn = "$prefix$($dev.Suffix)"
-            $wasBrand = @($prior.printerConfigured |
-                          Where-Object { $_.logicalName -eq $ldn -and $_.deviceClass -eq $dev.Class -and
-                                         $_.brand -and $_.brand -ne $brand } |
-                          ForEach-Object { $_.brand })
+            $wasBrand = @(& $priorBrand $ldn $dev.Class)
             if ($wasBrand -and (Test-Path "$PrinterOposRoot\$($dev.Class)\$ldn")) {
                 Dry "would clear the $($wasBrand[-1]) OPOS values from '$ldn' before rewriting it as $brand"
             }
@@ -3564,11 +3566,8 @@ function Set-PrinterOpos {
         $key   = "$PrinterOposRoot\$($dev.Class)\$ldn"
         $keepBrand = $null
 
-        # docs/PRINTER-OPOS.md#prior-brand  ($keepBrand stamps the PRIOR brand, or the advised re-run reports ok)
-        $wasBrand = @($prior.printerConfigured |
-                      Where-Object { $_.logicalName -eq $ldn -and $_.deviceClass -eq $dev.Class -and
-                                     $_.brand -and $_.brand -ne $brand } |
-                      ForEach-Object { $_.brand })
+        # $keepBrand stamps the PRIOR brand, or the advised re-run reports ok
+        $wasBrand = @(& $priorBrand $ldn $dev.Class)
         if ($wasBrand -and (Test-Path $key)) {
             try {
                 if ((Get-Item $key -ErrorAction Stop).SubKeyCount -gt 0) {
@@ -3661,16 +3660,23 @@ function New-InstallManifest {
 
 # docs/ARCHITECTURE.md#exit-codes
 $exitCode = 0
-$RunLog = $null
+# One transcript opener for all three modes: docs/ARCHITECTURE.md#run-shape
+$ModeBanner = switch ($Mode) {
+    'ScannerConfig' { @('scannercfg', 'Alleaves SCANNER-CONFIG ONLY (USB-OPOS)') }
+    'PrinterConfig' { @('printercfg', 'Alleaves PRINTER-CONFIG ONLY (OPOS)') }
+    'Uninstall'     { @('uninstall',  'Alleaves UNINSTALL') }
+    default         { @('install',    'Alleaves bootstrap INSTALL') }
+}
+$RunLog = Join-Path $LogDir ("{0}_{1:yyyyMMdd_HHmmss}.log" -f $ModeBanner[0], (Get-Date))
 try {
+    Start-Transcript -Path $RunLog -Append | Out-Null
+    Write-Host $ModeBanner[1] -ForegroundColor Cyan
+    Info "WorkDir:   $WorkDir"
+    Info "Manifest:  $ManifestPath"
+    if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
+
     if ($ScannerConfigOnly -or $PrinterConfigOnly) {
-        $scan   = [bool]$ScannerConfigOnly
-        $RunLog = Join-Path $LogDir ("{0}_{1:yyyyMMdd_HHmmss}.log" -f $(if ($scan) { 'scannercfg' } else { 'printercfg' }), (Get-Date))
-        Start-Transcript -Path $RunLog -Append | Out-Null
-        Write-Host $(if ($scan) { 'Alleaves SCANNER-CONFIG ONLY (USB-OPOS)' } else { 'Alleaves PRINTER-CONFIG ONLY (OPOS)' }) -ForegroundColor Cyan
-        Info "WorkDir:  $WorkDir"
-        Info "Manifest: $ManifestPath"
-        if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
+        $scan = [bool]$ScannerConfigOnly
 
         $Manifest = New-InstallManifest
         if ($scan) { Invoke-Step 'Scanner USB-OPOS' { Set-ScannerOpos } }
@@ -3692,26 +3698,14 @@ try {
         Info "Manifest: $ManifestPath"
         Info "Log:      $RunLog"
     } elseif ($Uninstall) {
-        $RunLog = Join-Path $LogDir ("uninstall_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
-        Start-Transcript -Path $RunLog -Append | Out-Null
-        Write-Host "Alleaves UNINSTALL" -ForegroundColor Cyan
-        Info "WorkDir:  $WorkDir"
-        Info "Manifest: $ManifestPath"
         $rc = Invoke-UninstallPhase
         # docs/ARCHITECTURE.md#what-folds-into-exit-1  (Clear-AccountSwapState runs pre-dispatch in EVERY mode)
         if ($rc -ne 0) { $exitCode = $rc }
         elseif ($script:FinishFailed -or $script:StepFailed) { $exitCode = 1 }
         Step 'Done'
     } else {
-        $RunLog = Join-Path $LogDir ("install_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
-        Start-Transcript -Path $RunLog -Append | Out-Null
-
-        Write-Host "Alleaves bootstrap INSTALL" -ForegroundColor Cyan
-        Info "WorkDir:      $WorkDir"
-        Info "Downloads:    $DownloadDir"
-        Info "Manifest:     $ManifestPath"
-        Info "Logs:         $LogDir"
-        if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
+        Info "Downloads: $DownloadDir"
+        Info "Logs:      $LogDir"
 
         $Manifest = New-InstallManifest
 
@@ -3722,6 +3716,7 @@ try {
         $brand0 = if ($SkipPrinterConfig) { if ($PrinterBrand) { $PrinterBrand } else { 'POS-X' } }
                   else { Invoke-Step 'Printer brand' { Resolve-PrinterBrand } }
         if (-not $brand0) { $brand0 = 'POS-X'; Warn 'printer brand unresolved - using POS-X' }
+        $script:PrinterBrandResolved = $brand0
         foreach ($b in $PrinterBrands.Keys) {
             if ($b -ne $brand0) { $SkipPrograms += $PrinterBrands[$b].RowName }
         }
@@ -3772,9 +3767,11 @@ try {
         Save-Manifest
         $script:ManifestSaved = -not $script:ManifestWriteFailed
 
-        Get-ChildItem $LogDir -Filter '*.std*.log' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -eq 0 } |
-            Remove-Item -Force -ErrorAction SilentlyContinue
+        if (-not $DryRun) {
+            Get-ChildItem $LogDir -Filter '*.std*.log' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -eq 0 } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
 
         if ($failed.Count -gt 0 -or $depFailed.Count -gt 0 -or $script:DownloadFailed -or $script:FinishFailed -or $script:StepFailed -or $script:ManifestWriteFailed) {
             $exitCode = 1

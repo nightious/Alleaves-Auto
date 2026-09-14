@@ -268,7 +268,8 @@ falling through to the "nothing registered" Warn, whose premise is a loop that i
 
 ## <a id="bails"></a>Every bail records a `printerConfigured` row
 
-A missing row cannot tell "the tech suppressed it" from "the run died before step 5b".
+A missing row cannot tell "the tech suppressed it" from "the run died before step 5b". All six are the
+same shape, so one local `$bail` scriptblock writes them.
 
 | Situation | `result` | Exit |
 |---|---|---|
@@ -279,9 +280,11 @@ A missing row cannot tell "the tech suppressed it" from "the run died before ste
 | tables not captured | `not-captured` | 7 |
 | already registered | `already-configured` | 0 |
 
-For `skipped:flag` the `brand` is `-PrinterBrand` **as given** (empty when it wasn't), since the flag
-suppresses the prompt and there is no resolved answer to record. `None` returns *before*
-`Remove-StalePrinterOpos` — it is a skip, not a retro-uninstall. `-Uninstall` removes those rows.
+For `skipped:flag` the `brand` is the one step 0b settled on (`-PrinterBrand`, else the POS-X fallback),
+read from `$script:PrinterBrandResolved` — the flag suppresses the *prompt*, but step 0b still had to pick
+a brand to gate the downloads, and recording the raw empty param instead made the row disagree with what
+the run actually installed. `None` returns *before* `Remove-StalePrinterOpos` — it is a skip, not a
+retro-uninstall. `-Uninstall` removes those rows.
 
 An **unknown brand** is unreachable via the param `ValidateSet` or the prompt (whose default arm falls back to
 POS-X), so it only fires if a brand is added to one and not the other. It raises the flag only when **not**

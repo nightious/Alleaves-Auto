@@ -11,7 +11,7 @@ dispatch paths so the key set can never drift between them.
 
 | Key | Shape | Reversal |
 |---|---|---|
-| `installed` | `name, source, displayNameMatch, result` always; `args` (redacted), `exitCode`, `stdoutLog`/`stderrLog`, `note`, `method` per writer — see below | uninstalled in reverse |
+| `installed` | `name, source, displayNameMatch, result` always; `args` (redacted), `exitCode`, `stdoutLog`/`stderrLog`, `note`, `method`, `removable` per writer — see below | uninstalled in reverse unless `removable=false` |
 | `dependencies` | VC++ only | **reported, never removed** — other software may depend on it |
 | `filesPlaced` | paths — **may hold a DIRECTORY** | deleted in order |
 | `filesReplaced` | `{ path; backup }` | backup moved back over path, after the deletes |
@@ -183,12 +183,16 @@ not a reversal failure.
 **<a id="step-1b"></a>1b — restore pre-existing files.** Must run AFTER the deletion loop, which removes
 the path this restores to.
 
-**<a id="step-2"></a>2 — uninstall products in REVERSE order.** **`'fail'` rows are replayed too, not
-just `'ok'`** (`$allowedResults`; `-DryRun` additionally replays `'dryrun'`): a row recorded fail
-routinely leaves a live ARP entry and partially copied files
-([INSTALL-ENGINE.md#already-installed](INSTALL-ENGINE.md#already-installed)), so skipping those
-stranded exactly the installs most in need of reversing. A row for something never installed costs
-nothing — `Find-InstalledProducts` finds no match and skips it with a warning.
+**<a id="step-2"></a>2 — uninstall products in REVERSE order.** **Every row with a `result` is
+replayed**, not an allow-list of `ok`/`fail` (`'dryrun'` only under `-DryRun`). An exact-match set
+silently excluded `fail-timeout`, `fail-exception` and `launch-failed: …` — and `fail-timeout` is the
+one `Invoke-Installer` writes when it refuses to kill a process *because it may still be installing*, so
+the row likeliest to have a live product was the one never reversed. A row for something never installed
+costs nothing — `Find-InstalledProducts` finds no match and skips it with a warning.
+
+The one exclusion is **`removable=$false`**: a product this installer only ever *found* already present
+([INSTALL-ENGINE.md#already-installed](INSTALL-ENGINE.md#already-installed)). An old manifest has no
+`removable` key, which reads as removable and is replayed exactly as before.
 
 **<a id="step-2b"></a>2b — sweep InstallShield orphans.** Gated on `method -eq 'iss-silent' -or
 note -eq 'msi-fallback'`; see [INSTALL-ENGINE.md#iss-fallback](INSTALL-ENGINE.md#iss-fallback) and
@@ -220,6 +224,10 @@ unused here.
 - **The restore arm must NOT `New-Item` the key back.** That resurrects the OPOS device a rename (or the
   drawer retirement) just retired — a phantom device created by the uninstall whose job is to remove
   them. A restore only means anything while the key that owns the value still exists.
+- **Its `New-ItemProperty` is `-ErrorAction Stop`**, like the deletion beside it. The registry
+  provider's refusals are non-terminating under `'Continue'`, so a value under a GPO-locked ACL printed
+  `[OK] restored …`, was never counted, and `-Uninstall` exited 0. Step 4d's `Taskband` writes had the
+  same gap.
 
 <a id="default-value"></a>**`Remove-ItemProperty` CANNOT delete a key's `(default)` value.** `-Name
 '(default)'` throws "Property (default) does not exist" and `-Name ''` fails parameter binding. Only a
@@ -274,5 +282,6 @@ Profiles not loaded now are cosmetic-only: removing the XML won't re-pin Edge.
 `computerRenamed` (restoring a factory-random name is pointless), `teamViewerRemoved`,
 `scannerConfigured` ([SCANNER-OPOS.md#uninstall](SCANNER-OPOS.md#uninstall)), and `accountCreated` — the
 terminal is signed into it and its Documents holds the `.nlbl`. `Invoke-UninstallPhase` merely prints a
-note for all four; the `removable` key is read at exactly one place, `Remove-StalePrinterOpos`
-([PRINTER-OPOS.md#removable-guard](PRINTER-OPOS.md#removable-guard)).
+note for all four. The `removable` key is read in two places: `Remove-StalePrinterOpos`
+([PRINTER-OPOS.md#removable-guard](PRINTER-OPOS.md#removable-guard)) and [step 2](#step-2)'s
+already-installed exclusion.
