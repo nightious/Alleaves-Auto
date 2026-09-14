@@ -60,10 +60,10 @@ least-trusted branch in the function was also the only one failing *open*.
 
 `PrincipalSource` is asked **first** and believed in both directions. The IdentityStore registry cache is
 the fallback, and its *absence* cannot tell "local" from "this build doesn't populate it" — so that path is
-`'unknown'`, not a pass. That cache probe is **one** function, `Get-IdentityStoreEmail`, shared with
-`Get-MsaLinkedEmail`: it returns the email or `$null` and decides nothing, because it is the probe most
-likely to change and two byte-identical copies drift. Each caller maps "no answer" itself — `'unknown'`
-(block) for the verdict, a display string for the message.
+`'unknown'`, not a pass. That cache probe is **one** function, `Get-IdentityStoreEmail`, called twice by
+`Get-MicrosoftAccountId`: it returns the email or `$null` and decides nothing, because it is the probe
+most likely to change and two byte-identical copies drift. Each arm maps "no answer" itself — `'unknown'`
+(block) for the verdict, `'(linked email unknown)'` for the message.
 
 > **TODO[rig]** — confirm on a real MSA terminal that `PrincipalSource` answers, so the registry fallback
 > stays the rare path rather than the usual one. Neither probe has been seen against a real MSA box.
@@ -113,6 +113,16 @@ top-to-bottom script, so raw cmdlets only. The facts reach the manifest via the 
 The **`not-admin` path arms NO autologon**: reaching that arm already proves the account is local and
 non-MSA, so promoting it in place is one `Add-LocalGroupMember` and the tech types a password they already
 know. Only the create path handles a secret, because only there do we have one.
+
+**`Read-SwapAnswer` honours `UserInteractive` + `ALLEAVES_NOPAUSE`**, like the rename and printer-brand
+prompts. Without it an unattended RMM run that tripped the precheck reached `Read-Host` and, with stdin an
+inherited handle rather than a console, blocked forever on "Create a local admin account and reboot?" —
+the flag that means "unattended" was honoured everywhere except the one prompt that can create an account
+and reboot. Declining is the safe default, so a `$null` answer degrades straight to exit 8. Gating that
+one function covers all three swap prompts, since the other two sit behind `Confirm-Swap`.
+
+`-NiceLabelLicense` is deliberately **not** persisted into the resume task (the task XML is world-readable),
+but the resumed run then falls back to the built-in key, so `ConvertTo-ResumeArgs` says so out loud.
 
 ### <a id="autologon"></a>`AutoLogonCount=1`, not an LSA secret
 

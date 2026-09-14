@@ -11,15 +11,7 @@
     Exits 0 on pass, 1 on failure.
 #>
 $ErrorActionPreference = 'Stop'
-$script:Failures = 0
-
-function Assert-Eq($expected, $actual, $what) {
-    if ("$expected" -eq "$actual") { Write-Host "  ok   $what" -ForegroundColor Green }
-    else {
-        Write-Host "  FAIL $what -- expected '$expected', got '$actual'" -ForegroundColor Red
-        $script:Failures++
-    }
-}
+. (Join-Path $PSScriptRoot '_common.ps1')
 
 Write-Host "`nStart-Process -PassThru + redirection loses the exit code without .Handle" -ForegroundColor Cyan
 
@@ -51,15 +43,9 @@ if ($null -ne $bareExit) {
 
 Write-Host "`nInvoke-Installer still caches the handle before waiting" -ForegroundColor Cyan
 
-$target = Join-Path (Split-Path $PSScriptRoot -Parent) 'alleaves_setup.ps1'
-$errs = $null
-$ast  = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$errs)
-if ($errs) { Write-Host "parse errors in $target" -ForegroundColor Red; exit 1 }
-
-$fn = $ast.FindAll({ param($n)
-    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-Installer'
-}, $true) | Select-Object -First 1
-if (-not $fn) { Write-Host 'FAIL: Invoke-Installer not found in the installer' -ForegroundColor Red; exit 1 }
+$funcs = Get-InstallerFunctions (Get-InstallerAst)
+Assert-InstallerHas $funcs @('Invoke-Installer')
+$fn = $funcs['Invoke-Installer']
 
 $startLine = ($fn.Body.FindAll({ param($n)
     $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Start-Process'

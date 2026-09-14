@@ -13,14 +13,11 @@
 #>
 
 [CmdletBinding()]
-param(
-    [string]$Source,
-    [string]$OutBat
-)
+param()
 
 $ScriptDir = $PSScriptRoot
-if (-not $Source) { $Source = Join-Path $ScriptDir 'alleaves_setup.ps1' }
-if (-not $OutBat) { $OutBat = Join-Path $ScriptDir 'Install-Alleaves.bat' }
+$Source = Join-Path $ScriptDir 'alleaves_setup.ps1'
+$OutBat = Join-Path $ScriptDir 'Install-Alleaves.bat'
 
 # -LiteralPath, not -Path: a bracketed checkout dir is a wildcard. docs/BUILD-BAT.md#pack
 if (-not (Test-Path -LiteralPath $Source)) { throw "Source not found: $Source" }
@@ -34,6 +31,7 @@ Write-Host "Base64:  $($b64.Length) chars in $($chunks.Count) chunk line(s)"
 
 $b64File = 'alleaves_b64.txt'
 $psFile  = 'alleaves_setup.ps1'
+$argFile = 'alleaves_args.txt'
 
 $L = New-Object System.Collections.Generic.List[string]
 $L.Add('@echo off')
@@ -48,23 +46,29 @@ $L.Add('')
 $L.Add('REM --- Single elevation owner: probe elevated-integrity SID, relaunch once.')
 $L.Add('REM  docs/BUILD-BAT.md#elevation-probe - absolute path, BOTH SIDs, and abort')
 $L.Add('REM  (never relaunch) when the probe cannot answer. All three prevent a fork bomb.')
-$L.Add('set "WHOAMI=%SystemRoot%\System32\whoami.exe"')
+$L.Add('set "SYS32=%SystemRoot%\System32"')
+$L.Add('set "WHOAMI=%SYS32%\whoami.exe"')
 $L.Add('if not exist "%WHOAMI%" goto :probefail')
-$L.Add('"%WHOAMI%" /groups | findstr /c:"S-1-16-12288" /c:"S-1-16-16384" >nul 2>&1')
+$L.Add('"%WHOAMI%" /groups | "%SYS32%\findstr.exe" /c:"S-1-16-12288" /c:"S-1-16-16384" >nul 2>&1')
 $L.Add('if not errorlevel 1 goto :elevated')
 $L.Add('REM  Second probe = the fork guard: no S-1-16-* label at all means the PROBE is')
 $L.Add('REM  broken, not that the token is unelevated. Abort instead of relaunching.')
-$L.Add('"%WHOAMI%" /groups | findstr /c:"S-1-16-" >nul 2>&1')
+$L.Add('"%WHOAMI%" /groups | "%SYS32%\findstr.exe" /c:"S-1-16-" >nul 2>&1')
 $L.Add('if errorlevel 1 goto :probefail')
 $L.Add('echo Requesting administrator elevation...')
-$L.Add('REM  "exit /b %ERRORLEVEL%" below MUST stay OUTSIDE any ( ) block, and this')
-$L.Add('REM  relaunch is INTERACTIVE-only. docs/BUILD-BAT.md#elevation-probe')
-$L.Add('if "%~1"=="" (')
-$L.Add('  powershell -NoProfile -Command "exit (Start-Process -FilePath ''%~f0'' -Verb RunAs -Wait -PassThru).ExitCode"')
-$L.Add(') else (')
-$L.Add('  powershell -NoProfile -Command "exit (Start-Process -FilePath ''%~f0'' -ArgumentList ''%*'' -Verb RunAs -Wait -PassThru).ExitCode"')
-$L.Add(')')
-$L.Add('exit /b %ERRORLEVEL%')
+$L.Add('REM  Two layers, both of which drop quoted args. Neither %* nor %~f0 may sit inside')
+$L.Add('REM  the -Command "..." string: the caller''s own quote closes cmd''s and a quoted')
+$L.Add('REM  regex pipe becomes a real pipe. And RunAs on a .bat re-enters cmd /c, which')
+$L.Add('REM  strips the outermost quote pair off the whole tail. So: path in a variable,')
+$L.Add('REM  args in a file, and relaunch cmd.exe double-wrapped, never the .bat direct.')
+$L.Add('REM  docs/BUILD-BAT.md#relaunch-args')
+$L.Add('set "ALLEAVES_SELF=%~f0"')
+$L.Add(">`"%TEMP%\$argFile`" echo.%*")
+$L.Add("powershell -NoProfile -Command `"`$a=Get-Content -LiteralPath (`$env:TEMP+'\$argFile') -Raw -ErrorAction SilentlyContinue; if(`$a){`$a=`$a.Trim()}; `$sp=@{FilePath=`$env:ComSpec;Verb='RunAs';Wait=`$true;PassThru=`$true}; `$sp.ArgumentList='/c `"`"'+`$env:ALLEAVES_SELF+'`" '+`$a+'`"'; exit (Start-Process @sp).ExitCode`"")
+$L.Add('set "RC=%ERRORLEVEL%"')
+$L.Add("del /f /q `"%TEMP%\$argFile`" >nul 2>&1")
+$L.Add('REM  "exit /b" MUST stay OUTSIDE any ( ) block. docs/BUILD-BAT.md#elevation-probe')
+$L.Add('exit /b %RC%')
 $L.Add('')
 $L.Add(':probefail')
 $L.Add('echo [FAIL] Cannot determine this token''s integrity level - refusing to relaunch.')
@@ -77,7 +81,9 @@ $L.Add(':elevated')
 $L.Add('')
 $L.Add('REM --- Record requested mode so the .ps1 can refuse a dropped -Uninstall.')
 $L.Add('set "ALLEAVES_REQUESTED_MODE=install"')
-$L.Add('echo %*| find /i "-uninstall" >nul 2>&1 && set "ALLEAVES_REQUESTED_MODE=uninstall"')
+$L.Add('REM  Padded on both sides: a bare substring made -ComputerName TILL-UNINSTALL-2')
+$L.Add('REM  request an uninstall, and the .ps1 refused it with exit 2.')
+$L.Add('echo. %* .| "%SYS32%\find.exe" /i " -uninstall " >nul 2>&1 && set "ALLEAVES_REQUESTED_MODE=uninstall"')
 $L.Add('echo Mode: %ALLEAVES_REQUESTED_MODE%')
 $L.Add('')
 $L.Add('REM --- Force 64-bit PowerShell (Sysnative when launched from a 32-bit shell).')
@@ -130,11 +136,9 @@ $emitted = [IO.File]::ReadAllLines($OutBat) |
 $decoded = [byte[]]@()
 try   { $decoded = [Convert]::FromBase64String(($emitted -join '')) }
 catch { Write-Host "  decode of emitted lines FAILED: $($_.Exception.Message)" -ForegroundColor Red }
-$srcHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
-$tmp = [IO.Path]::GetTempFileName()
-[IO.File]::WriteAllBytes($tmp, $decoded)
-$decHash = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash
-Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+$sha     = [Security.Cryptography.SHA256]::Create()
+$srcHash = [BitConverter]::ToString($sha.ComputeHash($srcBytes)).Replace('-','')
+$decHash = [BitConverter]::ToString($sha.ComputeHash($decoded)).Replace('-','')
 
 Write-Host ""
 Write-Host "=== Self-verification ==="

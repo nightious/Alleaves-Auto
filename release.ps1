@@ -42,7 +42,11 @@ Step 'Rebuild Install-Alleaves.bat'
 if ($LASTEXITCODE -ne 0) { Fail 'build-bat.ps1 failed - not releasing.' }
 
 Step 'Tests'
-foreach ($t in Get-ChildItem .\tests -Filter 'Test-*.ps1' | Sort-Object Name) {
+# Count first: an empty tests\ makes the loop body never run and the gate pass vacuously.
+$tests = @(Get-ChildItem .\tests -Filter 'Test-*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)
+if ($tests.Count -lt 5) { Fail "expected 5 tests in tests\, found $($tests.Count) - not releasing." }
+foreach ($t in $tests) {
+    $LASTEXITCODE = 99   # poison: a test that dies before its own exit must not read as a pass
     & $t.FullName | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "$($t.Name) failed - not releasing." }
     Write-Host "  ok   $($t.Name)" -ForegroundColor Green
@@ -56,6 +60,8 @@ if (-not $Notes) {
     $range = if ($LASTEXITCODE -eq 0 -and $prev) { "$prev..HEAD" } else { 'HEAD' }
     $Notes = (git log --no-merges --pretty='- %s' $range) -join "`n"
 }
+# PS 5.1 drops an empty string from a native command line, so gh would see --notes --title.
+if (-not $Notes) { $Notes = $Version }
 
 Step "Publish $Version"
 git tag -a $Version -m "Alleaves installer $Version"

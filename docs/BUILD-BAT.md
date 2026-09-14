@@ -20,8 +20,8 @@ quarter-megabyte of base64 (roughly 4/3 of the `.ps1`'s size, in ≤4000-char li
 and it grows with every edit. `build-bat.ps1` prints the exact char and chunk counts on every run; do
 not copy them back into this file, they go stale the next time the `.ps1` changes.
 
-`-LiteralPath` on the source `Test-Path` and `Get-FileHash`: without it a checkout under a bracketed
-directory throws "Source not found" on a file that is plainly there ([INSTALL-ENGINE.md#literalpath](INSTALL-ENGINE.md#literalpath)).
+`-LiteralPath` on the source `Test-Path`: without it a checkout under a bracketed directory throws
+"Source not found" on a file that is plainly there ([INSTALL-ENGINE.md#literalpath](INSTALL-ENGINE.md#literalpath)).
 
 ### <a id="echo-redirection"></a>Redirection first, command second
 
@@ -34,7 +34,9 @@ removes the question. `+ / =` are not cmd metacharacters here.
 ## <a id="self-verify"></a>Self-verification
 
 The build decodes the base64 back **out of the `.bat` it just wrote** — `ReadAllLines` plus a prefix-match
-on the emitted echo lines — and confirms byte-length **and** SHA256 identity against the source.
+on the emitted echo lines — and confirms byte-length **and** SHA256 identity against the source. Both
+hashes come from `SHA256.ComputeHash` over the byte arrays already in memory; the old `Get-FileHash`
+form had to write the decode to a temp file first, purely to hash it.
 
 > Deliberately **not** `$chunks`: that variable IS the source by construction, so comparing it to the source
 > could only ever pass, and it cannot see the one kind of corruption this build step causes — a mangled
@@ -61,20 +63,26 @@ relaunch when it cannot tell. Any future edit keeps all three.
    Matching High alone forked on any RMM dispatching the `.bat` as SYSTEM, while the `service-account`
    exit-8 verdict written for that account never reached the operator — see
    [ACCOUNT-SWAP.md#verdicts](ACCOUNT-SWAP.md#verdicts).
-2. **`%SystemRoot%\System32\whoami.exe` by FULL PATH** (with `if not exist` → `:probefail`), never a bare
-   `whoami`: the bare name resolves through `PATH`, and a git-bash / MSYS / Cygwin shell puts its own GNU
-   `whoami` first, which rejects `/groups` and exits 1 — the same fork, reached through a shadowed command
-   name (observed 2026-09-13, hundreds of UAC prompts deep).
+2. **Every System32 tool by FULL PATH** (`%SYS32%`, with `if not exist` → `:probefail` on `whoami.exe`),
+   never a bare name: the bare name resolves through `PATH`, and a git-bash / MSYS / Cygwin shell puts its
+   own GNU `whoami` first, which rejects `/groups` and exits 1 — the same fork, reached through a shadowed
+   command name (observed 2026-09-13, hundreds of UAC prompts deep). `findstr` and the mode test's `find`
+   are shadowed the same way: measured here, GNU `find` swallowed `/i` as a path and the requested mode was
+   never recorded.
 3. **Abort when the probe cannot answer.** A second probe for any `S-1-16-*` mandatory label sits behind the
    first, because a working `whoami` always prints one. No label means the *probe* is broken, not that the
    token is unelevated, so that case goes to `:probefail` → **exit 3**.
 
-**Relaunch mechanics.** `-Wait -PassThru` on both arms so the non-elevated launcher waits for the elevated
-child and propagates its real exit code. **`exit /b %ERRORLEVEL%` MUST stay OUTSIDE any `( )` block**:
-inside a parenthesized block cmd freezes `%ERRORLEVEL%` at parse time to the find result (=1), reporting a
-successful install as a failure. Treat the relaunch as **interactive-only** — `ALLEAVES_NOPAUSE` has not
-been observed to survive the UAC boundary (nothing in `build-bat.ps1` forwards or tests it, so that is field
-behaviour, not a code fact), and RMM callers should invoke it already-elevated.
+**Relaunch mechanics.** `-Wait -PassThru` so the non-elevated launcher waits for the elevated child and
+propagates its real exit code. **`exit /b` MUST stay OUTSIDE any `( )` block**: inside a parenthesized
+block cmd freezes `%ERRORLEVEL%` at parse time to the find result (=1), reporting a successful install as
+a failure. That is now free — there is no block, because neither `%*` nor `%~f0` may appear inside the
+relaunch's `-Command "…"` string ([#args](#args)). `%ERRORLEVEL%` is captured into `RC` before the
+args-file `del`, which would otherwise clobber it.
+
+Treat the relaunch as **interactive-only** — `ALLEAVES_NOPAUSE` has not been observed to survive the UAC
+boundary (nothing in `build-bat.ps1` forwards or tests it, so that is field behaviour, not a code fact),
+and RMM callers should invoke it already-elevated.
 
 ## <a id="decode-guard"></a>The decode guard
 
@@ -94,10 +102,28 @@ finish itself and skipped it, when the script never ran at all. **10 is launcher
 - **Quote any `-SkipPrograms` regex containing cmd metacharacters** (`| ^ & < >`), e.g. `-SkipPrograms
   "Chrome|NiceLabel"` — unquoted they are interpreted by cmd and get mangled. Callers needing exotic regexes
   should invoke `alleaves_setup.ps1` directly.
-- `-PrinterBrand` values must be **single words, no spaces or apostrophes**: args are double-wrapped through
-  cmd `%*` and a PowerShell single-quoted string on the non-elevated relaunch.
+- <a id="relaunch-args"></a>**Neither `%*` nor `%~f0` may sit inside the non-elevated relaunch's
+  `-Command "…"` string.** cmd counts quotes left to right, so the caller's own `"` closed the one
+  opened before `exit` and the `|` in `"Chrome|NiceLabel"` became a real pipe — the documented
+  invocation simply did not elevate, while running the `.ps1` directly worked. A `)` in any argument
+  ended the `if ( )` block the same way, and an apostrophe in the checkout path ended `'%~f0'`. Both now
+  travel out of band: the path in `ALLEAVES_SELF`, the args written redirection-first to
+  `%TEMP%\alleaves_args.txt` ([#echo-redirection](#echo-redirection), where the caller's quotes stay
+  balanced) and read back with `Get-Content`. The relaunch line itself contains only single quotes.
+
+  **That fixes the cmd-parse layer, and there is a second one underneath it.** `Start-Process -Verb
+  RunAs` on a `.bat` cannot carry a quoted argument at all: ShellExecute hands the batch to `cmd /c`,
+  and `cmd /c` with more than two quotes on the line strips the *outermost pair* off the whole tail —
+  which eats the opening quote of the batch path. The child then never starts, silently: no error, exit
+  1 (or 255 once an unquoted `|` is re-exposed). `Install-Alleaves.bat -ComputerName "POS-1"` — the
+  invocation in `README.md` — took that path. So the relaunch targets **`%ComSpec%`, not the `.bat`**,
+  with the tail double-wrapped, `/c ""<self>" <args>"`: the pair `cmd /c` strips is the one added for
+  it to strip, and the batch path and every caller quote arrive intact. Verified across no args,
+  `-Uninstall`, unquoted, quoted, quoted-with-space, and `-SkipPrograms "Chrome|NiceLabel"`.
 - The requested mode is recorded in `ALLEAVES_REQUESTED_MODE` so the `.ps1` can refuse a dropped
-  `-Uninstall` (exit 2); `ALLEAVES_NOPAUSE=1` skips the trailing pause.
+  `-Uninstall` (exit 2) — matched as a whole ` -uninstall ` token
+  ([ARCHITECTURE.md#argument-guards-exit-2](ARCHITECTURE.md#argument-guards-exit-2));
+  `ALLEAVES_NOPAUSE=1` skips the trailing pause.
 
 `-ExecutionPolicy Bypass` loses to an `AllSigned`/`Restricted` GPO; if that ever bites on a managed fleet,
 switch to piping via `-EncodedCommand`.

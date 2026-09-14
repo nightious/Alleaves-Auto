@@ -67,7 +67,10 @@ several prefer a stable serial match, else the one whose Id changed AND whose mo
 else best-effort first with a Warn.
 
 `Wait-ScannerReenum` is an **adaptive poll to the real reconnect**, not a fixed sleep: it polls `GetScanners`
-until the unit's Id or host-mode leaves its pre-hop values.
+until the unit's Id or host-mode leaves its pre-hop values. It keeps the **last scanner actually seen**
+rather than whatever the final poll returned — a unit mid-detach on the timeout poll used to erase a
+candidate from an earlier one, and the hop log then claimed it never re-enumerated, which is exactly the
+evidence `-ForceFingerprint` exists to collect.
 
 > `ponytail:` the 40 s ceiling is the fingerprint script's proven `$MaxWaitSec`; it only bites on a failed
 > hop, since success exits at the real reconnect.
@@ -134,7 +137,8 @@ reporting the terminal as empty.
 
 ## <a id="bails"></a>Every bail records a `scannerConfigured` row
 
-An empty `scannerConfigured` is indistinguishable from a step that never ran.
+An empty `scannerConfigured` is indistinguishable from a step that never ran. Every row below is the
+same shape, so they are written through one local `$bail` scriptblock rather than nine copies of it.
 
 | Situation | `result` | Exit |
 |---|---|---|
@@ -171,6 +175,10 @@ before its own row was appended. Identity is **seeded above the try**, because a
 `scannerConfigured` on `serialFinal`, so the stale one collided with that device's own success row. The row is
 appended **outside** the catch; final identity is captured **post-hop**, a HID-KB start reporting blank serial
 and model.
+
+The catch **keeps an `ok` / `already-opos` verdict** and only warns. Everything after the verdict is
+bookkeeping — the fingerprint dump is the one realistic thrower — and overwriting `result` there recorded
+a scanner that IS in USB-OPOS as failed, forcing exit 6 on a terminal with nothing wrong with it.
 
 ## <a id="fingerprint"></a>New-model fingerprint dump
 

@@ -4,6 +4,9 @@
 # Build intermediate (base64 blob emitted by build-bat.ps1)
 alleaves_b64.txt
 
+# Quarantined output of a failed build-bat.ps1 self-verify
+*.bat.corrupt
+
 # Runtime working state created on target terminals
 AlleavesAuto/
 downloads/

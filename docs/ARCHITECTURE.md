@@ -16,6 +16,15 @@ working root is the only durable state. `-DryRun` without admin falls back to `%
 caller-overridable**: a deep path overflows the IS5 stub's fixed command-line buffer
 ([INSTALL-ENGINE.md#is5-buffer](INSTALL-ENGINE.md#is5-buffer)), and nothing ever set it.
 
+**`$ManifestPath` does NOT follow that fallback.** It is always the `%ProgramData%` copy — only `-DryRun`
+reaches the `%TEMP%` branch and it never writes the manifest, so following `$WorkDir` made a non-elevated
+dry run preview against an *empty* one: `Test-PriorInstallFailed` trusted ARP, `Write-XmlFile` planned a
+backup it had already taken, `Remove-StalePrinterOpos` retired nothing, and `$installUser` flipped. Logs
+and the transcript still live under `$WorkDir`.
+
+The transcript is opened **once, before the mode branch**, from a mode-keyed log prefix and banner; all
+three branches used to carry their own copy and one dry-run banner had already drifted from the others.
+
 **Single elevation owner is the `.bat`.** The `.ps1` never relaunches itself; it aborts with exit 3 if not
 admin (except `-DryRun`).
 
@@ -143,7 +152,16 @@ config-only and install branches each used to carry their own and the wording ha
 
 All of these are rejected up front, beside each other:
 
-- `-Uninstall` when the launcher requested an install (a dropped switch)
+- <a id="positional"></a>a **positional** argument. `param()` hands every non-switch parameter an implicit
+  position, so `Install-Alleaves.bat uninstall` bound `uninstall` to `-SkipPrograms` and ran a full
+  INSTALL — the launcher's token test needs the dash, so no mode guard fired.
+  `[CmdletBinding(PositionalBinding=$false)]` plus a `ValueFromRemainingArguments` sink turns any
+  dashless token into exit 2 instead.
+- a **dropped `-Uninstall`**: the launcher sets `ALLEAVES_REQUESTED_MODE=uninstall` when its arg line
+  holds ` -uninstall ` as a whole token — padded on both sides, because the bare substring made
+  `-ComputerName TILL-UNINSTALL-2` request one. The reverse test ("requested install, parsed
+  uninstall") is gone: nothing can reach it except a legal abbreviation like `-Uninstal`, which it
+  then rejected.
 - `-ScannerConfigOnly` with `-Uninstall`, or with `-SkipScannerConfig` — "run ONLY this step" plus "skip
   this step" is a run that does nothing and exits 0, which reads as success to an RMM
 - `-PrinterConfigOnly` with `-Uninstall`, `-ScannerConfigOnly`, `-SkipPrinterConfig`, or `-PrinterBrand
@@ -178,6 +196,11 @@ the current name — correct, since by then the rename reboot has happened.
 `tests\` holds the runnable self-checks; all exit 0/1, no framework. Three AST-lift functions out of the
 `.ps1` rather than loading it; `Test-InstallerExitCode.ps1` lifts nothing — it spawns a live `cmd.exe /c
 exit 7`, then only compares AST extents and regex-matches body text.
+
+`_common.ps1` holds `Assert-Eq`, `Get-InstallerAst`, `Get-InstallerFunctions` and
+`Assert-InstallerHas`, dot-sourced by all five. It is **not** a test — the runner and `release.ps1` glob
+`Test-*.ps1` — and `$script:Failures` still belongs to each dot-sourcing test, since that is the scope the
+functions are defined in.
 
 | File | Covers |
 |---|---|

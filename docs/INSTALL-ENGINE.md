@@ -49,11 +49,15 @@ nothing and is silently skipped as "already gone".
 
 ### <a id="download-retry"></a>Retry behaviour
 
-`Get-FileWithRetry` deletes the target and its `.len` only when `Test-CachedFileValid` fails; the old
-unconditional delete destroyed a byte-correct 471 MB Star zip (and orphaned its sidecar) when a tech
-re-ran `-ForceReinstall` over a flaky link. When the retries are exhausted but the on-disk file still
-validates, the call returns **success** — the install runs from that exact file, so returning failure
-set `$script:DownloadFailed` and exited 1 on a run that installed fine.
+**Every attempt downloads to `<target>.part` and is `Move-Item`d into place only after the size and
+magic-byte checks pass.** Guarding the *delete* on `Test-CachedFileValid` was not enough: `WebClient`
+(and BITS) truncate the destination before they have a body, so the first attempt that connected at all
+overwrote the byte-correct 471 MB Star zip, after which the guard compared a 2 KB captive-portal page
+against the old `.len` and deleted both. The `.part` is removed before each attempt and on exhaustion.
+
+When the retries are exhausted but the on-disk file still validates, the call returns **success** — the
+install runs from that exact file, so returning failure set `$script:DownloadFailed` and exited 1 on a
+run that installed fine.
 
 `Unblock-FileSafe` retries three times: Defender can hold a sharing lock mid-scan.
 
@@ -151,6 +155,13 @@ re-run reports success.
   the product lands in ARP, the guard skips it on every future run, and the run exits **4 forever** —
   with its only advertised remediation, "re-run the installer", doing nothing. `result` stays `ok` on
   purpose: the tally must not count a fallback that worked as a failure.
+
+All three write their row through `Add-AlreadyInstalledRow`, which also decides **`removable`**: a
+product with no prior manifest row was never installed by us, so the row is `removable=$false` and
+[step 2](MANIFEST.md#step-2) leaves it alone. Without it `-Uninstall` ran Chrome's
+`setup.exe --force-uninstall` over a customer's own Chrome, profile and all. The prior-row test ignores
+rows that are themselves `removable=$false`, or run 2 would flip a pre-existing product back to
+removable.
 
 Consequence to expect: a genuinely failing product retries every run until it succeeds.
 
@@ -484,9 +495,12 @@ switch or blocked by policy/AV exits 0 having removed nothing, and nothing downs
 the instantaneous test reported "still in registry after uninstaller exit 0 — not removed" on a removal
 that finished seconds later (a counted reversal failure, and on the install side exit 1). Rig-observed.
 
-`$escName` exists only on the non-msiexec path — msiexec never polls and its exit code IS the
-authority. Console strings: `removed <name> (exit <code>)` on success, `<name> uninstaller exited
-<code>` on failure.
+**Both families re-check**, msiexec included. `$escName` used to be assigned inside the exe branch only,
+so the whole poll was skipped for every MSI: a stale ProductCode in ARP returns the accepted `1605` and
+reported "removed" with the product still installed. The poll costs nothing when the product really is
+gone, which is what makes the documented `1605` case (a broad match's second, already-removed entry)
+still pass instantly. Console strings: `removed <name> (exit <code>)` on success, `<name> uninstaller
+exited <code>` on failure.
 
 ### <a id="nicelabel-uninstall"></a>NiceLabel
 
