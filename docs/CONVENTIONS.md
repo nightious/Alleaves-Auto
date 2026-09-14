@@ -107,4 +107,4 @@ catch print `$_.InvocationInfo.ScriptLineNumber`.
 - Guard every state change behind `-DryRun`, **flags included**. A mode that writes nothing must
   not raise `$FinishFailed` and produce a phantom exit 1. This is why a dry run can never return
   6 or 7.
-- Runtime payloads, logs and `alleaves_b64.txt` are git-ignored.
+- Runtime payloads and logs are git-ignored.

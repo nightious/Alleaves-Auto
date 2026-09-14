@@ -52,9 +52,9 @@ foreach ($f in Get-ChildItem $DocsDir -Filter *.md) {
 }
 
 # --- what the tree CITES ---------------------------------------------------
-# Install-Alleaves.bat is skipped: it is generated, and its pointers come from build-bat.ps1.
 $sources = @()
 $sources += Get-ChildItem $Root -Filter *.ps1
+$sources += Get-ChildItem $Root -Filter *.bat
 $sources += Get-ChildItem (Join-Path $Root 'tests')   -Filter *.ps1 -ErrorAction SilentlyContinue
 $sources += Get-ChildItem (Join-Path $Root 'printer') -Filter *.ps1 -ErrorAction SilentlyContinue
 $sources += Get-ChildItem $Root -Filter *.md

@@ -212,8 +212,8 @@ On terminal failure `Show-ScannerBarcodeFallback` prints loud, actionable guidan
 `scanner/Scanner_OPOS_barcode.pdf` — **one scan from the HID-KB default**, since the two-hop is an SDK-path
 constraint only. Exit stays 6 (non-fatal); no scanner attached at all is a benign Warn, exit 0.
 
-That PDF is a repo / tech-share deliverable, **not embedded** in the `.bat`, so it needs no rebuild. Verified
-payload `SXUAH20008`.
+That PDF is a repo / tech-share deliverable the installer never touches — edit it in place, no release
+needed. Verified payload `SXUAH20008`.
 
 ## <a id="uninstall"></a>Uninstall
 

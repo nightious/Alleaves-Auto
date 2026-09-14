@@ -28,7 +28,7 @@ PowerShell -File .\alleaves_setup.ps1 -DryRun       # dev run, no admin. There i
 - Working root `%ProgramData%\AlleavesAuto` (`downloads\`, `logs\`, `logs\install_manifest.json`)
   survives `-Uninstall` by design. `-DryRun` without admin falls back to `%TEMP%`.
 - `scanner/` (barcode fallback PDF) and `printer/Collect-PrinterFingerprint.ps1` are doc-style
-  deliverables, **not** embedded — editing them needs no rebuild.
+  deliverables the installer never touches — edit them in place, no release needed.
 
 ## Checks to run before calling a change done
 
