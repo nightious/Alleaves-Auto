@@ -320,5 +320,5 @@ via `regKeysCreated` / `regValuesSet`. Removing the device *keys*, not just the 
 because the vendor uninstaller strands them: [MANIFEST.md#step-4b-ii](MANIFEST.md#step-4b-ii), and the
 `(default)`-deletion trap at [MANIFEST.md#default-value](MANIFEST.md#default-value).
 
-`printer/Collect-PrinterFingerprint.ps1` is the field diagnostic — a doc-style deliverable, **not** embedded,
-so it needs no `.bat` rebuild.
+`printer/Collect-PrinterFingerprint.ps1` is the field diagnostic — a doc-style deliverable the installer
+never touches, so editing it needs no release.

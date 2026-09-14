@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
     Single-file Alleaves POS bootstrap: Google Drive download + silent install +
-    manifest-driven uninstall. Base64-embedded in Install-Alleaves.bat.
+    manifest-driven uninstall. Install-Alleaves.bat fetches this from the latest
+    release on every run.
 
 .DESCRIPTION
     Working root %ProgramData%\AlleavesAuto (downloads\, logs\, manifest), which
@@ -94,7 +95,7 @@ param(
 #   docs/FINISHING.md       rename, taskbar, default browser, bookmark, logon task
 #   docs/SCANNER-OPOS.md    Zebra USB-OPOS switch
 #   docs/PRINTER-OPOS.md    receipt printer OPOS registration
-#   docs/BUILD-BAT.md       build-bat.ps1 and the .bat transport
+#   docs/BUILD-BAT.md       the .bat stub: fetch, elevation probe, arg relay
 # Add new rationale THERE and leave a pointer here; do not re-grow the essays.
 # ---------------------------------------------------------------------------
 $ErrorActionPreference = 'Continue'

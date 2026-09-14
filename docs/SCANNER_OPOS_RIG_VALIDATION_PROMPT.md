@@ -92,8 +92,8 @@ knows.
    matching the SDK path.
 
 9. **Finalize the deliverable + docs.**
-   - Rebuild after **every** `.ps1` edit: `.\build-bat.ps1` (SHA256 self-verify must pass).
-     Never hand-edit `Install-Alleaves.bat`.
+   - Test against `alleaves_setup.ps1` directly — the `.bat` fetches the *published* `.ps1`, so it
+     will not see your edits. They reach the field only via `.\release.ps1 -Version vX.Y.Z`.
    - Update `SCANNER-OPOS.md#open-items` to reflect the finalized constants.
    - Update the memory file `project_scanner_opos_step.md` to mark the rig items done and record
      the confirmed `type` strings / reconnect timing.
