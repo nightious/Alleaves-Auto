@@ -336,6 +336,61 @@ function Restore-AutoLogon($prior) {
     return $failed
 }
 
+# Step-0 prompt bodies. Defined HERE, above the swap, so it can ask them too: docs/ACCOUNT-SWAP.md#step0-before-reboot
+# docs/FINISHING.md#rename
+function Get-ComputerNameError($n) {
+    if ($n.Length -lt 1 -or $n.Length -gt 15) { return 'length must be 1-15 characters' }
+    if ($n -notmatch '^[A-Za-z0-9-]+$')        { return 'use only letters, digits and hyphens' }
+    if ($n -match '^[0-9]+$')                   { return 'name cannot be all digits' }
+    if ($n -eq $env:COMPUTERNAME)               { return 'that is already the current name' }
+    return $null
+}
+
+# Returns the validated name, or '' on Enter-to-skip. Read-Host throws propagate to the caller.
+function Read-ComputerName {
+    while ($true) {
+        $entry = Read-Host 'Enter new computer name (POS name & number), or press Enter to skip'
+        if ([string]::IsNullOrWhiteSpace($entry)) { return '' }
+        $entry = $entry.Trim()
+        $err = Get-ComputerNameError $entry
+        if (-not $err) { return $entry }
+        Warn "invalid: $err - try again (or Enter to skip)"
+    }
+}
+
+# docs/PRINTER-OPOS.md#brand-prompt  (Read-Host throws propagate to the caller)
+function Read-PrinterBrand {
+    Info ''
+    Info '  Receipt printer brand:'
+    Info '    1) POS-X   (default)'
+    Info '    2) None - no receipt printer (skips the driver install too)'
+    Info '    3) Star TSP100 (futurePRNT)'
+    $sel = Read-Host '  Select 1-3 (Enter for POS-X)'
+    switch -Regex ("$sel".Trim()) {
+        '^$'            { return 'POS-X' }
+        '^(1|POS-?X)$'  { return 'POS-X' }
+        '^(2|None)$'    { return 'None' }
+        '^(3|Star.*)$'  { return 'StarTSP100' }
+        default         { Warn "unrecognized answer '$sel' - using POS-X"; return 'POS-X' }
+    }
+}
+
+# docs/ACCOUNT-SWAP.md#step0-before-reboot
+function Add-Step0Answers($bound) {
+    $r = @{}; foreach ($k in $bound.Keys) { $r[$k] = $bound[$k] }
+    if ($ScannerConfigOnly -or $PrinterConfigOnly) { return $r }
+    Info ''
+    Info '  Answer the setup questions now so the resumed install runs unattended:'
+    try {
+        if (-not $ComputerName -and -not $SkipRename) {
+            $n = Read-ComputerName
+            if ($n) { $r.ComputerName = $n } else { $r.SkipRename = [switch]$true }
+        }
+        if (-not $PrinterBrand -and -not $SkipPrinterConfig) { $r.PrinterBrand = Read-PrinterBrand }
+    } catch { Write-Verbose "Add-Step0Answers: prompt failed, the resumed run will ask instead: $($_.Exception.Message)" }
+    return $r
+}
+
 # docs/ACCOUNT-SWAP.md#resume-task
 function ConvertTo-ResumeArgs($bound) {
     $q = { param($s) "'" + ("$s" -replace "'", "''") + "'" }
@@ -437,6 +492,7 @@ function Invoke-AccountSwapOffer($acct, $bound, $promote) {
         $pw = Read-NewAccountPassword $name
         if (-not $pw) { Fail 'no password given - nothing was changed.'; return $false }
     }
+    $resumeBound = Add-Step0Answers $bound
 
     $resumeDir  = Join-Path $AccountSwapDir 'resume'
     $scriptCopy = Join-Path $resumeDir 'alleaves_setup.ps1'
@@ -493,7 +549,7 @@ function Invoke-AccountSwapOffer($acct, $bound, $promote) {
         catch { Fail "could not arm autologon: $($_.Exception.Message)"; & $rollback; return $false }
     }
 
-    try { Register-ResumeTask $name $scriptCopy (ConvertTo-ResumeArgs $bound); Ok "registered resume task '$AccountSwapTask'" }
+    try { Register-ResumeTask $name $scriptCopy (ConvertTo-ResumeArgs $resumeBound); Ok "registered resume task '$AccountSwapTask'" }
     catch {
         Fail "could not register the resume task: $($_.Exception.Message)"
         & $rollback
@@ -905,6 +961,7 @@ if (-not $Uninstall) {
             } else {
                 Dry $(if ($wouldPromote) { "would offer to promote '$($acct.Detail)' and reboot to resume" }
                       else                { 'would offer to create a local admin account, arm a one-shot autologon, and reboot to resume' })
+            Dry 'a swap would ask the computer name and printer brand BEFORE the reboot, so the resumed run is unattended'
             }
             Dry 'would then offer to continue anyway; declining blocks a real run (exit 8)'
             Dry 'account precheck would block a real run (exit 8) - continuing, -DryRun changes nothing'
@@ -2332,31 +2389,16 @@ function Invoke-ComputerRename {
     $current = $env:COMPUTERNAME
     Info "  current name: $current"
 
-    $validate = {
-        param($n)
-        if ($n.Length -lt 1 -or $n.Length -gt 15) { return 'length must be 1-15 characters' }
-        if ($n -notmatch '^[A-Za-z0-9-]+$')        { return 'use only letters, digits and hyphens' }
-        if ($n -match '^[0-9]+$')                   { return 'name cannot be all digits' }
-        if ($n -eq $current)                        { return 'that is already the current name' }
-        return $null
-    }
-
     $name = $null
     if ($ComputerName) {
         if ($ComputerName -eq $current) { Ok "already named '$current' - rename not needed"; return }
-        $err = & $validate $ComputerName
+        $err = Get-ComputerNameError $ComputerName
         if ($err) { Fail "preset -ComputerName '$ComputerName' invalid: $err"; Warn 'skipping rename'; $script:FinishFailed = $true; return }
         $name = $ComputerName
     } elseif ([Environment]::UserInteractive -and -not $env:ALLEAVES_NOPAUSE) {
         try {
-            while ($true) {
-                $entry = Read-Host 'Enter new computer name (POS name & number), or press Enter to skip'
-                if ([string]::IsNullOrWhiteSpace($entry)) { Ok 'rename skipped (no name entered)'; return }
-                $entry = $entry.Trim()
-                $err = & $validate $entry
-                if (-not $err) { $name = $entry; break }
-                Warn "invalid: $err - try again (or Enter to skip)"
-            }
+            $name = Read-ComputerName
+            if (-not $name) { Ok 'rename skipped (no name entered)'; return }
         } catch {
             Warn "no console for rename prompt - skipping ($($_.Exception.Message))"; return
         }
@@ -3649,21 +3691,7 @@ function Resolve-PrinterBrand {
     if ($PrinterBrand) {
         $brand = $PrinterBrand
     } elseif ([Environment]::UserInteractive -and -not $env:ALLEAVES_NOPAUSE) {
-        try {
-            Info ''
-            Info '  Receipt printer brand:'
-            Info '    1) POS-X   (default)'
-            Info '    2) None - no receipt printer (skips the driver install too)'
-            Info '    3) Star TSP100 (futurePRNT)'
-            $sel = Read-Host '  Select 1-3 (Enter for POS-X)'
-            switch -Regex ("$sel".Trim()) {
-                '^$'            { }
-                '^(1|POS-?X)$'  { $brand = 'POS-X' }
-                '^(2|None)$'    { $brand = 'None' }
-                '^(3|Star.*)$'  { $brand = 'StarTSP100' }
-                default         { Warn "unrecognized answer '$sel' - using POS-X" }
-            }
-        } catch {
+        try { $brand = Read-PrinterBrand } catch {
             Warn "no console for the printer-brand prompt - defaulting to POS-X ($($_.Exception.Message))"
         }
     }

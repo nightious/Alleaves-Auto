@@ -59,7 +59,9 @@ places it.
 
 ### <a id="why-the-two-prompts-are-at-step-0"></a>Why the two prompts are at step 0
 
-Every interactive question belongs before the long unattended stretch, so the tech can walk away.
+Every interactive question belongs before the long unattended stretch, so the tech can walk away. An
+account swap asks both **before its reboot** and hands the answers to the resumed run
+([ACCOUNT-SWAP.md#step0-before-reboot](ACCOUNT-SWAP.md#step0-before-reboot)).
 
 Step 0b must also precede the **download** phase: it adds every *unchosen* brand's `RowName` to
 `$SkipPrograms`, so `Test-SkipMatch` drops those rows from both download and install. Picking POS-X must not

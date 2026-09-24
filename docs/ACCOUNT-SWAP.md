@@ -172,6 +172,24 @@ instant the script exits, so the resumed run's window used to vanish right after
 completed exit-6 run looked like the scanner failure had aborted the install. The action prints the exit
 code, waits for Enter, then `exit`s with that code so the task's Last Run Result stays meaningful.
 
+<a id="step0-before-reboot"></a>**The step-0 questions are asked BEFORE the reboot.** The rename and printer-brand
+prompts ([ARCHITECTURE.md#why-the-two-prompts-are-at-step-0](ARCHITECTURE.md#why-the-two-prompts-are-at-step-0))
+are the only `Read-Host`s in the install path, so a resumed run that asked them sat at a prompt after the
+reboot instead of downloading. `Add-Step0Answers` asks them right after the account name/password — the tech
+is still at the terminal — and writes the answers into the resume args as `-ComputerName` (or `-SkipRename`
+on Enter, so the resumed run never asks) and `-PrinterBrand`. Traps:
+
+- The prompt bodies (`Get-ComputerNameError`, `Read-ComputerName`, `Read-PrinterBrand`) live **above** the
+  swap, because a top-to-bottom script has not defined `Invoke-ComputerRename` / `Resolve-PrinterBrand` yet
+  when the swap runs. Those two call the same helpers, so the swap and step 0 cannot drift.
+- The rename is **passed, not applied**: the resumed run renames. Applying it before the reboot would change
+  `$env:COMPUTERNAME` under the `DefaultDomainName` the autologon was just armed with, and the rename would
+  land before `$Manifest` exists to record it.
+- Gates mirror the dispatch tail: an already-given `-ComputerName` / `-SkipRename` / `-PrinterBrand` is never
+  re-asked, `-SkipPrinterConfig` gets no brand prompt, and the config-only modes get **nothing** — they run
+  no step 0, and `-PrinterBrand None` on a `-PrinterConfigOnly` resume would trip exit 2.
+- A prompt that throws only loses the answer: the resumed run asks it, as before.
+
 `ConvertTo-ResumeArgs` takes `$bound` **explicitly** — inside a function the automatic `$PSBoundParameters`
 would be the *function's*, not the script's. It drops **`NiceLabelLicense`** as well as `DryRun`: a task
 action is persisted, readable by any standard user (`schtasks /query /xml`) and outlives the run — the
