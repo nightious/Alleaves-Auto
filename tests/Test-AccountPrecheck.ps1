@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 $funcs  = Get-InstallerFunctions (Get-InstallerAst)
 $wanted = @('Get-MicrosoftAccountId','Get-IdentityStoreEmail','Test-InstallAccount',
             'ConvertTo-ResumeArgs','Confirm-Swap','Read-SwapAnswer','Restore-AutoLogon',
-            'Set-AccountCheckOverride','Clear-AccountSwapState')
+            'Set-AccountCheckOverride','Clear-AccountSwapState','Add-Step0Answers')
 Assert-InstallerHas $funcs $wanted
 foreach ($w in $wanted) { . ([scriptblock]::Create($funcs[$w].Extent.Text)) }
 
@@ -82,6 +82,51 @@ Assert-Eq "O'Brien POS 1"  $rt.C        'round-trip: a name with a space and an 
 Assert-Eq 2                $rt.S.Count  'round-trip: -SkipPrograms binds as TWO elements, not one string'
 Assert-Eq 'NiceLabel'      $rt.S[1]     'round-trip: the second element is intact'
 Assert-Eq $false           $rt.D        'round-trip: -DryRun never reaches the resumed run'
+
+Write-Host "`nAdd-Step0Answers (asked before the swap reboot)" -ForegroundColor Cyan
+function Info($m) {}
+function Read-ComputerName { $script:NamePrompts++; $script:StubName }
+function Read-PrinterBrand { $script:BrandPrompts++; 'StarTSP100' }
+function Get-Step0($bound) {
+    $script:NamePrompts = 0; $script:BrandPrompts = 0
+    Add-Step0Answers $bound
+}
+$ComputerName = ''; $SkipRename = $false; $PrinterBrand = ''; $SkipPrinterConfig = $false
+$ScannerConfigOnly = $false; $PrinterConfigOnly = $false
+
+$script:StubName = 'POS-3'
+$r = Get-Step0 @{ ForceReinstall = [switch]$true }
+Assert-Eq 'POS-3'      $r.ComputerName             'a typed name becomes -ComputerName'
+Assert-Eq $false       $r.ContainsKey('SkipRename') 'a typed name does not also add -SkipRename'
+Assert-Eq 'StarTSP100' $r.PrinterBrand             'the chosen brand becomes -PrinterBrand'
+Assert-Eq $true        $r.ForceReinstall.IsPresent 'the operator''s own args are carried over'
+$rt = Invoke-Expression "& { param([switch]`$ForceReinstall, [string]`$ComputerName, [string]`$PrinterBrand) `"`$ComputerName|`$PrinterBrand`" } $(ConvertTo-ResumeArgs $r)"
+Assert-Eq 'POS-3|StarTSP100' $rt                   'round-trip: both answers bind on the resumed run'
+
+$script:StubName = ''
+$r = Get-Step0 @{}
+Assert-Eq $true  $r.SkipRename.IsPresent           'Enter at the name prompt becomes -SkipRename (resumed run never asks)'
+Assert-Eq $false $r.ContainsKey('ComputerName')    'Enter adds no -ComputerName (exit-2 guard)'
+
+$ComputerName = 'POS-9'; $PrinterBrand = 'None'
+$r = Get-Step0 @{ ComputerName = 'POS-9'; PrinterBrand = 'None' }
+Assert-Eq 0      ($script:NamePrompts + $script:BrandPrompts) 'preset -ComputerName / -PrinterBrand: nothing is asked'
+Assert-Eq 'None' $r.PrinterBrand                   'a preset brand is left as given'
+$ComputerName = ''; $PrinterBrand = ''
+
+$SkipPrinterConfig = $true
+$r = Get-Step0 @{ SkipPrinterConfig = [switch]$true }
+Assert-Eq 0      $script:BrandPrompts              '-SkipPrinterConfig: no brand prompt (matches the dispatch tail)'
+Assert-Eq $false $r.ContainsKey('PrinterBrand')    '-SkipPrinterConfig: no -PrinterBrand added'
+$SkipPrinterConfig = $false
+
+foreach ($mode in 'ScannerConfigOnly','PrinterConfigOnly') {
+    Set-Variable $mode $true
+    $r = Get-Step0 @{ $mode = [switch]$true }
+    Assert-Eq 0 ($script:NamePrompts + $script:BrandPrompts) "-${mode}: no step 0, nothing asked"
+    Assert-Eq 1 $r.Count                               "-${mode}: args returned unchanged"
+    Set-Variable $mode $false
+}
 
 Write-Host "`nConfirm-Swap defaults to NO" -ForegroundColor Cyan
 function Read-SwapAnswer($p) { $script:StubAnswer }
