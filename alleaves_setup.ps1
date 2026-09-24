@@ -356,7 +356,9 @@ function ConvertTo-ResumeArgs($bound) {
 function Register-ResumeTask($name, $scriptCopy, $argLine) {
     $inner = "& '" + ("$scriptCopy" -replace "'","''") + "'"
     if ($argLine) { $inner += " $argLine" }
-    $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"$inner`""
+    # docs/ACCOUNT-SWAP.md#resume-pause
+    $inner += "; `$rc = `$LASTEXITCODE; Write-Host ''; Write-Host ('Alleaves setup exit code: ' + `$rc); [void](Read-Host 'Press Enter to close'); exit `$rc"
+    $arg ="-NoProfile -ExecutionPolicy Bypass -Command `"$inner`""
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
     $trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$name"
     $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$name" -LogonType Interactive -RunLevel Highest
