@@ -166,6 +166,12 @@ values, comma-joined array literals — and `-File` hands each token through lit
 'Star','NiceLabel'` arrived as one bogus element (the resumed run re-downloaded 471 MB the operator had
 excluded) and `-ComputerName 'POS 1'` split on the space.
 
+<a id="resume-pause"></a>**It ends on a pause**, like the `.bat`'s `pause`. `-Command` closes the console the
+instant the script exits, so the resumed run's window used to vanish right after its last step. On POS1
+(2026-09-24) the printer step was an instant no-op, so the last line on screen was the scanner FAIL and a
+completed exit-6 run looked like the scanner failure had aborted the install. The action prints the exit
+code, waits for Enter, then `exit`s with that code so the task's Last Run Result stays meaningful.
+
 `ConvertTo-ResumeArgs` takes `$bound` **explicitly** — inside a function the automatic `$PSBoundParameters`
 would be the *function's*, not the script's. It drops **`NiceLabelLicense`** as well as `DryRun`: a task
 action is persisted, readable by any standard user (`schtasks /query /xml`) and outlives the run — the
