@@ -2481,10 +2481,11 @@ function New-TrackedShortcut {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Target,
         [string]$Arguments,
-        [string]$Description
+        [string]$Description,
+        [string]$Dir = $StartMenuAll
     )
     if (-not (Test-Path $Target)) { Warn "shortcut target missing ($Target) - skipping '$Name'"; return $null }
-    $lnk = Join-Path $StartMenuAll "$Name.lnk"
+    $lnk = Join-Path $Dir "$Name.lnk"
     try {
         $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
         $sc.TargetPath       = $Target
@@ -2494,8 +2495,42 @@ function New-TrackedShortcut {
         $sc.Save()
     } catch { Warn "could not create '$lnk': $($_.Exception.Message)"; return $null }
     $Manifest.filesPlaced += $lnk
-    Ok "all-users shortcut created: $lnk"
+    Ok "shortcut created: $lnk"
     return $lnk
+}
+
+# docs/FINISHING.md#splashtop-sos
+function Install-SplashtopSos {
+    Step 'Splashtop SOS: install + Start menu + desktop shortcut'
+    if (Test-SkipMatch -Names @('Splashtop','Splashtop SOS','SplashtopSOS.exe')) { Ok 'Splashtop SOS skipped (-SkipPrograms)'; return }
+    $src     = Join-Path $DownloadDir 'SplashtopSOS.exe'
+    $destDir = Join-Path $env:ProgramFiles 'Splashtop SOS'
+    $exe     = Join-Path $destDir 'SplashtopSOS.exe'
+    $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+    if ($DryRun) {
+        Dry "would copy $src -> $exe"
+        Dry "would create '$StartMenuAll\Splashtop SOS.lnk' -> $exe"
+        Dry "would create '$desktop\Splashtop SOS.lnk' -> $exe"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $src)) { Fail "$src not found"; $script:FinishFailed = $true; return }
+    if ((Test-Path -LiteralPath $exe) -and -not $ForceReinstall) {
+        Ok "already present: $exe"
+    } else {
+        try {
+            $madeDir = $false
+            if (-not (Test-Path -LiteralPath $destDir)) {
+                New-Item -ItemType Directory -Force -Path $destDir -ErrorAction Stop | Out-Null
+                $madeDir = $true
+            }
+            Copy-Item -LiteralPath $src -Destination $exe -Force -ErrorAction Stop
+            $Manifest.filesPlaced += $exe
+            if ($madeDir) { $Manifest.filesPlaced += $destDir }
+            Ok "placed $exe"
+        } catch { Fail "could not place ${exe}: $($_.Exception.Message)"; $script:FinishFailed = $true; return }
+    }
+    if (-not (New-TrackedShortcut -Name 'Splashtop SOS' -Target $exe)) { $script:FinishFailed = $true }
+    if (-not (New-TrackedShortcut -Name 'Splashtop SOS' -Target $exe -Dir $desktop)) { $script:FinishFailed = $true }
 }
 
 # docs/FINISHING.md#launcher-path
@@ -3977,6 +4012,8 @@ try {
                 Copy-MasterList -Source $source
             }
         }
+
+        Invoke-Step 'Splashtop SOS' { Install-SplashtopSos }
 
         Invoke-Step 'Scanner USB-OPOS' { Set-ScannerOpos }
 

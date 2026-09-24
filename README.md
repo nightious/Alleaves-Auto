@@ -100,8 +100,8 @@ NiceLabel → the chosen printer driver (POS-X `OLE POS Setup`, or Star TSP100 f
 471 MB CD image, so expect ~600 MB left in `downloads\`). The VC++ 2015–2022 x64 redistributable
 is bootstrapped first if missing and left in place on `-Uninstall`.
 
-Also: the NiceLabel master list copied into every user's Documents, `SplashtopSOS.exe`
-downloaded but **never installed**, and any existing TeamViewer removed.
+Also: the NiceLabel master list copied into every user's Documents, Splashtop SOS placed in
+`Program Files` with a Start Menu (searchable) and desktop shortcut, and any existing TeamViewer removed.
 
 Then, per terminal: rename · taskbar pins for Alleaves Terminal and Alleaves POS + Edge removed ·
 Chrome as default browser · a machine-wide Alleaves bookmark policy (so Chrome says "managed by
