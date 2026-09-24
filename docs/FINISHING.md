@@ -85,6 +85,19 @@ Only a profile with neither gets a directory created.
 - It consults `Test-SkipMatch` too: the `.nlbl` is a `$DriveFiles` row, so `-SkipPrograms 'Nice Label'`
   correctly skips its *download* — and this step then failed "not found" and exited 1 on a deliberate skip.
 
+## <a id="splashtop-sos"></a>Splashtop SOS
+
+`SplashtopSOS.exe` (what sos.splashtop.com serves) is a **portable exe — no installer, no ARP entry** — so
+`Install-SplashtopSos` "installs" it by copying it to `%ProgramFiles%\Splashtop SOS\` and creating two
+`New-TrackedShortcut`s: the all-users Start Menu (makes it Windows-search-findable) and the Public Desktop
+(`-Dir`). Exe, created dir (after the exe — [#master-list](#master-list)) and both `.lnk`s go in
+`filesPlaced`; the existing `-Uninstall` walk reverses them, no dedicated uninstall code.
+
+- **An existing exe is left alone unless `-ForceReinstall`**: the tech may be connected *through* SOS
+  while re-running, and overwriting a running exe fails.
+- Not copied from `downloads\` in place: that folder survives `-Uninstall`, and the shortcuts need a path
+  that is ours to remove.
+
 ## <a id="taskbar"></a>Taskbar pins
 
 `Get-TaskbarXml` takes the pin list; `Invoke-ChromeTaskbar` builds it **per app** so one missing product

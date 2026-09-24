@@ -47,14 +47,15 @@ branch:
 | 3b | CoreScanner presence check → exit 4 flag |
 | 3c | Per-terminal finishing: taskbar pins, default browser, Chrome bookmark, then the **logon task** that makes the first three take effect ([FINISHING.md](FINISHING.md)) |
 | 4 | Master-list `.nlbl` copy |
+| 4b | Splashtop SOS: copy to Program Files + Start Menu / desktop shortcuts ([FINISHING.md#splashtop-sos](FINISHING.md#splashtop-sos)) |
 | 5 | Scanner USB-OPOS switch |
 | 5b | Receipt-printer OPOS registration |
 | 6 | `Save-Manifest` |
 | 7 | Exit-code dispatch |
 
 Install order inside step 3: Chrome → Alleaves Terminal → Zebra 123 Scan → Zebra Scanner SDK → POS for .NET
-→ NiceLabel → the chosen printer driver. **Splashtop SOS is download-only** — staged for the tech to run by
-hand, never installed.
+→ NiceLabel → the chosen printer driver. Splashtop SOS is not in the loop — it has no installer; step 4b
+places it.
 
 ### <a id="why-the-two-prompts-are-at-step-0"></a>Why the two prompts are at step 0
 
