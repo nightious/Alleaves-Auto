@@ -40,6 +40,7 @@ branch:
 |---|---|
 | 0 | Computer rename prompt |
 | 0b | Printer-brand prompt → feeds `$SkipPrograms` |
+| 0c | Scanner prompt → No sets `$SkipScannerConfig` ([SCANNER-OPOS.md#scanner-prompt](SCANNER-OPOS.md#scanner-prompt)) |
 | 1 | Download phase |
 | 2 | TeamViewer removal (default on) |
 | 2b | VC++ x64 bootstrap |
@@ -57,10 +58,10 @@ Install order inside step 3: Chrome → Alleaves Terminal → Zebra 123 Scan →
 → NiceLabel → the chosen printer driver. Splashtop SOS is not in the loop — it has no installer; step 4b
 places it.
 
-### <a id="why-the-two-prompts-are-at-step-0"></a>Why the two prompts are at step 0
+### <a id="why-the-two-prompts-are-at-step-0"></a>Why the prompts are at step 0
 
 Every interactive question belongs before the long unattended stretch, so the tech can walk away. An
-account swap asks both **before its reboot** and hands the answers to the resumed run
+account swap asks them all **before its reboot** and hands the answers to the resumed run
 ([ACCOUNT-SWAP.md#step0-before-reboot](ACCOUNT-SWAP.md#step0-before-reboot)).
 
 Step 0b must also precede the **download** phase: it adds every *unchosen* brand's `RowName` to

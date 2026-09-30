@@ -55,8 +55,10 @@ $handleLine = ($fn.Body.FindAll({ param($n)
     $n -is [System.Management.Automation.Language.MemberExpressionAst] -and "$($n.Member)" -eq 'Handle'
 }, $true) | Select-Object -First 1).Extent.StartLineNumber
 
+# the wait is WaitForExit itself or the heartbeat wrapper around it (docs/INSTALL-ENGINE.md#heartbeat)
 $waitLine = ($fn.Body.FindAll({ param($n)
-    $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -eq 'WaitForExit'
+    ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -eq 'WaitForExit') -or
+    ($n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Wait-ProcessHeartbeat')
 }, $true) | Select-Object -First 1).Extent.StartLineNumber
 
 Assert-Eq $true ($null -ne $handleLine) 'Invoke-Installer dereferences .Handle'

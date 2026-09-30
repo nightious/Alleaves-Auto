@@ -19,6 +19,11 @@ on PS 5.1 buffers the whole body in memory and cannot resume. One shared User-Ag
 CDNs 403 a blank UA. The `WebClient` is **disposed on every path**: at 2 connections per host, leaked
 sockets wedged the rest of the run on connection exhaustion instead of on the error that started it.
 
+**BITS is used only when `Start-BitsTransfer` has `-CustomHeaders`.** Win10 1903 (build 18362, POS2
+2026-09-30) doesn't have it, so every file threw "parameter cannot be found". That gave 9 yellow
+`[WARN]`s and 9 `TerminatingError` lines per run before WebClient did the work. With the probe, 1903 goes
+straight to WebClient.
+
 **471 MB already works. Don't "fix" it.** Measured 2026-08-28, the `confirm=t` URL `Get-DriveFile`
 builds returns `206 / Content-Range: bytes 0-0/493881478` for the Star zip — no interstitial, **no
 `uuid` parameter needed** — and the 566 MB `Zebra 123 Scan.exe` proves the transport at that scale.
@@ -164,6 +169,22 @@ rows that are themselves `removable=$false`, or run 2 would flip a pre-existing 
 removable.
 
 Consequence to expect: a genuinely failing product retries every run until it succeeds.
+
+## <a id="heartbeat"></a>Heartbeat — long waits are never silent
+
+123 Scan takes ~10 minutes on a terminal. With no output in that time, a tech closes the window, and
+a killed run used to lose its manifest ([MANIFEST.md#checkpoint](MANIFEST.md#checkpoint)). So every wait
+that can run for minutes prints `still installing <Name> (<n> min)...` once a minute:
+
+- `Invoke-Installer` and the `Invoke-IssSilent` launcher wait use `Wait-ProcessHeartbeat`, which calls
+  `WaitForExit` in 5 s slices up to the same cap.
+- The `Invoke-IssSilent` poll loop and the `Invoke-WrappedMsi` extraction loop call `Write-Heartbeat`
+  every pass.
+- Minutes count from `$launchTime` in both `.iss` phases, so the count doesn't restart when the launcher
+  exits. `Write-Heartbeat` prints each minute once.
+
+`Step` headers also carry the wall-clock time (`=== NiceLabel === (15:42:06)`). A field log then shows
+*when* a reboot or prompt hit, which the 2026-09-30 logs could not.
 
 ## <a id="invoke-installer"></a>`Invoke-Installer`
 
@@ -339,6 +360,10 @@ The response log's `LastWriteTime` is compared to `$launchTime`. The pre-run del
 necessity (`SilentlyContinue`), so a log held open by a crashed helper or an AV scanner survives it —
 and reading the survivor served up the *previous* run's `ResultCode=0`, the entire verdict for a
 `RegistryShortCircuit=$false` family, handed to a PFTW stub that access-violated and wrote nothing.
+
+That pre-run delete also destroyed the evidence. On POS2 (2026-09-30) the Scanner SDK `.iss` failed
+in one run and succeeded in the next, and the next run's delete took the only log of the failure. A failed
+launch now copies the log to `<name>.silent.<yyyyMMdd_HHmmss>.fail.log` and records it as the row's `failLog`.
 
 ### <a id="iss-fallback"></a>The `.iss` → MSI fallback
 

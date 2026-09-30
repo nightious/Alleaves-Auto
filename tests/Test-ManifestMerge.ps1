@@ -210,6 +210,40 @@ Assert-Eq $true  $Manifest.installed[0].removable 'a product WE installed last r
 Assert-Eq $false $Manifest.installed[1].removable 'a pre-existing product stays non-removable across re-runs'
 Assert-Eq $false $Manifest.installed[2].removable 'no prior row at all = we never installed it'
 
+Write-Host "`nA killed run's 'pending' row keeps ownership" -ForegroundColor Cyan
+# docs/MANIFEST.md#pending
+$script:PriorManifest = [pscustomobject]@{ installed = @(
+    [pscustomobject]@{ name='Zebra 123 Scan'; result='pending'; method='iss-silent'; displayNameMatch='123Scan' }
+) }
+Assert-Eq $false (Test-PriorInstallFailed -Name 'Zebra 123 Scan') 'pending is not a failure: an installed product is skipped, not re-run'
+$Manifest = @{ installed = @() }
+Add-AlreadyInstalledRow -Name 'Zebra 123 Scan' -Source 'c' -Method 'iss-silent' -Match 'm'
+Assert-Eq $true $Manifest.installed[0].removable 'and the skip row stays OURS (removable)'
+$m = @(Merge-PriorList @(@{ name='Zebra 123 Scan'; result='ok' }) @(@{ name='Zebra 123 Scan'; result='pending' }) $byName)
+Assert-Eq 'ok' (($m | ForEach-Object { $_.result }) -join ',') 'the final row replaces the pending one on merge'
+
+Write-Host "`nSave-Manifest -Checkpoint writes the merge but leaves `$Manifest alone" -ForegroundColor Cyan
+# docs/MANIFEST.md#checkpoint
+Assert-InstallerHas $funcs @('Save-Manifest')
+. ([scriptblock]::Create($funcs['Save-Manifest'].Extent.Text))
+function Fail($m) { }
+$DryRun = $false
+$ManifestPath = Join-Path $env:TEMP ("alleaves_manifest_test_{0}.json" -f [guid]::NewGuid())
+Set-Content -Path $ManifestPath -Value '{"installed":[{"name":"Old Product","result":"fail"}]}' -Encoding UTF8
+$script:PriorManifest = $null
+$Manifest = [ordered]@{ installed = @(@{ name='Chrome'; result='ok' }); computerRenamed = @{} }
+try {
+    Save-Manifest -Checkpoint
+    $onDisk = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+    Assert-Eq 1 @($Manifest.installed).Count 'this run''s $Manifest does not pick up prior rows (exit tally stays clean)'
+    Assert-Eq 2 @($onDisk.installed).Count   'the file on disk holds the merged rows'
+    Assert-Eq 'Old Product' (@($script:PriorManifest.installed)[0].name) 'the prior memo is the run-START state'
+    Save-Manifest -Checkpoint
+    Assert-Eq 1 @((Get-PriorManifest).installed).Count 'a second checkpoint does not leak into the memo'
+} finally {
+    Remove-Item -LiteralPath $ManifestPath -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "`nManifest row shapes match docs/MANIFEST.md#keys" -ForegroundColor Cyan
 # The key table is the one thing a reader must trust literally, and it drifted six ways before this
 # check existed (an invented 'hive', a missing 'serialFinal', ...). docs/MANIFEST.md#keys

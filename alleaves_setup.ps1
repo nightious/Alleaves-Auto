@@ -101,7 +101,7 @@ param(
 # ---------------------------------------------------------------------------
 $ErrorActionPreference = 'Continue'
 
-function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
+function Step($msg) { Write-Host "`n=== $msg === ($(Get-Date -Format HH:mm:ss))" -ForegroundColor Cyan }
 function Ok($msg)   { Write-Host "  [OK]   $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
 function Fail($msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red }
@@ -116,6 +116,8 @@ function Invoke-Step {
         Fail "$Name failed (line $($_.InvocationInfo.ScriptLineNumber)): $($_.Exception.Message)"
         $script:StepFailed = $true
     }
+    # docs/MANIFEST.md#checkpoint
+    if ($Manifest -and -not $Uninstall -and -not $script:ManifestSaved) { Save-Manifest -Checkpoint }
 }
 
 function Test-IsAdmin {
@@ -362,17 +364,23 @@ function Read-ComputerName {
 function Read-PrinterBrand {
     Info ''
     Info '  Receipt printer brand:'
-    Info '    1) POS-X   (default)'
-    Info '    2) None - no receipt printer (skips the driver install too)'
+    Info '    1) POS-X'
+    Info '    2) None - no receipt printer (skips the driver install too)   (default)'
     Info '    3) Star TSP100 (futurePRNT)'
-    $sel = Read-Host '  Select 1-3 (Enter for POS-X)'
+    $sel = Read-Host '  Select 1-3 (Enter for None)'
     switch -Regex ("$sel".Trim()) {
-        '^$'            { return 'POS-X' }
+        '^$'            { return 'None' }
         '^(1|POS-?X)$'  { return 'POS-X' }
         '^(2|None)$'    { return 'None' }
         '^(3|Star.*)$'  { return 'StarTSP100' }
-        default         { Warn "unrecognized answer '$sel' - using POS-X"; return 'POS-X' }
+        default         { Warn "unrecognized answer '$sel' - using None (no printer)"; return 'None' }
     }
+}
+
+# docs/SCANNER-OPOS.md#scanner-prompt  (Read-Host throws propagate to the caller)
+function Read-ScannerConfig {
+    $a = Read-Host '  Zebra scanner on this terminal - set it to USB-OPOS? (y/N)'
+    return ("$a".Trim() -match '^(?i)y(es)?$')
 }
 
 # docs/ACCOUNT-SWAP.md#step0-before-reboot
@@ -387,6 +395,7 @@ function Add-Step0Answers($bound) {
             if ($n) { $r.ComputerName = $n } else { $r.SkipRename = [switch]$true }
         }
         if (-not $PrinterBrand -and -not $SkipPrinterConfig) { $r.PrinterBrand = Read-PrinterBrand }
+        if (-not $SkipScannerConfig -and -not (Read-ScannerConfig)) { $r.SkipScannerConfig = [switch]$true }
     } catch { Write-Verbose "Add-Step0Answers: prompt failed, the resumed run will ask instead: $($_.Exception.Message)" }
     return $r
 }
@@ -1300,7 +1309,10 @@ function Invoke-FileDownload {
     $dir = Split-Path $Dest -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     try {
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        # docs/INSTALL-ENGINE.md#transport  (-CustomHeaders is missing on Win10 1903)
+        $bits = Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue
+        if ($bits -and -not $bits.Parameters.ContainsKey('CustomHeaders')) { Write-Verbose 'Invoke-FileDownload: this BITS has no -CustomHeaders; using WebClient'; $bits = $null }
+        if ($bits) {
             Start-BitsTransfer -Source $Url -Destination $Dest -TransferType Download `
                 -CustomHeaders "User-Agent: $script:UserAgent" -ErrorAction Stop
             return $true
@@ -1488,6 +1500,22 @@ function Uninstall-TeamViewer {
     }
 }
 
+# docs/INSTALL-ENGINE.md#heartbeat
+function Write-Heartbeat([string]$Name, [datetime]$Since) {
+    $min = [int][Math]::Floor(((Get-Date) - $Since).TotalMinutes)
+    $key = "$Name|$($Since.Ticks)|$min"
+    if ($min -gt 0 -and $key -ne $script:HeartbeatKey) { $script:HeartbeatKey = $key; Info "  still installing $Name ($min min)..." }
+}
+
+# docs/INSTALL-ENGINE.md#heartbeat
+function Wait-ProcessHeartbeat($Process, [int]$TimeoutSeconds, [string]$Name, [datetime]$Since = (Get-Date)) {
+    while (-not $Process.WaitForExit(5000)) {
+        if (((Get-Date) - $Since).TotalSeconds -ge $TimeoutSeconds) { return $false }
+        Write-Heartbeat $Name $Since
+    }
+    return $true
+}
+
 # docs/INSTALL-ENGINE.md#invoke-installer  (the $p.Handle trap)
 function Invoke-Installer {
     param(
@@ -1543,7 +1571,7 @@ function Invoke-Installer {
     try { $null = $p.Handle } catch { Write-Verbose "Invoke-Installer: could not dereference the process handle: $($_.Exception.Message)" }
 
     # docs/INSTALL-ENGINE.md#invoke-installer-rules  (capped, never -Wait; and never killed)
-    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+    if (-not (Wait-ProcessHeartbeat $p $TimeoutSeconds $Name)) {
         Fail "$Name still running after $TimeoutSeconds s - giving up on it (not killing it; it may still be installing) - see $stdoutLog / $stderrLog"
         $Manifest.installed += @{
             name=$Name; source=$Path
@@ -1727,6 +1755,7 @@ function Invoke-WrappedMsi {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline -and -not $extractedMsi) {
         Start-Sleep -Seconds 3
+        Write-Heartbeat $Name $launchTime
         $candidates = Get-ChildItem $env:TEMP -Filter '{*}' -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notin $before }
         foreach ($c in $candidates) {
@@ -1904,7 +1933,7 @@ function Invoke-IssSilent {
     Info "  wrapper PID: $($proc.Id)"
 
     $launcherExited = $false
-    try { $launcherExited = $proc.WaitForExit($TimeoutSeconds * 1000) } catch { Write-Verbose "Invoke-IssSilent: WaitForExit threw, treating the launcher as exited: $($_.Exception.Message)"; $launcherExited = $true }
+    try { $launcherExited = Wait-ProcessHeartbeat $proc $TimeoutSeconds $Name $launchTime } catch { Write-Verbose "Invoke-IssSilent: WaitForExit threw, treating the launcher as exited: $($_.Exception.Message)"; $launcherExited = $true }
     if (-not $launcherExited) { Warn "$Name launcher still running after $TimeoutSeconds s - continuing without killing it (it may BE the install engine)" }
     Start-Sleep -Seconds 5
 
@@ -1926,6 +1955,7 @@ function Invoke-IssSilent {
             $idlePolls++
             if (($sawWorker -and $idlePolls -ge 2) -or $idlePolls -ge 10) { break }
         }
+        Write-Heartbeat $Name $launchTime
         Start-Sleep -Seconds 3
     }
 
@@ -1961,6 +1991,12 @@ function Invoke-IssSilent {
     } else {
         Fail "$Name silent install not confirmed (no ResultCode=0$(if (-not $RegistryShortCircuit) { '; registry presence is not proof for this family' } else { ', not in registry' })) - see $log"
         $entry.result = 'fail'
+        # docs/INSTALL-ENGINE.md#iss-log  (the next launch deletes $log; keep the evidence)
+        if (Test-Path $log) {
+            $keep = $log -replace '\.log$', ('.{0:yyyyMMdd_HHmmss}.fail.log' -f (Get-Date))
+            Copy-Item -LiteralPath $log -Destination $keep -Force -ErrorAction SilentlyContinue
+            $entry.failLog = $keep
+        }
         $Manifest.installed += $entry
         return 'fail'
     }
@@ -2147,7 +2183,7 @@ function Get-PriorManifest {
 function Test-PriorInstallFailed {
     param([Parameter(Mandatory)][string]$Name)
     return [bool](@((Get-PriorManifest).installed | Where-Object {
-        $_.name -eq $Name -and (($_.result -and $_.result -ne 'ok') -or $_.note -eq 'msi-fallback')
+        $_.name -eq $Name -and (($_.result -and $_.result -notin 'ok','pending') -or $_.note -eq 'msi-fallback')
     }).Count)
 }
 
@@ -2179,6 +2215,15 @@ function Invoke-InstallLoop {
                 Warn "skipped via -SkipPrograms"
                 continue
             }
+
+            # docs/MANIFEST.md#pending  (on disk BEFORE launch, so a kill/reboot mid-install keeps ownership)
+            $Manifest.installed += @{
+                name=$i.Name; source=(Join-Path $DownloadDir $i.File)
+                method=$(if ($i.Msi) { 'msi' } elseif ($i.Iss) { 'iss-silent' } else { 'exe' })
+                displayNameMatch=$(if ($i.UninstallMatch) { $i.UninstallMatch } else { $i.Match })
+                result='pending'
+            }
+            Save-Manifest -Checkpoint
 
             if ($ForceReinstall -and ($i.Msi -or $i.Iss)) {
                 $cleanPattern = if ($i.UninstallMatch) { $i.UninstallMatch } else { $i.Match }
@@ -2269,6 +2314,9 @@ function Invoke-InstallLoop {
                 name=$i.Name; source=(Join-Path $DownloadDir $i.File); method='exception'
                 displayNameMatch=$i.Match; result='fail-exception'
             }
+        } finally {
+            $Manifest.installed = @($Manifest.installed | Where-Object { $_.result -ne 'pending' })
+            Save-Manifest -Checkpoint
         }
     }
 }
@@ -2291,7 +2339,15 @@ function Merge-PriorList {
 
 # docs/MANIFEST.md#save
 function Save-Manifest {
-    if ($DryRun) { Ok 'dry-run: manifest not persisted (real manifest preserved)'; return }
+    param([switch]$Checkpoint)
+    if ($DryRun) { if (-not $Checkpoint) { Ok 'dry-run: manifest not persisted (real manifest preserved)' }; return }
+    if ($Checkpoint) {
+        # docs/MANIFEST.md#checkpoint  (memo the run-start prior first; merge into a shallow copy)
+        Get-PriorManifest | Out-Null
+        $copy = [ordered]@{}
+        foreach ($k in @($Manifest.Keys)) { $copy[$k] = $Manifest[$k] }
+        $Manifest = $copy
+    }
     if (Test-Path $ManifestPath) {
         try {
             $prior = Get-Content $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -2330,8 +2386,13 @@ function Save-Manifest {
     try {
         ($Manifest | ConvertTo-Json -Depth 6) | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
         Move-Item -LiteralPath $tmp -Destination $ManifestPath -Force -ErrorAction Stop
-        Ok "manifest written: $ManifestPath"
+        if (-not $Checkpoint) { Ok "manifest written: $ManifestPath" }
     } catch {
+        if ($Checkpoint) {
+            Write-Verbose "Save-Manifest: checkpoint write failed (the end-of-run save decides): $($_.Exception.Message)"
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            return
+        }
         Fail "could not write manifest ${ManifestPath}: $($_.Exception.Message)"
         $script:ManifestWriteFailed = $true
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -2351,10 +2412,10 @@ function Set-TrackedRegValue {
     if ($DryRun) { Dry "would set $Path\$Name = $Value ($Type)"; return }
 
     $prev = $null; $prevAbsent = $true
-    try {
-        $existing = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
-        $prev = $existing.$Name; $prevAbsent = $false
-    } catch { Write-Verbose "Set-TrackedRegValue: no prior value for '$Name' under '$Path': $($_.Exception.Message)"; $prevAbsent = $true }
+    # docs/MANIFEST.md#probe-quiet
+    $existing = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+    if ($existing) { $prev = $existing.$Name; $prevAbsent = $false }
+    else { Write-Verbose "Set-TrackedRegValue: no prior value for '$Name' under '$Path'" }
     if ($WarnIfPresent -and -not $prevAbsent -and "$prev" -ne "$Value") {
         Warn "$WarnIfPresent - existing value '$prev' is being replaced (restored on -Uninstall)"
     }
@@ -2413,7 +2474,7 @@ function Invoke-ComputerRename {
         return
     }
     try {
-        Rename-Computer -NewName $name -Force -ErrorAction Stop
+        Rename-Computer -NewName $name -Force -WarningAction SilentlyContinue -ErrorAction Stop
         Ok "computer will be renamed '$current' -> '$name' on next reboot"
         $Manifest.computerRenamed = @{ from=$current; to=$name; applied=$true }
         $script:RebootPending = $true
@@ -3006,6 +3067,16 @@ function Register-FinishLogonTask {
     }
 }
 
+# docs/FINISHING.md#apply-now
+function Invoke-FinishNow {
+    if (-not ($script:FinishBrowser -or $script:FinishTaskbar)) { return }
+    $finishPs = Join-Path $WorkDir 'AlleavesFinishUser.ps1'
+    if ($DryRun) { Dry "would run $finishPs now for $env:USERNAME"; return }
+    Step 'Apply per-user finish now (signed-in user)'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $finishPs
+    Ok "finish ran for $env:USERNAME - see $LogDir\finish_$env:USERNAME.log"
+}
+
 
 # docs/SCANNER-OPOS.md  -- rig-dependent constants, see #open-items
 $ScannerOpcodeSwitchHostMode = 6200
@@ -3224,7 +3295,7 @@ function Set-ScannerOpos {
         serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result=$r; removable=$false } }
 
     if ($SkipScannerConfig) {
-        Ok 'scanner OPOS skipped (-SkipScannerConfig)'
+        Ok 'scanner OPOS skipped (-SkipScannerConfig or answered No)'
         & $bail 'skipped:flag'
         return
     }
@@ -3687,16 +3758,27 @@ $PrinterBrands = [ordered]@{
 # docs/PRINTER-OPOS.md#brand-prompt
 function Resolve-PrinterBrand {
     if ($script:PrinterBrandResolved) { return $script:PrinterBrandResolved }
-    $brand = 'POS-X'
+    $brand = 'None'
     if ($PrinterBrand) {
         $brand = $PrinterBrand
     } elseif ([Environment]::UserInteractive -and -not $env:ALLEAVES_NOPAUSE) {
         try { $brand = Read-PrinterBrand } catch {
-            Warn "no console for the printer-brand prompt - defaulting to POS-X ($($_.Exception.Message))"
+            Warn "no console for the printer-brand prompt - defaulting to None ($($_.Exception.Message))"
         }
     }
     $script:PrinterBrandResolved = $brand
     return $brand
+}
+
+# docs/SCANNER-OPOS.md#scanner-prompt
+function Resolve-ScannerConfig {
+    if ($SkipScannerConfig -or $script:AccountSwapAttempted) { return }
+    if (-not [Environment]::UserInteractive -or $env:ALLEAVES_NOPAUSE) { return }
+    try {
+        if (-not (Read-ScannerConfig)) { $script:SkipScannerConfig = [switch]$true }
+    } catch {
+        Warn "no console for the scanner prompt - configuring as before ($($_.Exception.Message))"
+    }
 }
 
 
@@ -3955,6 +4037,9 @@ try {
     Write-Host $ModeBanner[1] -ForegroundColor Cyan
     Info "WorkDir:   $WorkDir"
     Info "Manifest:  $ManifestPath"
+    # docs/ACCOUNT-SWAP.md#running-as  (Clear-AccountSwapState ran before the transcript)
+    Info "Running as: $env:USERDOMAIN\$env:USERNAME"
+    if ($script:AccountSwapDone) { Ok "resumed after the account swap - signed in as '$($script:AccountSwapDone.name)'" }
     if ($DryRun) { Write-Host "DRY RUN - no system changes will be made" -ForegroundColor Yellow }
 
     if ($ScannerConfigOnly -or $PrinterConfigOnly) {
@@ -4009,6 +4094,8 @@ try {
         if ($brand0 -eq 'None') { Ok 'no receipt printer - no printer driver will be downloaded or installed' }
         else { Ok "receipt printer: $brand0 - other brands' drivers will not be downloaded or installed" }
 
+        Invoke-Step 'Scanner prompt' { Resolve-ScannerConfig }
+
         Invoke-Step 'Download phase' { Invoke-DownloadPhase }
 
         if (-not $SkipUninstallTeamViewer) { Invoke-Step 'TeamViewer removal' { Uninstall-TeamViewer } }
@@ -4047,6 +4134,8 @@ try {
 
         Invoke-Step 'Receipt printer OPOS' { Set-PrinterOpos }
 
+        Invoke-Step 'Finish now' { Invoke-FinishNow }
+
         # docs/ARCHITECTURE.md#tally-snapshot-ordering  (snapshot BEFORE Save-Manifest merges prior rows back in)
         $failed    = @($Manifest.installed    | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
         $depFailed = @($Manifest.dependencies | Where-Object { $_.result -and ($_.result -notin @('ok','already-present','dryrun')) })
@@ -4080,8 +4169,8 @@ try {
             Write-Host "  Recommended: reboot this terminal once to finalize Zebra CoreScanner." -ForegroundColor Yellow
         }
         if ($script:FinishBrowser -or $script:FinishTaskbar) {
-            Info "  After the reboot, sign in: the deferred per-user changes are applied"
-            Info "  automatically at logon (AlleavesAuto-FinishUser)."
+            Info "  Per-user changes were applied now for $env:USERNAME (unless it is the tech account);"
+            Info "  every other user gets them at their next logon (AlleavesAuto-FinishUser)."
             if ($script:FinishTaskbar) {
                 Info "  Verify 'Alleaves Terminal' and 'Alleaves POS' are pinned and Edge is gone."
                 Info "  The Alleaves POS pin should open $AlleavesUrl."

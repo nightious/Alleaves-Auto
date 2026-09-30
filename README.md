@@ -23,7 +23,7 @@ re-download it.**
 1. Download **[Install-Alleaves.bat](https://github.com/nightious/Alleaves-Auto/releases/latest/download/Install-Alleaves.bat)**
    ([older builds](https://github.com/nightious/Alleaves-Auto/releases)) onto the terminal.
 2. Double-click it and accept the UAC prompt. It elevates once, downloads the current installer, runs.
-3. Answer the two prompts: **computer name** (Enter skips) and **printer brand**.
+3. Answer the two prompts: **computer name** (Enter skips) and **printer brand** (Enter = None, no printer).
 4. Wait. Everything else is silent; nothing reboots on its own.
 5. **Reboot, then sign back in** — the taskbar pins and default browser are applied by a logon
    task on that first sign-in. A pending reboot prints `*** REBOOT REQUIRED ***`.
@@ -53,7 +53,7 @@ Optional — a bare double-click needs none. From a terminal:
 | `-SkipChromeTaskbar` | Don't pin Alleaves Terminal / Alleaves POS, don't remove Edge. |
 | `-SkipDefaultBrowser` | Don't make Chrome the default browser. |
 | `-SkipChromeBookmark` | Don't apply the read-only Alleaves bookmark. |
-| `-SkipScannerConfig` | Leave the Zebra scanner's host mode alone. |
+| `-SkipScannerConfig` | Leave the Zebra scanner's host mode alone. Also suppresses the step-0 scanner question (Enter there = No = this flag). |
 | `-SkipPrinterConfig` | Install the driver but don't register the OPOS entry. Also suppresses the brand prompt (unset brand then defaults to `POS-X`). |
 | `-ScannerConfigOnly` | Run **only** the USB-OPOS scanner switch. Switching nothing exits `6`, not `0`. |
 | `-PrinterConfigOnly` | Run **only** the OPOS printer registration — use after a rename. The driver must already be installed. |

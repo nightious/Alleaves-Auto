@@ -305,7 +305,11 @@ Answered **once** and cached — see
 - **The WORDS are accepted alongside the digits.** README documents `-PrinterBrand None`, so typing "None"
   here is the natural mistake — and with no default case it fell through to POS-X, installing the driver and
   registering a phantom `<POSname>_Printer` on a terminal that has no printer at all.
-- Enter = the POS-X default; every degraded path lands there.
+- Enter = **None** (since 2026-09-30, the user's call; it was POS-X). Unrecognized answers, no console,
+  and non-interactive runs with no `-PrinterBrand` land there too. A careless Enter now installs *no*
+  driver, where it used to put the wrong one on a Star terminal. The menu numbering is unchanged, so
+  techs' `1`/`2`/`3` habits still work. The `-SkipPrinterConfig` and thrown-step fallbacks stay POS-X
+  (below).
 
 <a id="skip-fallback"></a>⚠️ **`-SkipPrinterConfig` with no `-PrinterBrand` falls back to `'POS-X'`, not
 empty.** That flag only means "don't write the OPOS entry" and it suppresses the prompt, so there is no answer
