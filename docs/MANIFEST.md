@@ -11,7 +11,7 @@ dispatch paths so the key set can never drift between them.
 
 | Key | Shape | Reversal |
 |---|---|---|
-| `installed` | `name, source, displayNameMatch, result` always; `args` (redacted), `exitCode`, `stdoutLog`/`stderrLog`, `note`, `method`, `removable` per writer — see below | uninstalled in reverse unless `removable=false` |
+| `installed` | `name, source, displayNameMatch, result` always; `args` (redacted), `exitCode`, `stdoutLog`/`stderrLog`, `note`, `method`, `removable`, `failLog` per writer — see below; `result='pending'` = launched, never finished ([#pending](#pending)) | uninstalled in reverse unless `removable=false` |
 | `dependencies` | VC++ only | **reported, never removed** — other software may depend on it |
 | `filesPlaced` | paths — **may hold a DIRECTORY** | deleted in order |
 | `filesReplaced` | `{ path; backup }` | backup moved back over path, after the deletes |
@@ -33,7 +33,7 @@ deletion arm can only assume HKLM ([#default-value](#default-value)).
 <a id="installed-method"></a>**`method` is NOT on every `installed` row.** `Invoke-Installer` omits it,
 so every raw-exe row and every `Invoke-Msi` row lacks it. It is written only by `Invoke-IssSilent`
 (`'iss-silent'`), `Invoke-WrappedMsi` (`'wrapper-extract'`) and the install loop's own skip /
-extract-failure / exception rows. Anything that gates on it must tolerate the gap — [step 2b](#step-2b)
+pending / extract-failure / exception rows. Anything that gates on it must tolerate the gap — [step 2b](#step-2b)
 does, by also accepting `note -eq 'msi-fallback'`.
 
 `scannerConfigured` is kept **out of `installed`** so a benign `no-scanner` run doesn't trip the
@@ -98,6 +98,47 @@ Only the **first** run saw the pre-install state.
 - A failed write sets `$script:ManifestWriteFailed` → exit 1. Nothing this run did is recorded anywhere
   otherwise.
 
+### <a id="checkpoint"></a>`-Checkpoint` — a kill or reboot loses nothing
+
+The end-of-run save and the `finally` fallback both need the process to still be alive. On POS2
+(2026-09-30) it wasn't, twice: a surprise reboot ended the resumed run during 123 Scan, and the tech
+closed the next one after ten silent minutes. The re-run found Chrome, Alleaves Terminal and 123 Scan
+installed with no manifest row for them, so it recorded all three as `already-installed, removable=False` and
+`-Uninstall` would have left them behind. The `accountCreated` row was lost the same way, because
+`Clear-AccountSwapState` had already deleted the marker. The rename was lost too.
+
+So `Invoke-Step` checkpoints after every step and the install loop checkpoints around every product
+([#pending](#pending)). A checkpoint:
+
+- **Merges into a shallow COPY of `$Manifest`, never `$Manifest` itself.** The merge pulls prior rows in,
+  and the exit-code tally must count only this run's
+  ([ARCHITECTURE.md#tally-snapshot-ordering](ARCHITECTURE.md#tally-snapshot-ordering)). A top-level copy is
+  enough because the merge only *reassigns* keys and never mutates a list or row in place.
+- **Memoizes `Get-PriorManifest` before its first write.** Ownership (`Add-AlreadyInstalledRow`), the
+  taskbar's "is this ours?" test and the stale-printer sweep must see the run-START state, not this run's
+  own checkpoint.
+- **Says nothing and never fails the run.** A write failure is `Write-Verbose`; the end-of-run save is the
+  one that sets `ManifestWriteFailed`. It stops once that save has run (`$script:ManifestSaved`), and
+  it's a no-op on `-DryRun`.
+
+### <a id="pending"></a>`result='pending'` rows
+
+`Invoke-InstallLoop` writes a `pending` row (real `method`, `displayNameMatch` = `UninstallMatch` or
+`Match`) and checkpoints **before** launching each product. It drops the row in `finally` once the real
+row exists. If the run dies in between, the row is still on disk:
+
+- `Test-PriorInstallFailed` ignores `pending`. If the product did finish, the next run skips it and
+  still **owns** it: the row has no `removable=$false`. If it didn't finish, the next run just installs it.
+- `-Uninstall` replays a `pending` row like any other ([#step-2](#step-2)), so what a dead run launched is
+  still removed. `method` is recorded so the `.iss` orphan sweep ([#step-2b](#step-2b)) still fires.
+
+### <a id="probe-quiet"></a>Absent-value probes use `SilentlyContinue`, not `Stop` + `catch`
+
+`Set-TrackedRegValue` reads the prior value with `-ErrorAction SilentlyContinue` and a null check. With
+`Stop`, PS 5.1 writes a `PS>TerminatingError(Get-ItemProperty)` line to the transcript even though the
+`catch` handles it. An absent value is the normal case, so every first run logged four of them. The
+outcome is the same: an unreadable value reads as absent either way.
+
 ## <a id="prior"></a>`Get-PriorManifest`
 
 The on-disk manifest from an **earlier** run, read at most once. Distinct from `$Manifest`, which is
@@ -116,8 +157,9 @@ so run 2 backed up OUR OWN layout as the "OEM" one
 two OPOS printers ([PRINTER-OPOS.md#stale](PRINTER-OPOS.md#stale)).
 
 **An UNKNOWN prior state is not an empty one.** `$script:PriorManifestUnreadable` makes the taskbar step
-decline to guess rather than destroy the OEM layout — `Save-Manifest` preserves the bytes, but that
-runs at the END of the run, long after the taskbar step.
+decline to guess rather than destroy the OEM layout. `Save-Manifest` preserves the bytes, but the first
+[checkpoint](#checkpoint) moves the file aside long before the taskbar step. The flag survives because
+the checkpoint memoizes the unreadable read first.
 
 ## <a id="set-trackedregvalue"></a>`Set-TrackedRegValue`
 

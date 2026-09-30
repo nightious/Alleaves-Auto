@@ -195,6 +195,12 @@ would be the *function's*, not the script's. It drops **`NiceLabelLicense`** as 
 action is persisted, readable by any standard user (`schtasks /query /xml`) and outlives the run — the
 exposure `$safeArgs` redacts everywhere else. `param()`'s default hands the key back on resume.
 
+<a id="running-as"></a>**The banner says who is running.** `Clear-AccountSwapState` runs before
+`Start-Transcript`, so its "resumed as" line never reached the log or Slack. On POS2 (2026-09-30) the
+tech couldn't tell which profile the resumed run was using; it was the new account, as designed. Every
+run now prints `Running as: DOMAIN\user` under the banner. A resumed run also prints a green "resumed after
+the account swap" line, both inside the transcript.
+
 ### <a id="loop-guard"></a>`$script:AccountSwapAttempted` — the loop guard
 
 Set by `Clear-AccountSwapState` whenever a marker existed. Without it a resume landing on a still-wrong
