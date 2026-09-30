@@ -87,12 +87,14 @@ Write-Host "`nAdd-Step0Answers (asked before the swap reboot)" -ForegroundColor 
 function Info($m) {}
 function Read-ComputerName { $script:NamePrompts++; $script:StubName }
 function Read-PrinterBrand { $script:BrandPrompts++; 'StarTSP100' }
+function Read-ScannerConfig { $script:ScanPrompts++; $script:StubScan }
 function Get-Step0($bound) {
-    $script:NamePrompts = 0; $script:BrandPrompts = 0
+    $script:NamePrompts = 0; $script:BrandPrompts = 0; $script:ScanPrompts = 0
     Add-Step0Answers $bound
 }
 $ComputerName = ''; $SkipRename = $false; $PrinterBrand = ''; $SkipPrinterConfig = $false
-$ScannerConfigOnly = $false; $PrinterConfigOnly = $false
+$ScannerConfigOnly = $false; $PrinterConfigOnly = $false; $SkipScannerConfig = $false
+$script:StubScan = $true
 
 $script:StubName = 'POS-3'
 $r = Get-Step0 @{ ForceReinstall = [switch]$true }
@@ -107,6 +109,17 @@ $script:StubName = ''
 $r = Get-Step0 @{}
 Assert-Eq $true  $r.SkipRename.IsPresent           'Enter at the name prompt becomes -SkipRename (resumed run never asks)'
 Assert-Eq $false $r.ContainsKey('ComputerName')    'Enter adds no -ComputerName (exit-2 guard)'
+Assert-Eq $false $r.ContainsKey('SkipScannerConfig') 'scanner Yes adds nothing (the resumed run configures unasked)'
+
+$script:StubScan = $false
+$r = Get-Step0 @{}
+Assert-Eq $true  $r.SkipScannerConfig.IsPresent    'scanner No / Enter becomes -SkipScannerConfig'
+$script:StubScan = $true
+
+$SkipScannerConfig = $true
+$r = Get-Step0 @{ SkipScannerConfig = [switch]$true }
+Assert-Eq 0      $script:ScanPrompts               '-SkipScannerConfig: no scanner prompt'
+$SkipScannerConfig = $false
 
 $ComputerName = 'POS-9'; $PrinterBrand = 'None'
 $r = Get-Step0 @{ ComputerName = 'POS-9'; PrinterBrand = 'None' }
@@ -123,7 +136,7 @@ $SkipPrinterConfig = $false
 foreach ($mode in 'ScannerConfigOnly','PrinterConfigOnly') {
     Set-Variable $mode $true
     $r = Get-Step0 @{ $mode = [switch]$true }
-    Assert-Eq 0 ($script:NamePrompts + $script:BrandPrompts) "-${mode}: no step 0, nothing asked"
+    Assert-Eq 0 ($script:NamePrompts + $script:BrandPrompts + $script:ScanPrompts) "-${mode}: no step 0, nothing asked"
     Assert-Eq 1 $r.Count                               "-${mode}: args returned unchanged"
     Set-Variable $mode $false
 }

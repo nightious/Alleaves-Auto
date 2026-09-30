@@ -172,14 +172,15 @@ instant the script exits, so the resumed run's window used to vanish right after
 completed exit-6 run looked like the scanner failure had aborted the install. The action prints the exit
 code, waits for Enter, then `exit`s with that code so the task's Last Run Result stays meaningful.
 
-<a id="step0-before-reboot"></a>**The step-0 questions are asked BEFORE the reboot.** The rename and printer-brand
+<a id="step0-before-reboot"></a>**The step-0 questions are asked BEFORE the reboot.** The rename, printer-brand and scanner
 prompts ([ARCHITECTURE.md#why-the-two-prompts-are-at-step-0](ARCHITECTURE.md#why-the-two-prompts-are-at-step-0))
 are the only `Read-Host`s in the install path, so a resumed run that asked them sat at a prompt after the
 reboot instead of downloading. `Add-Step0Answers` asks them right after the account name/password — the tech
 is still at the terminal — and writes the answers into the resume args as `-ComputerName` (or `-SkipRename`
-on Enter, so the resumed run never asks) and `-PrinterBrand`. Traps:
+on Enter, so the resumed run never asks), `-PrinterBrand`, and `-SkipScannerConfig` on a scanner No (a Yes adds
+nothing — [SCANNER-OPOS.md#scanner-prompt](SCANNER-OPOS.md#scanner-prompt)). Traps:
 
-- The prompt bodies (`Get-ComputerNameError`, `Read-ComputerName`, `Read-PrinterBrand`) live **above** the
+- The prompt bodies (`Get-ComputerNameError`, `Read-ComputerName`, `Read-PrinterBrand`, `Read-ScannerConfig`) live **above** the
   swap, because a top-to-bottom script has not defined `Invoke-ComputerRename` / `Resolve-PrinterBrand` yet
   when the swap runs. Those two call the same helpers, so the swap and step 0 cannot drift.
 - The rename is **passed, not applied**: the resumed run renames. Applying it before the reboot would change

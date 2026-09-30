@@ -377,6 +377,12 @@ function Read-PrinterBrand {
     }
 }
 
+# docs/SCANNER-OPOS.md#scanner-prompt  (Read-Host throws propagate to the caller)
+function Read-ScannerConfig {
+    $a = Read-Host '  Zebra scanner on this terminal - set it to USB-OPOS? (y/N)'
+    return ("$a".Trim() -match '^(?i)y(es)?$')
+}
+
 # docs/ACCOUNT-SWAP.md#step0-before-reboot
 function Add-Step0Answers($bound) {
     $r = @{}; foreach ($k in $bound.Keys) { $r[$k] = $bound[$k] }
@@ -389,6 +395,7 @@ function Add-Step0Answers($bound) {
             if ($n) { $r.ComputerName = $n } else { $r.SkipRename = [switch]$true }
         }
         if (-not $PrinterBrand -and -not $SkipPrinterConfig) { $r.PrinterBrand = Read-PrinterBrand }
+        if (-not $SkipScannerConfig -and -not (Read-ScannerConfig)) { $r.SkipScannerConfig = [switch]$true }
     } catch { Write-Verbose "Add-Step0Answers: prompt failed, the resumed run will ask instead: $($_.Exception.Message)" }
     return $r
 }
@@ -3288,7 +3295,7 @@ function Set-ScannerOpos {
         serial=$null; model=$null; hostBefore=$null; target='USB-OPOS'; result=$r; removable=$false } }
 
     if ($SkipScannerConfig) {
-        Ok 'scanner OPOS skipped (-SkipScannerConfig)'
+        Ok 'scanner OPOS skipped (-SkipScannerConfig or answered No)'
         & $bail 'skipped:flag'
         return
     }
@@ -3763,6 +3770,17 @@ function Resolve-PrinterBrand {
     return $brand
 }
 
+# docs/SCANNER-OPOS.md#scanner-prompt
+function Resolve-ScannerConfig {
+    if ($SkipScannerConfig -or $script:AccountSwapAttempted) { return }
+    if (-not [Environment]::UserInteractive -or $env:ALLEAVES_NOPAUSE) { return }
+    try {
+        if (-not (Read-ScannerConfig)) { $script:SkipScannerConfig = [switch]$true }
+    } catch {
+        Warn "no console for the scanner prompt - configuring as before ($($_.Exception.Message))"
+    }
+}
+
 
 # docs/PRINTER-OPOS.md#already-configured
 # ponytail: the emptied CLASS key is left in place - it enumerates no devices, and
@@ -4075,6 +4093,8 @@ try {
         }
         if ($brand0 -eq 'None') { Ok 'no receipt printer - no printer driver will be downloaded or installed' }
         else { Ok "receipt printer: $brand0 - other brands' drivers will not be downloaded or installed" }
+
+        Invoke-Step 'Scanner prompt' { Resolve-ScannerConfig }
 
         Invoke-Step 'Download phase' { Invoke-DownloadPhase }
 

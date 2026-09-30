@@ -24,6 +24,17 @@ Capture with `-ScannerConfigOnly -ForceFingerprint` (forces the dump for an alre
 `alleaves_setup.ps1` — `$ScannerOpcodeSwitchHostMode` … `$ScannerRetryWaitSec`, immediately above
 `Get-ScannerHostMode`, which holds no values of its own. Read that block; don't copy its values here.
 
+## <a id="scanner-prompt"></a>The step-0 question
+
+`Resolve-ScannerConfig` asks once, at step 0c: "Zebra scanner on this terminal - set it to USB-OPOS? (y/N)".
+Only `y` / `yes` configures; **Enter is No**, and No just sets `$SkipScannerConfig` — the Zebra 123 Scan /
+Scanner SDK installs are untouched, so the switch can still run later with `-ScannerConfigOnly`.
+
+When nobody can be asked (non-interactive, `ALLEAVES_NOPAUSE`, or a resumed account-swap run) it does **not**
+default to No: it configures, as before the prompt existed. The resumed run already had its answer — a No
+arrives as `-SkipScannerConfig` ([ACCOUNT-SWAP.md#step0-before-reboot](ACCOUNT-SWAP.md#step0-before-reboot)),
+so no flag means Yes. Unattended runs skip with `-SkipScannerConfig`.
+
 ## <a id="the-command"></a>It is a COMMAND, not a file
 
 Turning on OPOS is a single CoreScanner command:
@@ -142,7 +153,7 @@ same shape, so they are written through one local `$bail` scriptblock rather tha
 
 | Situation | `result` | Exit |
 |---|---|---|
-| `-SkipScannerConfig` | `skipped:flag` | 0 |
+| `-SkipScannerConfig` or step-0 No | `skipped:flag` | 0 |
 | `$script:ScannerDegraded` | `skipped:degraded` | 4 |
 | `-DryRun` | `dryrun` | 0 |
 | Interop DLL missing | `no-interop` | 6 |
