@@ -277,6 +277,20 @@ after the taskbar/browser steps and only if at least one set a Finish flag.
 - On failure the **flags are cleared too**, or the end-of-run summary tells the tech the taskbar pin and
   default browser apply automatically at logon when the script or task does not exist.
 
+### <a id="apply-now"></a>The finish also runs once at the end of the install
+
+Field, POS2 2026-09-30: the install finished, the tech didn't reboot, and no pins appeared. They were only
+staged for the next logon. So `Invoke-FinishNow` runs the staged script synchronously for the signed-in user
+as the run's last step. Nothing new is written: the script's own install-user skip keeps the tech out in a
+non-swap run, its `TaskbarApplied` stamp stops the logon task from clearing the pins a second time, and
+`Backup-LoadedTaskbands` has already backed up this hive for `-Uninstall`. The logon task stays: other
+profiles still need it, and so does the browser half behind UCPD, which fails harmlessly now and lands after
+the reboot.
+
+Caveat: this Explorer restart comes from an elevated process. Winlogon's shell auto-restart normally brings
+Explorer back unelevated. If it doesn't, the script's `Start-Process explorer.exe` fallback starts an
+elevated Explorer, which goes away at the next logon.
+
 ### <a id="finish-bom"></a>The finish script is written WITH a BOM
 
 Unlike `Write-XmlFile`'s XML, which declares its own encoding. PS 5.1 decodes a BOM-less `.ps1` as ANSI, and

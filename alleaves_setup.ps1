@@ -3060,6 +3060,16 @@ function Register-FinishLogonTask {
     }
 }
 
+# docs/FINISHING.md#apply-now
+function Invoke-FinishNow {
+    if (-not ($script:FinishBrowser -or $script:FinishTaskbar)) { return }
+    $finishPs = Join-Path $WorkDir 'AlleavesFinishUser.ps1'
+    if ($DryRun) { Dry "would run $finishPs now for $env:USERNAME"; return }
+    Step 'Apply per-user finish now (signed-in user)'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $finishPs
+    Ok "finish ran for $env:USERNAME - see $LogDir\finish_$env:USERNAME.log"
+}
+
 
 # docs/SCANNER-OPOS.md  -- rig-dependent constants, see #open-items
 $ScannerOpcodeSwitchHostMode = 6200
@@ -4104,6 +4114,8 @@ try {
 
         Invoke-Step 'Receipt printer OPOS' { Set-PrinterOpos }
 
+        Invoke-Step 'Finish now' { Invoke-FinishNow }
+
         # docs/ARCHITECTURE.md#tally-snapshot-ordering  (snapshot BEFORE Save-Manifest merges prior rows back in)
         $failed    = @($Manifest.installed    | Where-Object { $_.result -and ($_.result -notin @('ok','dryrun')) })
         $depFailed = @($Manifest.dependencies | Where-Object { $_.result -and ($_.result -notin @('ok','already-present','dryrun')) })
@@ -4137,8 +4149,8 @@ try {
             Write-Host "  Recommended: reboot this terminal once to finalize Zebra CoreScanner." -ForegroundColor Yellow
         }
         if ($script:FinishBrowser -or $script:FinishTaskbar) {
-            Info "  After the reboot, sign in: the deferred per-user changes are applied"
-            Info "  automatically at logon (AlleavesAuto-FinishUser)."
+            Info "  Per-user changes were applied now for $env:USERNAME (unless it is the tech account);"
+            Info "  every other user gets them at their next logon (AlleavesAuto-FinishUser)."
             if ($script:FinishTaskbar) {
                 Info "  Verify 'Alleaves Terminal' and 'Alleaves POS' are pinned and Edge is gone."
                 Info "  The Alleaves POS pin should open $AlleavesUrl."
